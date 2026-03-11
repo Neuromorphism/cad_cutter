@@ -2,27 +2,38 @@
 """
 CAD Assembly Pipeline — Stack, Cut, and Render
 
-Takes multiple CAD/mesh files, stacks them into an assembly along a chosen axis,
-optionally cuts the assembly with a radial wedge cutter, exports a .step assembly
-file, and renders a professional-quality .png image.
+Takes multiple CAD/mesh files, assembles them concentrically, optionally cuts
+with a radial wedge cutter, exports a .step assembly file, and renders a
+professional-quality .png image.
+
+Part naming convention:
+  Parts are named as "<tier>_<level>" where:
+    tier  = "inner", "mid", or "outer"  (nesting position)
+    level = integer starting at 1       (vertical stack order)
+
+  Example filenames: outer_1.step, mid_1.step, inner_1.step, outer_2.step ...
+
+  - Outer parts stack vertically: outer_1 base at z=0, outer_2 on top, etc.
+  - Mid parts are XY-centered within the outer part at the same level.
+  - Inner parts are XY-centered within the mid part (or outer) at the same level.
+  - Parts without a recognized tier/level are treated as outer and stacked in order.
 
 Supported input formats:
   CAD:  .step / .stp / .iges / .igs / .brep
   Mesh: .stl / .obj / .ply / .3mf
 
 Usage examples:
-  # Stack parts and render
-  python assemble.py part_a.step part_b.stl -o assembly.step --render assembly.png
+  # Concentric assembly with cut and render
+  python assemble.py outer_1.step mid_1.step inner_1.step outer_2.step \\
+      -o assembly.step --cut-angle 90 --render assembly.png
 
-  # Stack with 5mm gap, cut at 90°, render at 4K
-  python assemble.py *.step -o assy.step --gap 5 --cut-angle 90 --render assy.png --resolution 4096
-
-  # Stack along X axis
-  python assemble.py housing.step rotor_copper.stl --axis x --render result.png
+  # Simple vertical stack (parts without tier names)
+  python assemble.py plate.step shaft.step flange.step -o assy.step --render assy.png
 """
 
 import sys
 import os
+import re
 import argparse
 import math
 import tempfile
@@ -166,8 +177,56 @@ def load_cad_file(filepath):
         raise ValueError(f"Unsupported CAD format: {ext}")
 
 
+def _mesh_shell_to_solid(shape):
+    """Convert a mesh/shell TopoDS_Shape to a solid via sewing.
+
+    This is required so that boolean operations (cut) work on mesh-origin data.
+    Returns the solid shape, or the original shape if conversion fails.
+    """
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing, BRepBuilderAPI_MakeSolid
+    from OCP.TopAbs import TopAbs_SHELL, TopAbs_SOLID, TopAbs_COMPOUND
+    from OCP.TopoDS import TopoDS
+
+    # If already a solid, nothing to do
+    if shape.ShapeType() == TopAbs_SOLID:
+        return shape
+
+    try:
+        # Sew the faces into a shell
+        sew = BRepBuilderAPI_Sewing(1e-6)
+        sew.Add(shape)
+        sew.Perform()
+        sewn = sew.SewedShape()
+
+        # Try to extract a shell and make a solid
+        if sewn.ShapeType() == TopAbs_SHELL:
+            maker = BRepBuilderAPI_MakeSolid(TopoDS.Shell_s(sewn))
+            if maker.IsDone():
+                return maker.Solid()
+        elif sewn.ShapeType() == TopAbs_SOLID:
+            return sewn
+        elif sewn.ShapeType() == TopAbs_COMPOUND:
+            # Try to find a shell inside the compound
+            from OCP.TopExp import TopExp_Explorer
+            explorer = TopExp_Explorer(sewn, TopAbs_SHELL)
+            if explorer.More():
+                shell = TopoDS.Shell_s(explorer.Current())
+                maker = BRepBuilderAPI_MakeSolid(shell)
+                if maker.IsDone():
+                    return maker.Solid()
+    except Exception:
+        pass
+
+    return shape
+
+
 def load_mesh_file(filepath):
-    """Load a mesh file and convert to CadQuery shape."""
+    """Load a mesh file and convert to a CadQuery solid shape.
+
+    Supports .stl, .obj, .ply, .3mf. Non-STL formats are converted to STL
+    via trimesh first, then loaded through OCP and sewn into a solid for
+    compatibility with boolean operations (cutting).
+    """
     from OCP.StlAPI import StlAPI_Reader
 
     ext = os.path.splitext(filepath)[1].lower()
@@ -191,7 +250,8 @@ def load_mesh_file(filepath):
         reader = StlAPI_Reader()
         shape = TopoDS_Shape()
         reader.Read(shape, stl_path)
-        return cq.Workplane("XY").newObject([cq.Shape(shape)])
+        solid = _mesh_shell_to_solid(shape)
+        return cq.Workplane("XY").newObject([cq.Shape(solid)])
     finally:
         if tmp_stl:
             os.unlink(tmp_stl.name)
@@ -232,36 +292,172 @@ def pick_color(name, index):
 
 
 # ===================================================================
-# Core assembly (stacking)
+# Part name parsing
+# ===================================================================
+
+TIER_ORDER = {"outer": 0, "mid": 1, "inner": 2}
+TIER_PATTERN = re.compile(
+    r"(?P<tier>inner|mid|outer)[_\- ]?(?P<levels>\d+(?:[_\- ]\d+)*)", re.IGNORECASE
+)
+
+
+def parse_part_name(name):
+    """Parse a part name into (tier, levels).
+
+    Supports multi-level spans: ``inner_2_3`` means inner spanning levels 2-3.
+
+    Returns:
+        (tier, levels): tier is "outer"/"mid"/"inner", levels is a list of ints.
+        If the name doesn't match, returns (None, None).
+
+    Examples:
+        "outer_1"          -> ("outer", [1])
+        "inner_2_3_steel"  -> ("inner", [2, 3])
+        "mid_1_2_3"        -> ("mid", [1, 2, 3])
+        "plate"            -> (None, None)
+    """
+    m = TIER_PATTERN.search(name)
+    if m:
+        tier = m.group("tier").lower()
+        levels_str = m.group("levels")
+        levels = [int(x) for x in re.split(r"[_\- ]", levels_str)]
+        return tier, levels
+    return None, None
+
+
+# ===================================================================
+# Core assembly (concentric stacking)
 # ===================================================================
 
 def stack_parts(parts, axis_vec, gap):
     """
-    Stack (cq.Workplane, name) tuples along `axis_vec` with `gap` spacing.
+    Assemble parts concentrically based on their tier/level naming.
+
+    Outer parts stack vertically (level 1 at z=0, level 2 on top, etc.).
+    Mid parts are XY-centered within the outer part at the same level.
+    Inner parts are XY-centered within the mid part (or outer) at the same level.
+    Parts without a tier/level name are treated as sequential outer parts.
+
     Returns a CadQuery Assembly and a list of (name, ocp_shape, location, rgb_tuple).
     """
-    assy = Assembly()
-    cursor = 0.0
-    part_info = []
+    # --- Classify parts by tier and levels ---
+    classified = []  # (tier, levels_list, wp, name, original_index)
+    auto_level = 1
 
     for i, (wp, name) in enumerate(parts):
+        tier, levels = parse_part_name(name)
+        if tier is None:
+            # Unrecognized naming — treat as sequential outer parts
+            tier = "outer"
+            levels = [auto_level]
+            auto_level += 1
+        classified.append((tier, levels, wp, name, i))
+
+    # --- Build the set of levels and group by (level, tier) ---
+    # Single-level parts go into levels_map[level][tier].
+    # Multi-level (spanning) parts are collected separately.
+    levels_map = {}  # level -> {tier -> (wp, name, original_index)}
+    spanning_parts = []  # (tier, levels_list, wp, name, original_index)
+
+    for tier, levels, wp, name, idx in classified:
+        if len(levels) == 1:
+            levels_map.setdefault(levels[0], {})[tier] = (wp, name, idx)
+        else:
+            spanning_parts.append((tier, levels, wp, name, idx))
+            # Ensure all spanned levels exist in levels_map
+            for lv in levels:
+                levels_map.setdefault(lv, {})
+
+    sorted_levels = sorted(levels_map.keys())
+
+    # --- Stack outer parts vertically, center mid/inner within them ---
+    assy = Assembly()
+    part_info = []
+    z_cursor = 0.0  # current Z position for stacking (always Z-axis for vertical)
+    level_z_base = {}  # level -> z_cursor at bottom of that level
+    level_z_top = {}   # level -> z at top of that level
+
+    for level in sorted_levels:
+        tier_group = levels_map[level]
+        level_z_base[level] = z_cursor
+
+        # Skip empty levels (only referenced by spanning parts, no own parts)
+        if not tier_group:
+            level_z_top[level] = z_cursor
+            continue
+
+        # Get the outer part for this level (required for positioning)
+        if "outer" in tier_group:
+            outer_wp, outer_name, outer_idx = tier_group["outer"]
+        elif "mid" in tier_group:
+            # No outer at this level — use mid as the stacking reference
+            outer_wp, outer_name, outer_idx = tier_group["mid"]
+        elif "inner" in tier_group:
+            outer_wp, outer_name, outer_idx = tier_group["inner"]
+        else:
+            level_z_top[level] = z_cursor
+            continue
+
+        outer_shape = outer_wp.val().wrapped
+        oxn, oyn, ozn, oxx, oyx, ozx = get_bounding_box(outer_shape)
+        outer_height = ozx - ozn
+
+        # Process each tier at this level
+        for tier in ("outer", "mid", "inner"):
+            if tier not in tier_group:
+                continue
+            wp, name, idx = tier_group[tier]
+            shape = wp.val().wrapped
+            pxn, pyn, pzn, pxx, pyx, pzx = get_bounding_box(shape)
+            part_cx = (pxn + pxx) / 2.0
+            part_cy = (pyn + pyx) / 2.0
+
+            if tier == "outer":
+                # Outer: just shift Z so base sits at z_cursor
+                dx = -part_cx  # center XY at origin
+                dy = -part_cy
+                dz = z_cursor - pzn
+            else:
+                # Mid/inner: center XY within the container at this level
+                dx = -part_cx
+                dy = -part_cy
+                dz = z_cursor - pzn
+
+            loc = Location(Vector(dx, dy, dz))
+            cq_color, rgb = pick_color(name, idx)
+
+            assy.add(wp, name=name, loc=loc, color=cq_color)
+            part_info.append((name, shape, loc, rgb))
+
+        # Advance the Z cursor past the outer part (+ gap)
+        level_z_top[level] = z_cursor + outer_height
+        z_cursor += outer_height + gap
+
+    # --- Place spanning parts (parts that cover multiple levels) ---
+    for tier, levels, wp, name, idx in spanning_parts:
+        first_level = min(levels)
+        last_level = max(levels)
+
+        if first_level not in level_z_base or last_level not in level_z_top:
+            continue
+
+        span_z_base = level_z_base[first_level]
+
         shape = wp.val().wrapped
+        pxn, pyn, pzn, pxx, pyx, pzx = get_bounding_box(shape)
+        part_cx = (pxn + pxx) / 2.0
+        part_cy = (pyn + pyx) / 2.0
 
-        lo, hi = shape_extent(shape, axis_vec)
-        extent = hi - lo
-
-        offset = cursor - lo
-        dx = offset * axis_vec.x
-        dy = offset * axis_vec.y
-        dz = offset * axis_vec.z
+        # Center XY at origin, place Z-base at the start of the first level
+        dx = -part_cx
+        dy = -part_cy
+        dz = span_z_base - pzn
 
         loc = Location(Vector(dx, dy, dz))
-        cq_color, rgb = pick_color(name, i)
+        cq_color, rgb = pick_color(name, idx)
 
         assy.add(wp, name=name, loc=loc, color=cq_color)
         part_info.append((name, shape, loc, rgb))
-
-        cursor += extent + gap
 
     return assy, part_info
 
@@ -304,11 +500,33 @@ def make_cutter(bbox_vals, angle, axis_vec):
 
 
 def cut_assembly(assy_compound, cutter_shape):
-    """Boolean-cut the assembly compound with the cutter."""
-    op = BRepAlgoAPI_Cut(assy_compound, cutter_shape)
+    """Boolean-cut the assembly compound with the cutter.
+
+    Uses fuzzy tolerance for robustness with mixed CAD/mesh geometry.
+    """
+    from OCP.TopTools import TopTools_ListOfShape
+
+    args_list = TopTools_ListOfShape()
+    args_list.Append(assy_compound)
+    tools_list = TopTools_ListOfShape()
+    tools_list.Append(cutter_shape)
+
+    op = BRepAlgoAPI_Cut()
+    op.SetArguments(args_list)
+    op.SetTools(tools_list)
+    op.SetFuzzyValue(1e-5)
+    op.SetRunParallel(True)
     op.Build()
     if not op.IsDone():
-        raise RuntimeError("Boolean cut operation failed")
+        # Fallback: try with larger tolerance
+        op2 = BRepAlgoAPI_Cut()
+        op2.SetArguments(args_list)
+        op2.SetTools(tools_list)
+        op2.SetFuzzyValue(1e-3)
+        op2.Build()
+        if not op2.IsDone():
+            raise RuntimeError("Boolean cut operation failed")
+        return op2.Shape()
     return op.Shape()
 
 
@@ -550,23 +768,48 @@ def run_pipeline(args):
         except Exception as e:
             print(f"  Warning: Assembly export issue: {e}")
 
-        # Build compound for cutting
+        # Build compound and compute global bounding box
         print(f"\nCutting assembly at {args.cut_angle} degrees...")
         builder = BRep_Builder()
         compound = TopoDS_Compound()
         builder.MakeCompound(compound)
+        moved_parts = []
         for name, shape, loc, color in part_info:
             moved = apply_location(shape, loc)
             builder.Add(compound, moved)
+            moved_parts.append((name, moved))
 
-        # Bounding box
         bbox = Bnd_Box()
         BRepBndLib.Add_s(compound, bbox)
         bbox_vals = bbox.Get()
-
         cutter = make_cutter(bbox_vals, args.cut_angle, axis_vec)
-        cut_result_shape = cut_assembly(compound, cutter)
-        print("  Cut complete.")
+
+        # Cut each part individually for robustness with mixed geometry
+        cut_builder = BRep_Builder()
+        cut_compound = TopoDS_Compound()
+        cut_builder.MakeCompound(cut_compound)
+        cut_ok = 0
+        cut_skip = 0
+
+        for pname, moved_shape in moved_parts:
+            try:
+                cut_part = cut_assembly(moved_shape, cutter)
+                # Verify the result is not empty
+                part_bbox = Bnd_Box()
+                BRepBndLib.Add_s(cut_part, part_bbox)
+                if not part_bbox.IsVoid():
+                    cut_builder.Add(cut_compound, cut_part)
+                    cut_ok += 1
+                else:
+                    cut_skip += 1
+            except Exception as e:
+                print(f"  Warning: cut failed for '{pname}': {e}")
+                # Include the original uncut part
+                cut_builder.Add(cut_compound, moved_shape)
+                cut_ok += 1
+
+        cut_result_shape = cut_compound
+        print(f"  Cut complete ({cut_ok} parts cut, {cut_skip} fully removed).")
 
         print(f"Exporting cut assembly: {output_step}")
         export_shape_step(cut_result_shape, output_step)
