@@ -1,0 +1,16 @@
+# CAD Assembly Pipeline dependencies
+#
+# Core CAD kernel (cadquery bundles OCP / OpenCascade bindings)
+cadquery>=2.4,<3
+numpy>=1.24
+
+# Rendering
+pyvista>=0.43
+
+# Mesh format support (.stl, .obj, .ply, .3mf)
+trimesh>=4.0
+networkx>=3.0
+lxml>=4.9
+
+# Testing
+pytest>=7.0
