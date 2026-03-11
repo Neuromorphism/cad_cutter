@@ -35,6 +35,7 @@ from assemble import (
     export_assembly_step,
     export_shape_step,
     tessellate_shape,
+    _mesh_shell_to_solid,
     AXIS_MAP,
     MATERIAL_COLORS,
 )
@@ -915,3 +916,151 @@ class TestMaterialDetection:
         _, rgb_lower = pick_color("copper_part", 0)
         _, rgb_mixed = pick_color("Copper_Part", 0)
         assert rgb_lower == rgb_mixed
+
+
+# ============================================================================
+# Test: Mixed format loading and assembly
+# ============================================================================
+
+class TestMixedFormats:
+    """Test that .step, .stl, .obj, and .ply files can be mixed freely."""
+
+    @pytest.fixture
+    def mixed_parts(self, tmp_dir):
+        """Create parts in multiple formats with tier/level names."""
+        paths = {}
+
+        # outer_1 as STEP
+        outer1 = cq.Workplane("XY").box(40, 40, 10)
+        p = os.path.join(tmp_dir, "outer_1.step")
+        cq.exporters.export(outer1, p)
+        paths["outer_1.step"] = p
+
+        # inner_1 as STL
+        inner1 = cq.Workplane("XY").cylinder(10, 4)
+        p = os.path.join(tmp_dir, "inner_1.stl")
+        cq.exporters.export(inner1, p, exportType="STL")
+        paths["inner_1.stl"] = p
+
+        # outer_2 as STEP
+        outer2 = cq.Workplane("XY").box(35, 35, 8)
+        p = os.path.join(tmp_dir, "outer_2.step")
+        cq.exporters.export(outer2, p)
+        paths["outer_2.step"] = p
+
+        # inner_2 as STL
+        inner2 = cq.Workplane("XY").cylinder(8, 3)
+        p = os.path.join(tmp_dir, "inner_2.stl")
+        cq.exporters.export(inner2, p, exportType="STL")
+        paths["inner_2.stl"] = p
+
+        return paths
+
+    def test_load_step(self, mixed_parts):
+        wp, name = load_part(mixed_parts["outer_1.step"])
+        assert name == "outer_1"
+        assert not wp.val().wrapped.IsNull()
+
+    def test_load_stl(self, mixed_parts):
+        wp, name = load_part(mixed_parts["inner_1.stl"])
+        assert name == "inner_1"
+        assert not wp.val().wrapped.IsNull()
+
+    def test_mixed_step_stl_assembly(self, mixed_parts):
+        """Assemble STEP + STL parts concentrically."""
+        parts = [
+            load_part(mixed_parts["outer_1.step"]),
+            load_part(mixed_parts["inner_1.stl"]),
+        ]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
+        assert len(info) == 2
+
+        # Both should have z-base at 0 (same level)
+        for name, shape, loc, rgb in info:
+            moved = apply_location(shape, loc)
+            _, _, zn, _, _, _ = get_bounding_box(moved)
+            assert abs(zn - 0) < 0.5
+
+    def test_mixed_two_level_assembly(self, mixed_parts):
+        """Two-level assembly mixing STEP and STL."""
+        parts = [
+            load_part(mixed_parts["outer_1.step"]),
+            load_part(mixed_parts["inner_1.stl"]),
+            load_part(mixed_parts["outer_2.step"]),
+            load_part(mixed_parts["inner_2.stl"]),
+        ]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=1)
+        assert len(info) == 4
+
+    def test_mixed_format_cut(self, mixed_parts):
+        """Cut a mixed STEP+STL assembly."""
+        parts = [
+            load_part(mixed_parts["outer_1.step"]),
+            load_part(mixed_parts["inner_1.stl"]),
+        ]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
+
+        # Cut each part individually (as the pipeline does)
+        cut_ok = 0
+        for name, shape, loc, rgb in info:
+            moved = apply_location(shape, loc)
+            bbox = Bnd_Box()
+            BRepBndLib.Add_s(moved, bbox)
+            cutter = make_cutter(bbox.Get(), 90, AXIS_MAP["z"])
+            result = cut_assembly(moved, cutter)
+            assert not result.IsNull()
+            cut_ok += 1
+        assert cut_ok == 2
+
+    def test_mixed_format_step_export(self, mixed_parts, tmp_dir):
+        """Export mixed-format assembly to STEP."""
+        parts = [
+            load_part(mixed_parts["outer_1.step"]),
+            load_part(mixed_parts["inner_1.stl"]),
+        ]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
+        out = os.path.join(tmp_dir, "mixed.step")
+        export_assembly_step(assy, out)
+        assert os.path.exists(out)
+        assert os.path.getsize(out) > 100
+
+    def test_mixed_format_tessellation(self, mixed_parts):
+        """Tessellate parts from different formats."""
+        for key in mixed_parts:
+            wp, name = load_part(mixed_parts[key])
+            verts, faces = tessellate_shape(wp.val().wrapped, tolerance=0.1)
+            assert len(verts) > 0, f"No vertices for {key}"
+            assert len(faces) > 0, f"No faces for {key}"
+
+
+class TestMeshToSolid:
+    """Test mesh-to-solid conversion for boolean compatibility."""
+
+    def test_stl_becomes_cuttable(self, tmp_dir):
+        """An STL-loaded part should survive a boolean cut."""
+        p = os.path.join(tmp_dir, "box.stl")
+        box = cq.Workplane("XY").box(20, 20, 10)
+        cq.exporters.export(box, p, exportType="STL")
+
+        wp, name = load_part(p)
+        shape = wp.val().wrapped
+
+        bbox = Bnd_Box()
+        BRepBndLib.Add_s(shape, bbox)
+        cutter = make_cutter(bbox.Get(), 90, AXIS_MAP["z"])
+        result = cut_assembly(shape, cutter)
+        assert not result.IsNull()
+
+    def test_solid_conversion_preserves_geometry(self, tmp_dir):
+        """Mesh-to-solid should keep roughly the same bounding box."""
+        p = os.path.join(tmp_dir, "cyl.stl")
+        cyl = cq.Workplane("XY").cylinder(20, 8)
+        cq.exporters.export(cyl, p, exportType="STL")
+
+        wp, _ = load_part(p)
+        shape = wp.val().wrapped
+        xn, yn, zn, xx, yx, zx = get_bounding_box(shape)
+
+        # Cylinder: radius 8, height 20 → x/y range ~[-8,8], z range ~[-10,10]
+        assert abs((xx - xn) - 16) < 1.0
+        assert abs((zx - zn) - 20) < 1.0

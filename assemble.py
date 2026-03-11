@@ -177,8 +177,56 @@ def load_cad_file(filepath):
         raise ValueError(f"Unsupported CAD format: {ext}")
 
 
+def _mesh_shell_to_solid(shape):
+    """Convert a mesh/shell TopoDS_Shape to a solid via sewing.
+
+    This is required so that boolean operations (cut) work on mesh-origin data.
+    Returns the solid shape, or the original shape if conversion fails.
+    """
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing, BRepBuilderAPI_MakeSolid
+    from OCP.TopAbs import TopAbs_SHELL, TopAbs_SOLID, TopAbs_COMPOUND
+    from OCP.TopoDS import TopoDS
+
+    # If already a solid, nothing to do
+    if shape.ShapeType() == TopAbs_SOLID:
+        return shape
+
+    try:
+        # Sew the faces into a shell
+        sew = BRepBuilderAPI_Sewing(1e-6)
+        sew.Add(shape)
+        sew.Perform()
+        sewn = sew.SewedShape()
+
+        # Try to extract a shell and make a solid
+        if sewn.ShapeType() == TopAbs_SHELL:
+            maker = BRepBuilderAPI_MakeSolid(TopoDS.Shell_s(sewn))
+            if maker.IsDone():
+                return maker.Solid()
+        elif sewn.ShapeType() == TopAbs_SOLID:
+            return sewn
+        elif sewn.ShapeType() == TopAbs_COMPOUND:
+            # Try to find a shell inside the compound
+            from OCP.TopExp import TopExp_Explorer
+            explorer = TopExp_Explorer(sewn, TopAbs_SHELL)
+            if explorer.More():
+                shell = TopoDS.Shell_s(explorer.Current())
+                maker = BRepBuilderAPI_MakeSolid(shell)
+                if maker.IsDone():
+                    return maker.Solid()
+    except Exception:
+        pass
+
+    return shape
+
+
 def load_mesh_file(filepath):
-    """Load a mesh file and convert to CadQuery shape."""
+    """Load a mesh file and convert to a CadQuery solid shape.
+
+    Supports .stl, .obj, .ply, .3mf. Non-STL formats are converted to STL
+    via trimesh first, then loaded through OCP and sewn into a solid for
+    compatibility with boolean operations (cutting).
+    """
     from OCP.StlAPI import StlAPI_Reader
 
     ext = os.path.splitext(filepath)[1].lower()
@@ -202,7 +250,8 @@ def load_mesh_file(filepath):
         reader = StlAPI_Reader()
         shape = TopoDS_Shape()
         reader.Read(shape, stl_path)
-        return cq.Workplane("XY").newObject([cq.Shape(shape)])
+        solid = _mesh_shell_to_solid(shape)
+        return cq.Workplane("XY").newObject([cq.Shape(solid)])
     finally:
         if tmp_stl:
             os.unlink(tmp_stl.name)
@@ -418,11 +467,33 @@ def make_cutter(bbox_vals, angle, axis_vec):
 
 
 def cut_assembly(assy_compound, cutter_shape):
-    """Boolean-cut the assembly compound with the cutter."""
-    op = BRepAlgoAPI_Cut(assy_compound, cutter_shape)
+    """Boolean-cut the assembly compound with the cutter.
+
+    Uses fuzzy tolerance for robustness with mixed CAD/mesh geometry.
+    """
+    from OCP.TopTools import TopTools_ListOfShape
+
+    args_list = TopTools_ListOfShape()
+    args_list.Append(assy_compound)
+    tools_list = TopTools_ListOfShape()
+    tools_list.Append(cutter_shape)
+
+    op = BRepAlgoAPI_Cut()
+    op.SetArguments(args_list)
+    op.SetTools(tools_list)
+    op.SetFuzzyValue(1e-5)
+    op.SetRunParallel(True)
     op.Build()
     if not op.IsDone():
-        raise RuntimeError("Boolean cut operation failed")
+        # Fallback: try with larger tolerance
+        op2 = BRepAlgoAPI_Cut()
+        op2.SetArguments(args_list)
+        op2.SetTools(tools_list)
+        op2.SetFuzzyValue(1e-3)
+        op2.Build()
+        if not op2.IsDone():
+            raise RuntimeError("Boolean cut operation failed")
+        return op2.Shape()
     return op.Shape()
 
 
@@ -664,23 +735,48 @@ def run_pipeline(args):
         except Exception as e:
             print(f"  Warning: Assembly export issue: {e}")
 
-        # Build compound for cutting
+        # Build compound and compute global bounding box
         print(f"\nCutting assembly at {args.cut_angle} degrees...")
         builder = BRep_Builder()
         compound = TopoDS_Compound()
         builder.MakeCompound(compound)
+        moved_parts = []
         for name, shape, loc, color in part_info:
             moved = apply_location(shape, loc)
             builder.Add(compound, moved)
+            moved_parts.append((name, moved))
 
-        # Bounding box
         bbox = Bnd_Box()
         BRepBndLib.Add_s(compound, bbox)
         bbox_vals = bbox.Get()
-
         cutter = make_cutter(bbox_vals, args.cut_angle, axis_vec)
-        cut_result_shape = cut_assembly(compound, cutter)
-        print("  Cut complete.")
+
+        # Cut each part individually for robustness with mixed geometry
+        cut_builder = BRep_Builder()
+        cut_compound = TopoDS_Compound()
+        cut_builder.MakeCompound(cut_compound)
+        cut_ok = 0
+        cut_skip = 0
+
+        for pname, moved_shape in moved_parts:
+            try:
+                cut_part = cut_assembly(moved_shape, cutter)
+                # Verify the result is not empty
+                part_bbox = Bnd_Box()
+                BRepBndLib.Add_s(cut_part, part_bbox)
+                if not part_bbox.IsVoid():
+                    cut_builder.Add(cut_compound, cut_part)
+                    cut_ok += 1
+                else:
+                    cut_skip += 1
+            except Exception as e:
+                print(f"  Warning: cut failed for '{pname}': {e}")
+                # Include the original uncut part
+                cut_builder.Add(cut_compound, moved_shape)
+                cut_ok += 1
+
+        cut_result_shape = cut_compound
+        print(f"  Cut complete ({cut_ok} parts cut, {cut_skip} fully removed).")
 
         print(f"Exporting cut assembly: {output_step}")
         export_shape_step(cut_result_shape, output_step)
