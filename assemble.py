@@ -297,20 +297,31 @@ def pick_color(name, index):
 
 TIER_ORDER = {"outer": 0, "mid": 1, "inner": 2}
 TIER_PATTERN = re.compile(
-    r"(?P<tier>inner|mid|outer)[_\- ]?(?P<level>\d+)", re.IGNORECASE
+    r"(?P<tier>inner|mid|outer)[_\- ]?(?P<levels>\d+(?:[_\- ]\d+)*)", re.IGNORECASE
 )
 
 
 def parse_part_name(name):
-    """Parse a part name into (tier, level).
+    """Parse a part name into (tier, levels).
+
+    Supports multi-level spans: ``inner_2_3`` means inner spanning levels 2-3.
 
     Returns:
-        (tier, level): tier is "outer"/"mid"/"inner", level is int >= 1.
+        (tier, levels): tier is "outer"/"mid"/"inner", levels is a list of ints.
         If the name doesn't match, returns (None, None).
+
+    Examples:
+        "outer_1"          -> ("outer", [1])
+        "inner_2_3_steel"  -> ("inner", [2, 3])
+        "mid_1_2_3"        -> ("mid", [1, 2, 3])
+        "plate"            -> (None, None)
     """
     m = TIER_PATTERN.search(name)
     if m:
-        return m.group("tier").lower(), int(m.group("level"))
+        tier = m.group("tier").lower()
+        levels_str = m.group("levels")
+        levels = [int(x) for x in re.split(r"[_\- ]", levels_str)]
+        return tier, levels
     return None, None
 
 
@@ -329,23 +340,33 @@ def stack_parts(parts, axis_vec, gap):
 
     Returns a CadQuery Assembly and a list of (name, ocp_shape, location, rgb_tuple).
     """
-    # --- Classify parts by tier and level ---
-    classified = []  # (tier, level, wp, name, original_index)
+    # --- Classify parts by tier and levels ---
+    classified = []  # (tier, levels_list, wp, name, original_index)
     auto_level = 1
 
     for i, (wp, name) in enumerate(parts):
-        tier, level = parse_part_name(name)
+        tier, levels = parse_part_name(name)
         if tier is None:
             # Unrecognized naming — treat as sequential outer parts
             tier = "outer"
-            level = auto_level
+            levels = [auto_level]
             auto_level += 1
-        classified.append((tier, level, wp, name, i))
+        classified.append((tier, levels, wp, name, i))
 
     # --- Build the set of levels and group by (level, tier) ---
+    # Single-level parts go into levels_map[level][tier].
+    # Multi-level (spanning) parts are collected separately.
     levels_map = {}  # level -> {tier -> (wp, name, original_index)}
-    for tier, level, wp, name, idx in classified:
-        levels_map.setdefault(level, {})[tier] = (wp, name, idx)
+    spanning_parts = []  # (tier, levels_list, wp, name, original_index)
+
+    for tier, levels, wp, name, idx in classified:
+        if len(levels) == 1:
+            levels_map.setdefault(levels[0], {})[tier] = (wp, name, idx)
+        else:
+            spanning_parts.append((tier, levels, wp, name, idx))
+            # Ensure all spanned levels exist in levels_map
+            for lv in levels:
+                levels_map.setdefault(lv, {})
 
     sorted_levels = sorted(levels_map.keys())
 
@@ -353,9 +374,17 @@ def stack_parts(parts, axis_vec, gap):
     assy = Assembly()
     part_info = []
     z_cursor = 0.0  # current Z position for stacking (always Z-axis for vertical)
+    level_z_base = {}  # level -> z_cursor at bottom of that level
+    level_z_top = {}   # level -> z at top of that level
 
     for level in sorted_levels:
         tier_group = levels_map[level]
+        level_z_base[level] = z_cursor
+
+        # Skip empty levels (only referenced by spanning parts, no own parts)
+        if not tier_group:
+            level_z_top[level] = z_cursor
+            continue
 
         # Get the outer part for this level (required for positioning)
         if "outer" in tier_group:
@@ -366,17 +395,12 @@ def stack_parts(parts, axis_vec, gap):
         elif "inner" in tier_group:
             outer_wp, outer_name, outer_idx = tier_group["inner"]
         else:
+            level_z_top[level] = z_cursor
             continue
 
         outer_shape = outer_wp.val().wrapped
         oxn, oyn, ozn, oxx, oyx, ozx = get_bounding_box(outer_shape)
         outer_height = ozx - ozn
-        outer_cx = (oxn + oxx) / 2.0
-        outer_cy = (oyn + oyx) / 2.0
-
-        # Place the outer part: shift so its Z-bottom sits at z_cursor,
-        # and keep its XY position (centered at origin).
-        outer_dz = z_cursor - ozn
 
         # Process each tier at this level
         for tier in ("outer", "mid", "inner"):
@@ -395,26 +419,8 @@ def stack_parts(parts, axis_vec, gap):
                 dz = z_cursor - pzn
             else:
                 # Mid/inner: center XY within the container at this level
-                # Find the container (outer for mid, mid for inner)
-                if tier == "mid":
-                    container_tier = "outer"
-                else:
-                    container_tier = "mid" if "mid" in tier_group else "outer"
-
-                if container_tier in tier_group:
-                    c_wp = tier_group[container_tier][0]
-                    c_shape = c_wp.val().wrapped
-                    cxn, cyn, czn, cxx, cyx, czx = get_bounding_box(c_shape)
-                    # Container center in XY (after it's been moved to origin)
-                    cont_cx = 0.0  # container is centered at origin
-                    cont_cy = 0.0
-                else:
-                    cont_cx = 0.0
-                    cont_cy = 0.0
-
-                # Center this part at origin XY, base at z_cursor
-                dx = cont_cx - part_cx
-                dy = cont_cy - part_cy
+                dx = -part_cx
+                dy = -part_cy
                 dz = z_cursor - pzn
 
             loc = Location(Vector(dx, dy, dz))
@@ -424,7 +430,34 @@ def stack_parts(parts, axis_vec, gap):
             part_info.append((name, shape, loc, rgb))
 
         # Advance the Z cursor past the outer part (+ gap)
+        level_z_top[level] = z_cursor + outer_height
         z_cursor += outer_height + gap
+
+    # --- Place spanning parts (parts that cover multiple levels) ---
+    for tier, levels, wp, name, idx in spanning_parts:
+        first_level = min(levels)
+        last_level = max(levels)
+
+        if first_level not in level_z_base or last_level not in level_z_top:
+            continue
+
+        span_z_base = level_z_base[first_level]
+
+        shape = wp.val().wrapped
+        pxn, pyn, pzn, pxx, pyx, pzx = get_bounding_box(shape)
+        part_cx = (pxn + pxx) / 2.0
+        part_cy = (pyn + pyx) / 2.0
+
+        # Center XY at origin, place Z-base at the start of the first level
+        dx = -part_cx
+        dy = -part_cy
+        dz = span_z_base - pzn
+
+        loc = Location(Vector(dx, dy, dz))
+        cq_color, rgb = pick_color(name, idx)
+
+        assy.add(wp, name=name, loc=loc, color=cq_color)
+        part_info.append((name, shape, loc, rgb))
 
     return assy, part_info
 

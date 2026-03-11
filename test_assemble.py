@@ -1,8 +1,8 @@
 """
 Tests for the CAD Assembly Pipeline (assemble.py).
 
-Covers: name parsing, concentric stacking, cutting, STEP export, tessellation,
-and rendering.
+Covers: name parsing, concentric stacking, multi-level spanning parts,
+cutting, STEP export, tessellation, mixed format support, and rendering.
 
 Run with:
   xvfb-run -a python3 -m pytest test_assemble.py -v
@@ -287,59 +287,79 @@ class TestColorPicking:
 
 class TestParsePartName:
     def test_outer_1(self):
-        tier, level = parse_part_name("outer_1")
+        tier, levels = parse_part_name("outer_1")
         assert tier == "outer"
-        assert level == 1
+        assert levels == [1]
 
     def test_mid_2(self):
-        tier, level = parse_part_name("mid_2")
+        tier, levels = parse_part_name("mid_2")
         assert tier == "mid"
-        assert level == 2
+        assert levels == [2]
 
     def test_inner_3(self):
-        tier, level = parse_part_name("inner_3")
+        tier, levels = parse_part_name("inner_3")
         assert tier == "inner"
-        assert level == 3
+        assert levels == [3]
 
     def test_case_insensitive(self):
-        tier, level = parse_part_name("OUTER_1")
+        tier, levels = parse_part_name("OUTER_1")
         assert tier == "outer"
-        assert level == 1
+        assert levels == [1]
 
     def test_mixed_case(self):
-        tier, level = parse_part_name("Inner_5")
+        tier, levels = parse_part_name("Inner_5")
         assert tier == "inner"
-        assert level == 5
+        assert levels == [5]
 
     def test_hyphen_separator(self):
-        tier, level = parse_part_name("outer-1")
+        tier, levels = parse_part_name("outer-1")
         assert tier == "outer"
-        assert level == 1
+        assert levels == [1]
 
     def test_no_separator(self):
-        tier, level = parse_part_name("outer1")
+        tier, levels = parse_part_name("outer1")
         assert tier == "outer"
-        assert level == 1
+        assert levels == [1]
 
     def test_with_material_prefix(self):
-        tier, level = parse_part_name("steel_outer_2")
+        tier, levels = parse_part_name("steel_outer_2")
         assert tier == "outer"
-        assert level == 2
+        assert levels == [2]
 
     def test_unrecognized_name(self):
-        tier, level = parse_part_name("plate")
+        tier, levels = parse_part_name("plate")
         assert tier is None
-        assert level is None
+        assert levels is None
 
     def test_unrecognized_with_number(self):
-        tier, level = parse_part_name("flange_3")
+        tier, levels = parse_part_name("flange_3")
         assert tier is None
-        assert level is None
+        assert levels is None
 
     def test_multi_digit_level(self):
-        tier, level = parse_part_name("outer_12")
+        tier, levels = parse_part_name("outer_12")
         assert tier == "outer"
-        assert level == 12
+        assert levels == [12]
+
+    def test_multi_level_span(self):
+        tier, levels = parse_part_name("inner_2_3")
+        assert tier == "inner"
+        assert levels == [2, 3]
+
+    def test_multi_level_three_sections(self):
+        tier, levels = parse_part_name("mid_1_2_3")
+        assert tier == "mid"
+        assert levels == [1, 2, 3]
+
+    def test_multi_level_with_material(self):
+        tier, levels = parse_part_name("inner_2_3_steel")
+        assert tier == "inner"
+        assert levels == [2, 3]
+
+    def test_multi_level_hyphen(self):
+        tier, levels = parse_part_name("outer-1-2")
+        assert tier == "outer"
+        assert levels == [1, 2]
 
 
 # ============================================================================
@@ -531,6 +551,152 @@ class TestConcentricStacking:
 
         for name in fwd_z:
             assert abs(fwd_z[name] - rev_z[name]) < 0.5
+
+
+class TestSpanningParts:
+    """Parts that span multiple sections (e.g. inner_2_3_steel)."""
+
+    @pytest.fixture
+    def three_level_parts(self, tmp_dir):
+        """Create 3 outer levels + a spanning inner part."""
+        paths = {}
+        for i in range(1, 4):
+            p = os.path.join(tmp_dir, f"outer_{i}.step")
+            box = cq.Workplane("XY").box(40, 40, 10)
+            cq.exporters.export(box, p)
+            paths[f"outer_{i}"] = p
+
+        # Inner part spanning levels 2-3, height 20 (should cover 2 levels)
+        p = os.path.join(tmp_dir, "inner_2_3_steel.step")
+        cyl = cq.Workplane("XY").cylinder(20, 5)
+        cq.exporters.export(cyl, p)
+        paths["inner_2_3_steel"] = p
+
+        return paths
+
+    def test_spanning_part_name_parsed(self):
+        tier, levels = parse_part_name("inner_2_3_steel")
+        assert tier == "inner"
+        assert levels == [2, 3]
+
+    def test_spanning_part_z_base(self, three_level_parts):
+        """A spanning part's Z-base should align with the first spanned level."""
+        parts = []
+        for key in ["outer_1", "outer_2", "outer_3", "inner_2_3_steel"]:
+            parts.append(load_part(three_level_parts[key]))
+
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
+
+        # Find the spanning part and level-2 outer
+        span_info = None
+        lvl2_info = None
+        for name, shape, loc, rgb in info:
+            if "2_3" in name:
+                span_info = (name, shape, loc, rgb)
+            elif name == "outer_2":
+                lvl2_info = (name, shape, loc, rgb)
+
+        assert span_info is not None, "Spanning part not found in assembly"
+        assert lvl2_info is not None, "outer_2 not found in assembly"
+
+        # Spanning part's Z-base should match outer_2's Z-base
+        span_moved = apply_location(span_info[1], span_info[2])
+        lvl2_moved = apply_location(lvl2_info[1], lvl2_info[2])
+        _, _, span_zn, _, _, _ = get_bounding_box(span_moved)
+        _, _, lvl2_zn, _, _, _ = get_bounding_box(lvl2_moved)
+        assert abs(span_zn - lvl2_zn) < 0.5
+
+    def test_spanning_part_is_xy_centered(self, three_level_parts):
+        """Spanning part should be XY-centered at origin."""
+        parts = []
+        for key in ["outer_1", "outer_2", "outer_3", "inner_2_3_steel"]:
+            parts.append(load_part(three_level_parts[key]))
+
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
+
+        for name, shape, loc, rgb in info:
+            if "2_3" in name:
+                moved = apply_location(shape, loc)
+                xn, yn, _, xx, yx, _ = get_bounding_box(moved)
+                cx = (xn + xx) / 2.0
+                cy = (yn + yx) / 2.0
+                assert abs(cx) < 0.5, f"Spanning part not centered in X: {cx}"
+                assert abs(cy) < 0.5, f"Spanning part not centered in Y: {cy}"
+
+    def test_spanning_part_with_gap(self, three_level_parts):
+        """Spanning part should respect gaps between levels."""
+        parts = []
+        for key in ["outer_1", "outer_2", "outer_3", "inner_2_3_steel"]:
+            parts.append(load_part(three_level_parts[key]))
+
+        gap = 5.0
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=gap)
+
+        # Level 1 outer is 10 high, gap 5 → level 2 starts at 15
+        for name, shape, loc, rgb in info:
+            if "2_3" in name:
+                moved = apply_location(shape, loc)
+                _, _, span_zn, _, _, _ = get_bounding_box(moved)
+                assert abs(span_zn - 15.0) < 0.5
+
+    def test_spanning_part_total_count(self, three_level_parts):
+        """Assembly should contain all 4 parts."""
+        parts = []
+        for key in ["outer_1", "outer_2", "outer_3", "inner_2_3_steel"]:
+            parts.append(load_part(three_level_parts[key]))
+
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
+        assert len(info) == 4
+
+    def test_spanning_part_gets_material_color(self, three_level_parts):
+        """inner_2_3_steel should be colored as steel."""
+        parts = []
+        for key in ["outer_1", "outer_2", "outer_3", "inner_2_3_steel"]:
+            parts.append(load_part(three_level_parts[key]))
+
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
+
+        for name, shape, loc, rgb in info:
+            if "steel" in name.lower():
+                # Steel color: R ~ 0.55
+                assert abs(rgb[0] - 0.55) < 0.01, f"Expected steel color, got {rgb}"
+
+    def test_spanning_three_levels(self, tmp_dir):
+        """A part spanning levels 1-2-3 starts at level 1."""
+        parts = []
+        for i in range(1, 4):
+            p = os.path.join(tmp_dir, f"outer_{i}.step")
+            cq.Workplane("XY").box(40, 40, 10).val().exportStep(p)
+            parts.append(load_part(p))
+
+        span_path = os.path.join(tmp_dir, "mid_1_2_3.step")
+        cq.Workplane("XY").cylinder(30, 8).val().exportStep(span_path)
+        parts.append(load_part(span_path))
+
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
+
+        for name, shape, loc, rgb in info:
+            if "1_2_3" in name:
+                moved = apply_location(shape, loc)
+                _, _, zn, _, _, _ = get_bounding_box(moved)
+                assert abs(zn) < 0.5, "3-level span should start at z=0"
+
+    def test_spanning_part_cuttable(self, three_level_parts):
+        """A spanning part should be cuttable like any other part."""
+        parts = []
+        for key in ["outer_1", "outer_2", "inner_2_3_steel"]:
+            parts.append(load_part(three_level_parts[key]))
+
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
+
+        # Cut each part
+        for name, shape, loc, rgb in info:
+            moved = apply_location(shape, loc)
+            bbox = Bnd_Box()
+            BRepBndLib.Add_s(moved, bbox)
+            cutter = make_cutter(bbox.Get(), 90, AXIS_MAP["z"])
+            result = cut_assembly(moved, cutter)
+            assert not result.IsNull(), f"Cut failed for spanning part '{name}'"
 
 
 class TestLegacyStacking:
