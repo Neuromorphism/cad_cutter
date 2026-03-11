@@ -1,7 +1,8 @@
 """
 Tests for the CAD Assembly Pipeline (assemble.py).
 
-Covers: loading, stacking, cutting, STEP export, tessellation, and rendering.
+Covers: name parsing, concentric stacking, cutting, STEP export, tessellation,
+and rendering.
 
 Run with:
   xvfb-run -a python3 -m pytest test_assemble.py -v
@@ -27,6 +28,7 @@ from assemble import (
     apply_location,
     load_part,
     pick_color,
+    parse_part_name,
     stack_parts,
     make_cutter,
     cut_assembly,
@@ -88,21 +90,56 @@ def flange_step(tmp_dir):
 
 
 @pytest.fixture
-def copper_part(tmp_dir):
-    """Create a part with 'copper' in name for material detection."""
-    path = os.path.join(tmp_dir, "copper_tube.step")
-    tube = cq.Workplane("XY").circle(10).circle(7).extrude(20)
-    cq.exporters.export(tube, path)
-    return path
-
-
-@pytest.fixture
 def stl_part(tmp_dir):
     """Create a simple STL mesh file."""
     path = os.path.join(tmp_dir, "mesh_part.stl")
     box = cq.Workplane("XY").box(15, 15, 8)
     cq.exporters.export(box, path, exportType="STL")
     return path
+
+
+def _make_concentric_parts(tmp_dir):
+    """Create a full set of concentric parts for two levels."""
+    paths = {}
+
+    # Level 1
+    outer1 = cq.Workplane("XY").box(60, 60, 15)
+    p = os.path.join(tmp_dir, "outer_1.step")
+    cq.exporters.export(outer1, p)
+    paths["outer_1"] = p
+
+    mid1 = cq.Workplane("XY").circle(20).circle(15).extrude(15)
+    p = os.path.join(tmp_dir, "mid_1.step")
+    cq.exporters.export(mid1, p)
+    paths["mid_1"] = p
+
+    inner1 = cq.Workplane("XY").cylinder(15, 5)
+    p = os.path.join(tmp_dir, "inner_1.step")
+    cq.exporters.export(inner1, p)
+    paths["inner_1"] = p
+
+    # Level 2
+    outer2 = cq.Workplane("XY").box(50, 50, 12)
+    p = os.path.join(tmp_dir, "outer_2.step")
+    cq.exporters.export(outer2, p)
+    paths["outer_2"] = p
+
+    mid2 = cq.Workplane("XY").circle(18).circle(12).extrude(12)
+    p = os.path.join(tmp_dir, "mid_2.step")
+    cq.exporters.export(mid2, p)
+    paths["mid_2"] = p
+
+    inner2 = cq.Workplane("XY").cylinder(12, 4)
+    p = os.path.join(tmp_dir, "inner_2.step")
+    cq.exporters.export(inner2, p)
+    paths["inner_2"] = p
+
+    return paths
+
+
+@pytest.fixture
+def concentric_parts(tmp_dir):
+    return _make_concentric_parts(tmp_dir)
 
 
 # ============================================================================
@@ -235,89 +272,308 @@ class TestColorPicking:
     def test_no_keyword_uses_palette(self):
         _, rgb1 = pick_color("part_a", 0)
         _, rgb2 = pick_color("part_b", 1)
-        assert rgb1 != rgb2  # different palette entries
+        assert rgb1 != rgb2
 
     def test_palette_wraps(self):
         _, rgb0 = pick_color("part", 0)
         _, rgb8 = pick_color("part", 8)
-        assert rgb0 == rgb8  # wraps around palette length
+        assert rgb0 == rgb8
 
 
 # ============================================================================
-# Test: Stacking
+# Test: Part name parsing
 # ============================================================================
 
-class TestStackParts:
-    def test_single_part_z(self, box_step):
-        wp, name = load_part(box_step)
+class TestParsePartName:
+    def test_outer_1(self):
+        tier, level = parse_part_name("outer_1")
+        assert tier == "outer"
+        assert level == 1
+
+    def test_mid_2(self):
+        tier, level = parse_part_name("mid_2")
+        assert tier == "mid"
+        assert level == 2
+
+    def test_inner_3(self):
+        tier, level = parse_part_name("inner_3")
+        assert tier == "inner"
+        assert level == 3
+
+    def test_case_insensitive(self):
+        tier, level = parse_part_name("OUTER_1")
+        assert tier == "outer"
+        assert level == 1
+
+    def test_mixed_case(self):
+        tier, level = parse_part_name("Inner_5")
+        assert tier == "inner"
+        assert level == 5
+
+    def test_hyphen_separator(self):
+        tier, level = parse_part_name("outer-1")
+        assert tier == "outer"
+        assert level == 1
+
+    def test_no_separator(self):
+        tier, level = parse_part_name("outer1")
+        assert tier == "outer"
+        assert level == 1
+
+    def test_with_material_prefix(self):
+        tier, level = parse_part_name("steel_outer_2")
+        assert tier == "outer"
+        assert level == 2
+
+    def test_unrecognized_name(self):
+        tier, level = parse_part_name("plate")
+        assert tier is None
+        assert level is None
+
+    def test_unrecognized_with_number(self):
+        tier, level = parse_part_name("flange_3")
+        assert tier is None
+        assert level is None
+
+    def test_multi_digit_level(self):
+        tier, level = parse_part_name("outer_12")
+        assert tier == "outer"
+        assert level == 12
+
+
+# ============================================================================
+# Test: Concentric stacking
+# ============================================================================
+
+class TestConcentricStacking:
+    def test_single_outer_base_at_z0(self, tmp_dir):
+        """A single outer_1 part should have its base at z=0."""
+        path = os.path.join(tmp_dir, "outer_1.step")
+        box = cq.Workplane("XY").box(40, 40, 10)
+        cq.exporters.export(box, path)
+
+        wp, name = load_part(path)
         assy, info = stack_parts([(wp, name)], AXIS_MAP["z"], gap=0)
         assert len(info) == 1
-        # Part should be moved so its bottom is at z=0
-        moved = apply_location(info[0][1], info[0][2])
-        xn, yn, zn, xx, yx, zx = get_bounding_box(moved)
-        assert abs(zn - 0) < 0.1  # bottom at z=0 (moved from z=-5)
 
-    def test_two_parts_stacked_z(self, box_step, cylinder_step):
+        moved = apply_location(info[0][1], info[0][2])
+        _, _, zn, _, _, zx = get_bounding_box(moved)
+        assert abs(zn - 0) < 0.1
+        assert abs(zx - 10) < 0.1
+
+    def test_two_outer_levels_stack(self, tmp_dir):
+        """outer_1 and outer_2 should stack vertically."""
+        p1 = os.path.join(tmp_dir, "outer_1.step")
+        cq.exporters.export(cq.Workplane("XY").box(40, 40, 10), p1)
+
+        p2 = os.path.join(tmp_dir, "outer_2.step")
+        cq.exporters.export(cq.Workplane("XY").box(30, 30, 8), p2)
+
+        parts = [load_part(p) for p in [p1, p2]]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
+        assert len(info) == 2
+
+        # outer_1: z = [0, 10]
+        m1 = apply_location(info[0][1], info[0][2])
+        _, _, z1n, _, _, z1x = get_bounding_box(m1)
+        assert abs(z1n - 0) < 0.1
+        assert abs(z1x - 10) < 0.1
+
+        # outer_2: z = [10, 18]
+        m2 = apply_location(info[1][1], info[1][2])
+        _, _, z2n, _, _, z2x = get_bounding_box(m2)
+        assert abs(z2n - 10) < 0.1
+        assert abs(z2x - 18) < 0.1
+
+    def test_gap_between_outer_levels(self, tmp_dir):
+        """Gap should separate outer levels."""
+        p1 = os.path.join(tmp_dir, "outer_1.step")
+        cq.exporters.export(cq.Workplane("XY").box(40, 40, 10), p1)
+
+        p2 = os.path.join(tmp_dir, "outer_2.step")
+        cq.exporters.export(cq.Workplane("XY").box(30, 30, 8), p2)
+
+        parts = [load_part(p) for p in [p1, p2]]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=5)
+
+        m1 = apply_location(info[0][1], info[0][2])
+        _, _, _, _, _, z1x = get_bounding_box(m1)
+
+        m2 = apply_location(info[1][1], info[1][2])
+        _, _, z2n, _, _, _ = get_bounding_box(m2)
+
+        assert abs(z2n - z1x - 5) < 0.5
+
+    def test_mid_centered_in_outer_xy(self, concentric_parts):
+        """mid_1 should be XY-centered within outer_1."""
+        parts = [
+            load_part(concentric_parts["outer_1"]),
+            load_part(concentric_parts["mid_1"]),
+        ]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
+
+        # Find mid and outer in results
+        outer_info = [i for i in info if "outer" in i[0]][0]
+        mid_info = [i for i in info if "mid" in i[0]][0]
+
+        outer_moved = apply_location(outer_info[1], outer_info[2])
+        mid_moved = apply_location(mid_info[1], mid_info[2])
+
+        oxn, oyn, _, oxx, oyx, _ = get_bounding_box(outer_moved)
+        mxn, myn, _, mxx, myx, _ = get_bounding_box(mid_moved)
+
+        outer_cx = (oxn + oxx) / 2
+        outer_cy = (oyn + oyx) / 2
+        mid_cx = (mxn + mxx) / 2
+        mid_cy = (myn + myx) / 2
+
+        assert abs(mid_cx - outer_cx) < 0.5
+        assert abs(mid_cy - outer_cy) < 0.5
+
+    def test_inner_centered_in_mid_xy(self, concentric_parts):
+        """inner_1 should be XY-centered within mid_1."""
+        parts = [
+            load_part(concentric_parts["outer_1"]),
+            load_part(concentric_parts["mid_1"]),
+            load_part(concentric_parts["inner_1"]),
+        ]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
+
+        mid_info = [i for i in info if "mid" in i[0]][0]
+        inner_info = [i for i in info if "inner" in i[0]][0]
+
+        mid_moved = apply_location(mid_info[1], mid_info[2])
+        inner_moved = apply_location(inner_info[1], inner_info[2])
+
+        mxn, myn, _, mxx, myx, _ = get_bounding_box(mid_moved)
+        ixn, iyn, _, ixx, iyx, _ = get_bounding_box(inner_moved)
+
+        mid_cx = (mxn + mxx) / 2
+        mid_cy = (myn + myx) / 2
+        inner_cx = (ixn + ixx) / 2
+        inner_cy = (iyn + iyx) / 2
+
+        assert abs(inner_cx - mid_cx) < 0.5
+        assert abs(inner_cy - mid_cy) < 0.5
+
+    def test_same_level_same_z_base(self, concentric_parts):
+        """All tiers at the same level should share the same Z base."""
+        parts = [
+            load_part(concentric_parts["outer_1"]),
+            load_part(concentric_parts["mid_1"]),
+            load_part(concentric_parts["inner_1"]),
+        ]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
+
+        z_bottoms = []
+        for name, shape, loc, rgb in info:
+            moved = apply_location(shape, loc)
+            _, _, zn, _, _, _ = get_bounding_box(moved)
+            z_bottoms.append(zn)
+
+        # All parts at level 1 should start at z=0
+        for zn in z_bottoms:
+            assert abs(zn - 0) < 0.5
+
+    def test_two_levels_full_concentric(self, concentric_parts):
+        """Full 2-level concentric assembly."""
+        parts = [
+            load_part(concentric_parts["outer_1"]),
+            load_part(concentric_parts["mid_1"]),
+            load_part(concentric_parts["inner_1"]),
+            load_part(concentric_parts["outer_2"]),
+            load_part(concentric_parts["mid_2"]),
+            load_part(concentric_parts["inner_2"]),
+        ]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=2)
+        assert len(info) == 6
+
+        # Level 1 parts at z=0, level 2 parts at z=15+2=17
+        level1 = [i for i in info if "_1" in i[0]]
+        level2 = [i for i in info if "_2" in i[0]]
+
+        for name, shape, loc, rgb in level1:
+            moved = apply_location(shape, loc)
+            _, _, zn, _, _, _ = get_bounding_box(moved)
+            assert abs(zn - 0) < 0.5, f"{name} z_bottom={zn}, expected 0"
+
+        for name, shape, loc, rgb in level2:
+            moved = apply_location(shape, loc)
+            _, _, zn, _, _, _ = get_bounding_box(moved)
+            assert abs(zn - 17) < 0.5, f"{name} z_bottom={zn}, expected 17"
+
+    def test_input_order_doesnt_matter(self, concentric_parts):
+        """Parts can be given in any order — result should be the same."""
+        # Forward order
+        parts_fwd = [
+            load_part(concentric_parts["outer_1"]),
+            load_part(concentric_parts["mid_1"]),
+            load_part(concentric_parts["inner_1"]),
+        ]
+        _, info_fwd = stack_parts(parts_fwd, AXIS_MAP["z"], gap=0)
+
+        # Reverse order
+        parts_rev = [
+            load_part(concentric_parts["inner_1"]),
+            load_part(concentric_parts["mid_1"]),
+            load_part(concentric_parts["outer_1"]),
+        ]
+        _, info_rev = stack_parts(parts_rev, AXIS_MAP["z"], gap=0)
+
+        # Both should produce 3 parts with same Z bottoms
+        def get_z_map(info):
+            return {n: get_bounding_box(apply_location(s, l))[2]
+                    for n, s, l, _ in info}
+
+        fwd_z = get_z_map(info_fwd)
+        rev_z = get_z_map(info_rev)
+
+        for name in fwd_z:
+            assert abs(fwd_z[name] - rev_z[name]) < 0.5
+
+
+class TestLegacyStacking:
+    """Parts without tier/level names stack as sequential outer parts."""
+
+    def test_unnamed_parts_stack_sequentially(self, box_step, cylinder_step):
         wp1, n1 = load_part(box_step)
         wp2, n2 = load_part(cylinder_step)
         assy, info = stack_parts([(wp1, n1), (wp2, n2)], AXIS_MAP["z"], gap=0)
         assert len(info) == 2
 
-        # First part: bottom at z=0, top at z=10
-        moved1 = apply_location(info[0][1], info[0][2])
-        _, _, z1n, _, _, z1x = get_bounding_box(moved1)
+        m1 = apply_location(info[0][1], info[0][2])
+        _, _, z1n, _, _, z1x = get_bounding_box(m1)
         assert abs(z1n - 0) < 0.1
-        assert abs(z1x - 10) < 0.1
 
-        # Second part: bottom at z=10
-        moved2 = apply_location(info[1][1], info[1][2])
-        _, _, z2n, _, _, z2x = get_bounding_box(moved2)
-        assert abs(z2n - 10) < 0.5
+        m2 = apply_location(info[1][1], info[1][2])
+        _, _, z2n, _, _, _ = get_bounding_box(m2)
+        assert abs(z2n - z1x) < 0.5
 
-    def test_gap_spacing(self, box_step, cylinder_step):
+    def test_unnamed_parts_gap(self, box_step, cylinder_step):
         wp1, n1 = load_part(box_step)
         wp2, n2 = load_part(cylinder_step)
         gap = 5.0
         assy, info = stack_parts([(wp1, n1), (wp2, n2)], AXIS_MAP["z"], gap=gap)
 
-        moved1 = apply_location(info[0][1], info[0][2])
-        _, _, _, _, _, z1x = get_bounding_box(moved1)
+        m1 = apply_location(info[0][1], info[0][2])
+        _, _, _, _, _, z1x = get_bounding_box(m1)
 
-        moved2 = apply_location(info[1][1], info[1][2])
-        _, _, z2n, _, _, _ = get_bounding_box(moved2)
+        m2 = apply_location(info[1][1], info[1][2])
+        _, _, z2n, _, _, _ = get_bounding_box(m2)
 
         assert abs(z2n - z1x - gap) < 0.5
 
-    def test_stack_x_axis(self, box_step, cylinder_step):
-        wp1, n1 = load_part(box_step)
-        wp2, n2 = load_part(cylinder_step)
-        assy, info = stack_parts([(wp1, n1), (wp2, n2)], AXIS_MAP["x"], gap=0)
-
-        moved1 = apply_location(info[0][1], info[0][2])
-        xn, _, _, xx, _, _ = get_bounding_box(moved1)
-        assert abs(xn - 0) < 0.1
-
-    def test_stack_y_axis(self, box_step, cylinder_step):
-        wp1, n1 = load_part(box_step)
-        wp2, n2 = load_part(cylinder_step)
-        assy, info = stack_parts([(wp1, n1), (wp2, n2)], AXIS_MAP["y"], gap=0)
-
-        moved1 = apply_location(info[0][1], info[0][2])
-        _, yn, _, _, yx, _ = get_bounding_box(moved1)
-        assert abs(yn - 0) < 0.1
-
-    def test_three_parts_ordered(self, box_step, cylinder_step, flange_step):
+    def test_three_unnamed_parts_ordered(self, box_step, cylinder_step, flange_step):
         parts = [load_part(p) for p in [box_step, cylinder_step, flange_step]]
         assy, info = stack_parts(parts, AXIS_MAP["z"], gap=2)
         assert len(info) == 3
 
-        # Verify ordering: each part's bottom >= previous part's top + gap
         prev_top = None
         for name, shape, loc, rgb in info:
             moved = apply_location(shape, loc)
             _, _, zn, _, _, zx = get_bounding_box(moved)
             if prev_top is not None:
-                assert zn >= prev_top + 1.5  # gap=2, allow tolerance
+                assert zn >= prev_top + 1.5
             prev_top = zx
 
 
@@ -342,13 +598,10 @@ class TestCutting:
 
         bbox = Bnd_Box()
         BRepBndLib.Add_s(compound, bbox)
-        bbox_vals = bbox.Get()
-
-        cutter = make_cutter(bbox_vals, 90, AXIS_MAP["z"])
+        cutter = make_cutter(bbox.Get(), 90, AXIS_MAP["z"])
         result = cut_assembly(compound, cutter)
 
         assert not result.IsNull()
-        # The result should exist (not be empty)
         result_bbox = Bnd_Box()
         BRepBndLib.Add_s(result, result_bbox)
         assert not result_bbox.IsVoid()
@@ -360,23 +613,23 @@ class TestCutting:
 
         bbox = Bnd_Box()
         BRepBndLib.Add_s(compound, bbox)
-        bbox_vals = bbox.Get()
-
-        cutter = make_cutter(bbox_vals, 180, AXIS_MAP["z"])
+        cutter = make_cutter(bbox.Get(), 180, AXIS_MAP["z"])
         result = cut_assembly(compound, cutter)
         assert not result.IsNull()
 
-    def test_cut_multi_part_assembly(self, box_step, cylinder_step):
-        wp1, n1 = load_part(box_step)
-        wp2, n2 = load_part(cylinder_step)
-        assy, info = stack_parts([(wp1, n1), (wp2, n2)], AXIS_MAP["z"], gap=1)
+    def test_cut_concentric_assembly(self, concentric_parts):
+        """Cut a full concentric assembly."""
+        parts = [
+            load_part(concentric_parts["outer_1"]),
+            load_part(concentric_parts["mid_1"]),
+            load_part(concentric_parts["inner_1"]),
+        ]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
         compound = self._build_compound(info)
 
         bbox = Bnd_Box()
         BRepBndLib.Add_s(compound, bbox)
-        bbox_vals = bbox.Get()
-
-        cutter = make_cutter(bbox_vals, 90, AXIS_MAP["z"])
+        cutter = make_cutter(bbox.Get(), 90, AXIS_MAP["z"])
         result = cut_assembly(compound, cutter)
         assert not result.IsNull()
 
@@ -447,10 +700,25 @@ class TestStepExport:
         out_path = os.path.join(tmp_dir, "reimport.step")
         export_assembly_step(assy, out_path)
 
-        # Reimport should succeed
         reimported = cq.importers.importStep(out_path)
         shape = reimported.val().wrapped
         assert not shape.IsNull()
+
+    def test_concentric_export_reimport(self, concentric_parts, tmp_dir):
+        """Export a concentric assembly and reimport."""
+        parts = [
+            load_part(concentric_parts["outer_1"]),
+            load_part(concentric_parts["mid_1"]),
+            load_part(concentric_parts["inner_1"]),
+        ]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
+
+        out_path = os.path.join(tmp_dir, "concentric_out.step")
+        export_assembly_step(assy, out_path)
+        assert os.path.exists(out_path)
+
+        reimported = cq.importers.importStep(out_path)
+        assert not reimported.val().wrapped.IsNull()
 
 
 # ============================================================================
@@ -463,20 +731,18 @@ class TestTessellation:
         verts, faces = tessellate_shape(box.val().wrapped, tolerance=0.1)
         assert len(verts) > 0
         assert len(faces) > 0
-        # Box should have at least 8 vertices and 12 triangles
         assert len(verts) >= 8
         assert len(faces) >= 12
 
     def test_cylinder_tessellation(self):
         cyl = cq.Workplane("XY").cylinder(20, 5)
         verts, faces = tessellate_shape(cyl.val().wrapped, tolerance=0.1)
-        assert len(verts) > 20  # cylinder needs many vertices
+        assert len(verts) > 20
         assert len(faces) > 10
 
     def test_face_format(self):
         box = cq.Workplane("XY").box(10, 10, 10)
         verts, faces = tessellate_shape(box.val().wrapped, tolerance=0.1)
-        # Each face row should be [3, i1, i2, i3] for triangles
         for face in faces:
             assert face[0] == 3
             assert all(0 <= face[j] < len(verts) for j in range(1, 4))
@@ -486,17 +752,15 @@ class TestTessellation:
         shape = cyl.val().wrapped
         v_coarse, f_coarse = tessellate_shape(shape, tolerance=1.0)
         v_fine, f_fine = tessellate_shape(shape, tolerance=0.01)
-        # Finer tolerance should produce more vertices
         assert len(v_fine) >= len(v_coarse)
 
 
 # ============================================================================
-# Test: End-to-end pipeline (no rendering — that requires xvfb)
+# Test: End-to-end pipeline (no rendering)
 # ============================================================================
 
 class TestPipelineNoRender:
     def test_single_part_pipeline(self, box_step, tmp_dir):
-        """Stack a single part and export."""
         wp, name = load_part(box_step)
         assy, info = stack_parts([(wp, name)], AXIS_MAP["z"], gap=0)
         out = os.path.join(tmp_dir, "single.step")
@@ -504,18 +768,21 @@ class TestPipelineNoRender:
         assert os.path.exists(out)
         assert os.path.getsize(out) > 100
 
-    def test_multi_part_pipeline(self, box_step, cylinder_step, flange_step, tmp_dir):
-        """Stack 3 parts and export."""
-        parts = [load_part(p) for p in [box_step, cylinder_step, flange_step]]
+    def test_concentric_pipeline(self, concentric_parts, tmp_dir):
+        """Full concentric assembly pipeline."""
+        parts = [load_part(concentric_parts[k])
+                 for k in ["outer_1", "mid_1", "inner_1", "outer_2", "mid_2", "inner_2"]]
         assy, info = stack_parts(parts, AXIS_MAP["z"], gap=2)
-        out = os.path.join(tmp_dir, "multi.step")
+        out = os.path.join(tmp_dir, "concentric.step")
         export_assembly_step(assy, out)
         assert os.path.exists(out)
+        assert os.path.getsize(out) > 100
 
-    def test_cut_pipeline(self, box_step, cylinder_step, tmp_dir):
-        """Stack, cut, export."""
-        parts = [load_part(p) for p in [box_step, cylinder_step]]
-        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=1)
+    def test_cut_concentric_pipeline(self, concentric_parts, tmp_dir):
+        """Cut a concentric assembly and export."""
+        parts = [load_part(concentric_parts[k])
+                 for k in ["outer_1", "mid_1", "inner_1"]]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
 
         builder = BRep_Builder()
         compound = TopoDS_Compound()
@@ -528,19 +795,17 @@ class TestPipelineNoRender:
         cutter = make_cutter(bbox.Get(), 120, AXIS_MAP["z"])
         result = cut_assembly(compound, cutter)
 
-        out = os.path.join(tmp_dir, "cut_pipeline.step")
+        out = os.path.join(tmp_dir, "cut_concentric.step")
         export_shape_step(result, out)
         assert os.path.exists(out)
         assert os.path.getsize(out) > 100
 
     def test_mesh_input_pipeline(self, stl_part, tmp_dir):
-        """Load an STL mesh and stack it."""
         wp, name = load_part(stl_part)
         assy, info = stack_parts([(wp, name)], AXIS_MAP["z"], gap=0)
         assert len(info) == 1
 
     def test_mixed_cad_mesh_pipeline(self, box_step, stl_part, tmp_dir):
-        """Mix STEP and STL inputs."""
         parts = [load_part(p) for p in [box_step, stl_part]]
         assy, info = stack_parts(parts, AXIS_MAP["z"], gap=2)
         assert len(info) == 2
@@ -551,7 +816,7 @@ class TestPipelineNoRender:
 # ============================================================================
 
 class TestEdgeCases:
-    def test_very_small_angle(self, box_step, tmp_dir):
+    def test_very_small_angle(self, box_step):
         wp, name = load_part(box_step)
         assy, info = stack_parts([(wp, name)], AXIS_MAP["z"], gap=0)
 
@@ -567,7 +832,7 @@ class TestEdgeCases:
         result = cut_assembly(compound, cutter)
         assert not result.IsNull()
 
-    def test_near_full_angle(self, box_step, tmp_dir):
+    def test_near_full_angle(self, box_step):
         wp, name = load_part(box_step)
         assy, info = stack_parts([(wp, name)], AXIS_MAP["z"], gap=0)
 
@@ -583,32 +848,50 @@ class TestEdgeCases:
         result = cut_assembly(compound, cutter)
         assert not result.IsNull()
 
-    def test_zero_gap(self, box_step, cylinder_step):
-        wp1, n1 = load_part(box_step)
-        wp2, n2 = load_part(cylinder_step)
-        assy, info = stack_parts([(wp1, n1), (wp2, n2)], AXIS_MAP["z"], gap=0)
+    def test_zero_gap(self, tmp_dir):
+        p1 = os.path.join(tmp_dir, "outer_1.step")
+        cq.exporters.export(cq.Workplane("XY").box(20, 20, 10), p1)
+        p2 = os.path.join(tmp_dir, "outer_2.step")
+        cq.exporters.export(cq.Workplane("XY").box(20, 20, 8), p2)
 
-        moved1 = apply_location(info[0][1], info[0][2])
-        _, _, _, _, _, z1x = get_bounding_box(moved1)
+        parts = [load_part(p) for p in [p1, p2]]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
 
-        moved2 = apply_location(info[1][1], info[1][2])
-        _, _, z2n, _, _, _ = get_bounding_box(moved2)
+        m1 = apply_location(info[0][1], info[0][2])
+        _, _, _, _, _, z1x = get_bounding_box(m1)
 
-        # Parts should be touching (no gap)
+        m2 = apply_location(info[1][1], info[1][2])
+        _, _, z2n, _, _, _ = get_bounding_box(m2)
+
         assert abs(z2n - z1x) < 0.5
 
-    def test_large_gap(self, box_step, cylinder_step):
-        wp1, n1 = load_part(box_step)
-        wp2, n2 = load_part(cylinder_step)
-        assy, info = stack_parts([(wp1, n1), (wp2, n2)], AXIS_MAP["z"], gap=100)
+    def test_large_gap(self, tmp_dir):
+        p1 = os.path.join(tmp_dir, "outer_1.step")
+        cq.exporters.export(cq.Workplane("XY").box(20, 20, 10), p1)
+        p2 = os.path.join(tmp_dir, "outer_2.step")
+        cq.exporters.export(cq.Workplane("XY").box(20, 20, 8), p2)
 
-        moved1 = apply_location(info[0][1], info[0][2])
-        _, _, _, _, _, z1x = get_bounding_box(moved1)
+        parts = [load_part(p) for p in [p1, p2]]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=100)
 
-        moved2 = apply_location(info[1][1], info[1][2])
-        _, _, z2n, _, _, _ = get_bounding_box(moved2)
+        m1 = apply_location(info[0][1], info[0][2])
+        _, _, _, _, _, z1x = get_bounding_box(m1)
+
+        m2 = apply_location(info[1][1], info[1][2])
+        _, _, z2n, _, _, _ = get_bounding_box(m2)
 
         assert abs(z2n - z1x - 100) < 0.5
+
+    def test_only_mid_and_inner_no_outer(self, tmp_dir):
+        """Level with mid and inner but no outer should still work."""
+        p1 = os.path.join(tmp_dir, "mid_1.step")
+        cq.exporters.export(cq.Workplane("XY").circle(15).extrude(10), p1)
+        p2 = os.path.join(tmp_dir, "inner_1.step")
+        cq.exporters.export(cq.Workplane("XY").cylinder(10, 3), p2)
+
+        parts = [load_part(p) for p in [p1, p2]]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
+        assert len(info) == 2
 
 
 # ============================================================================

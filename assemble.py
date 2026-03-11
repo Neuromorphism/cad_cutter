@@ -2,27 +2,38 @@
 """
 CAD Assembly Pipeline — Stack, Cut, and Render
 
-Takes multiple CAD/mesh files, stacks them into an assembly along a chosen axis,
-optionally cuts the assembly with a radial wedge cutter, exports a .step assembly
-file, and renders a professional-quality .png image.
+Takes multiple CAD/mesh files, assembles them concentrically, optionally cuts
+with a radial wedge cutter, exports a .step assembly file, and renders a
+professional-quality .png image.
+
+Part naming convention:
+  Parts are named as "<tier>_<level>" where:
+    tier  = "inner", "mid", or "outer"  (nesting position)
+    level = integer starting at 1       (vertical stack order)
+
+  Example filenames: outer_1.step, mid_1.step, inner_1.step, outer_2.step ...
+
+  - Outer parts stack vertically: outer_1 base at z=0, outer_2 on top, etc.
+  - Mid parts are XY-centered within the outer part at the same level.
+  - Inner parts are XY-centered within the mid part (or outer) at the same level.
+  - Parts without a recognized tier/level are treated as outer and stacked in order.
 
 Supported input formats:
   CAD:  .step / .stp / .iges / .igs / .brep
   Mesh: .stl / .obj / .ply / .3mf
 
 Usage examples:
-  # Stack parts and render
-  python assemble.py part_a.step part_b.stl -o assembly.step --render assembly.png
+  # Concentric assembly with cut and render
+  python assemble.py outer_1.step mid_1.step inner_1.step outer_2.step \\
+      -o assembly.step --cut-angle 90 --render assembly.png
 
-  # Stack with 5mm gap, cut at 90°, render at 4K
-  python assemble.py *.step -o assy.step --gap 5 --cut-angle 90 --render assy.png --resolution 4096
-
-  # Stack along X axis
-  python assemble.py housing.step rotor_copper.stl --axis x --render result.png
+  # Simple vertical stack (parts without tier names)
+  python assemble.py plate.step shaft.step flange.step -o assy.step --render assy.png
 """
 
 import sys
 import os
+import re
 import argparse
 import math
 import tempfile
@@ -232,36 +243,139 @@ def pick_color(name, index):
 
 
 # ===================================================================
-# Core assembly (stacking)
+# Part name parsing
+# ===================================================================
+
+TIER_ORDER = {"outer": 0, "mid": 1, "inner": 2}
+TIER_PATTERN = re.compile(
+    r"(?P<tier>inner|mid|outer)[_\- ]?(?P<level>\d+)", re.IGNORECASE
+)
+
+
+def parse_part_name(name):
+    """Parse a part name into (tier, level).
+
+    Returns:
+        (tier, level): tier is "outer"/"mid"/"inner", level is int >= 1.
+        If the name doesn't match, returns (None, None).
+    """
+    m = TIER_PATTERN.search(name)
+    if m:
+        return m.group("tier").lower(), int(m.group("level"))
+    return None, None
+
+
+# ===================================================================
+# Core assembly (concentric stacking)
 # ===================================================================
 
 def stack_parts(parts, axis_vec, gap):
     """
-    Stack (cq.Workplane, name) tuples along `axis_vec` with `gap` spacing.
+    Assemble parts concentrically based on their tier/level naming.
+
+    Outer parts stack vertically (level 1 at z=0, level 2 on top, etc.).
+    Mid parts are XY-centered within the outer part at the same level.
+    Inner parts are XY-centered within the mid part (or outer) at the same level.
+    Parts without a tier/level name are treated as sequential outer parts.
+
     Returns a CadQuery Assembly and a list of (name, ocp_shape, location, rgb_tuple).
     """
-    assy = Assembly()
-    cursor = 0.0
-    part_info = []
+    # --- Classify parts by tier and level ---
+    classified = []  # (tier, level, wp, name, original_index)
+    auto_level = 1
 
     for i, (wp, name) in enumerate(parts):
-        shape = wp.val().wrapped
+        tier, level = parse_part_name(name)
+        if tier is None:
+            # Unrecognized naming — treat as sequential outer parts
+            tier = "outer"
+            level = auto_level
+            auto_level += 1
+        classified.append((tier, level, wp, name, i))
 
-        lo, hi = shape_extent(shape, axis_vec)
-        extent = hi - lo
+    # --- Build the set of levels and group by (level, tier) ---
+    levels_map = {}  # level -> {tier -> (wp, name, original_index)}
+    for tier, level, wp, name, idx in classified:
+        levels_map.setdefault(level, {})[tier] = (wp, name, idx)
 
-        offset = cursor - lo
-        dx = offset * axis_vec.x
-        dy = offset * axis_vec.y
-        dz = offset * axis_vec.z
+    sorted_levels = sorted(levels_map.keys())
 
-        loc = Location(Vector(dx, dy, dz))
-        cq_color, rgb = pick_color(name, i)
+    # --- Stack outer parts vertically, center mid/inner within them ---
+    assy = Assembly()
+    part_info = []
+    z_cursor = 0.0  # current Z position for stacking (always Z-axis for vertical)
 
-        assy.add(wp, name=name, loc=loc, color=cq_color)
-        part_info.append((name, shape, loc, rgb))
+    for level in sorted_levels:
+        tier_group = levels_map[level]
 
-        cursor += extent + gap
+        # Get the outer part for this level (required for positioning)
+        if "outer" in tier_group:
+            outer_wp, outer_name, outer_idx = tier_group["outer"]
+        elif "mid" in tier_group:
+            # No outer at this level — use mid as the stacking reference
+            outer_wp, outer_name, outer_idx = tier_group["mid"]
+        elif "inner" in tier_group:
+            outer_wp, outer_name, outer_idx = tier_group["inner"]
+        else:
+            continue
+
+        outer_shape = outer_wp.val().wrapped
+        oxn, oyn, ozn, oxx, oyx, ozx = get_bounding_box(outer_shape)
+        outer_height = ozx - ozn
+        outer_cx = (oxn + oxx) / 2.0
+        outer_cy = (oyn + oyx) / 2.0
+
+        # Place the outer part: shift so its Z-bottom sits at z_cursor,
+        # and keep its XY position (centered at origin).
+        outer_dz = z_cursor - ozn
+
+        # Process each tier at this level
+        for tier in ("outer", "mid", "inner"):
+            if tier not in tier_group:
+                continue
+            wp, name, idx = tier_group[tier]
+            shape = wp.val().wrapped
+            pxn, pyn, pzn, pxx, pyx, pzx = get_bounding_box(shape)
+            part_cx = (pxn + pxx) / 2.0
+            part_cy = (pyn + pyx) / 2.0
+
+            if tier == "outer":
+                # Outer: just shift Z so base sits at z_cursor
+                dx = -part_cx  # center XY at origin
+                dy = -part_cy
+                dz = z_cursor - pzn
+            else:
+                # Mid/inner: center XY within the container at this level
+                # Find the container (outer for mid, mid for inner)
+                if tier == "mid":
+                    container_tier = "outer"
+                else:
+                    container_tier = "mid" if "mid" in tier_group else "outer"
+
+                if container_tier in tier_group:
+                    c_wp = tier_group[container_tier][0]
+                    c_shape = c_wp.val().wrapped
+                    cxn, cyn, czn, cxx, cyx, czx = get_bounding_box(c_shape)
+                    # Container center in XY (after it's been moved to origin)
+                    cont_cx = 0.0  # container is centered at origin
+                    cont_cy = 0.0
+                else:
+                    cont_cx = 0.0
+                    cont_cy = 0.0
+
+                # Center this part at origin XY, base at z_cursor
+                dx = cont_cx - part_cx
+                dy = cont_cy - part_cy
+                dz = z_cursor - pzn
+
+            loc = Location(Vector(dx, dy, dz))
+            cq_color, rgb = pick_color(name, idx)
+
+            assy.add(wp, name=name, loc=loc, color=cq_color)
+            part_info.append((name, shape, loc, rgb))
+
+        # Advance the Z cursor past the outer part (+ gap)
+        z_cursor += outer_height + gap
 
     return assy, part_info
 
