@@ -220,17 +220,24 @@ def apply_location(shape, loc):
 # Cylinder orientation
 # ===================================================================
 
-def orient_to_cylinder(parts):
-    """Rotate all parts so the cylinder height axis aligns with Z.
+def orient_to_cylinder(parts, gap=0.0):
+    """Rotate, orient, and restack parts so the cylinder height axis aligns with Z.
 
-    Uses PCA on the combined vertex cloud of all parts to find the principal
-    axis (direction of maximum variance), which corresponds to the cylinder
-    height direction.  All parts are rotated together by the same transform so
-    that axis → +Z.
+    Steps:
+    1. PCA on combined vertices → find cylinder height axis → rotate to Z.
+    2. For conic shapes, ensure the wider end is at the bottom (flip 180° if not).
+    3. Sort parts by centroid position along the new Z axis.
+    4. Restack sequentially: each part's bottom placed directly on top of the
+       previous part, with *gap* spacing between them.
 
-    Returns a list of (cq.Workplane, name) tuples with rotated shapes.
+    Returns a list of (cq.Workplane, name) tuples ready for normal stacking.
     """
-    # Collect all vertices via coarse tessellation (speed over accuracy)
+    if not parts:
+        return parts
+
+    # ------------------------------------------------------------------
+    # Step 1 – PCA to find the cylinder height axis and rotate to Z
+    # ------------------------------------------------------------------
     all_verts = []
     for wp, name in parts:
         shape = wp.val().wrapped
@@ -245,14 +252,11 @@ def orient_to_cylinder(parts):
     center = vertices.mean(axis=0)
     centered = vertices - center
 
-    # 3×3 covariance matrix; eigenvector with largest eigenvalue = principal axis
     cov = (centered.T @ centered) / len(vertices)
     eigenvalues, eigenvectors = np.linalg.eigh(cov)
-
-    # Largest eigenvalue index → cylinder height axis
     principal = eigenvectors[:, np.argmax(eigenvalues)]
 
-    # Prefer orientation with positive Z component for consistency
+    # Prefer the +Z half-space for a consistent initial orientation
     if principal[2] < 0:
         principal = -principal
 
@@ -262,33 +266,88 @@ def orient_to_cylinder(parts):
     px, py, pz = principal
     print(f"  Cylinder axis detected: ({px:.3f}, {py:.3f}, {pz:.3f})")
 
-    # Already aligned with +Z — nothing to do
-    if abs(dot) > 1.0 - 1e-6:
+    current_parts = parts
+    if abs(dot) < 1.0 - 1e-6:
+        rot_axis = np.cross(principal, z)
+        rot_axis = rot_axis / np.linalg.norm(rot_axis)
+        angle = math.acos(dot)
+        print(f"  Rotating {math.degrees(angle):.1f}° to align cylinder axis with Z.")
+
+        trsf = gp_Trsf()
+        trsf.SetRotation(
+            gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(*rot_axis.tolist())),
+            angle,
+        )
+        current_parts = []
+        for wp, name in parts:
+            shape = BRepBuilderAPI_Transform(wp.val().wrapped, trsf, True).Shape()
+            current_parts.append((cq.Workplane("XY").newObject([cq.Shape(shape)]), name))
+    else:
         print("  Parts already aligned with Z-axis.")
-        return parts
 
-    # Rotation axis = cross(principal, z), then normalize
-    rot_axis = np.cross(principal, z)
-    rot_axis = rot_axis / np.linalg.norm(rot_axis)
-    angle = math.acos(dot)
+    # ------------------------------------------------------------------
+    # Step 2 – Wider end down: compare average radial distance from the
+    #          Z-axis in the bottom and top halves of the combined vertex cloud.
+    # ------------------------------------------------------------------
+    verts_z = []
+    for wp, name in current_parts:
+        verts, _ = tessellate_shape(wp.val().wrapped, tolerance=1.0)
+        if len(verts) > 0:
+            verts_z.append(verts)
 
-    print(f"  Rotating {math.degrees(angle):.1f}° to align cylinder axis with Z.")
+    if verts_z:
+        vz = np.vstack(verts_z)
+        z_vals = vz[:, 2]
+        z_mid = (z_vals.min() + z_vals.max()) / 2.0
+        bot_mask = z_vals < z_mid
+        top_mask = z_vals >= z_mid
 
-    trsf = gp_Trsf()
-    ax1 = gp_Ax1(
-        gp_Pnt(0.0, 0.0, 0.0),
-        gp_Dir(float(rot_axis[0]), float(rot_axis[1]), float(rot_axis[2])),
-    )
-    trsf.SetRotation(ax1, angle)
+        if bot_mask.any() and top_mask.any():
+            r_bot = np.mean(np.hypot(vz[bot_mask, 0], vz[bot_mask, 1]))
+            r_top = np.mean(np.hypot(vz[top_mask, 0], vz[top_mask, 1]))
 
-    rotated_parts = []
-    for wp, name in parts:
+            if r_top > r_bot * (1.0 + 1e-3):
+                print(
+                    f"  Conic: wide end is up "
+                    f"(r_bottom={r_bot:.3f}, r_top={r_top:.3f}), flipping 180°."
+                )
+                flip = gp_Trsf()
+                flip.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(1, 0, 0)), math.pi)
+                flipped = []
+                for wp, name in current_parts:
+                    s = BRepBuilderAPI_Transform(wp.val().wrapped, flip, True).Shape()
+                    flipped.append((cq.Workplane("XY").newObject([cq.Shape(s)]), name))
+                current_parts = flipped
+
+    # ------------------------------------------------------------------
+    # Step 3 – Sort by centroid Z so parts are in natural stacking order
+    # ------------------------------------------------------------------
+    def _cz(wp_name):
+        shape = wp_name[0].val().wrapped
+        xn, yn, zn, xx, yx, zx = get_bounding_box(shape)
+        return (zn + zx) / 2.0
+
+    current_parts.sort(key=_cz)
+
+    # ------------------------------------------------------------------
+    # Step 4 – Restack: each part's bottom sits on top of the previous
+    #          part, with *gap* between adjacent parts.
+    # ------------------------------------------------------------------
+    restacked = []
+    z_cursor = 0.0
+    for wp, name in current_parts:
         shape = wp.val().wrapped
-        rotated = BRepBuilderAPI_Transform(shape, trsf, True).Shape()
-        new_wp = cq.Workplane("XY").newObject([cq.Shape(rotated)])
-        rotated_parts.append((new_wp, name))
+        xn, yn, zn, xx, yx, zx = get_bounding_box(shape)
+        height = zx - zn
+        dz = z_cursor - zn
+        if abs(dz) > 1e-9:
+            t = gp_Trsf()
+            t.SetTranslation(gp_Vec(0.0, 0.0, dz))
+            shape = BRepBuilderAPI_Transform(shape, t, True).Shape()
+        restacked.append((cq.Workplane("XY").newObject([cq.Shape(shape)]), name))
+        z_cursor += height + gap
 
-    return rotated_parts
+    return restacked
 
 
 # ===================================================================
@@ -1472,8 +1531,8 @@ def run_pipeline(args):
 
     # 1b. Cylinder orientation (optional)
     if getattr(args, "cyl", False):
-        print("\nOrient parts for cylinder (--cyl): aligning cylinder axis with Z...")
-        parts = orient_to_cylinder(parts)
+        print("\nOrient parts for cylinder (--cyl)...")
+        parts = orient_to_cylinder(parts, gap=args.gap)
 
     # 2. Stack parts
     axis_vec = AXIS_MAP[args.axis]
