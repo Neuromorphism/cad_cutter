@@ -329,6 +329,8 @@ def _mesh_shell_to_solid(shape):
 
     This is required so that boolean operations (cut) work on mesh-origin data.
     Returns the solid shape, or the original shape if conversion fails.
+
+    Tries progressively larger sewing tolerances to handle meshes with gaps.
     """
     from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing, BRepBuilderAPI_MakeSolid
     from OCP.TopAbs import TopAbs_SHELL, TopAbs_SOLID, TopAbs_COMPOUND
@@ -338,31 +340,32 @@ def _mesh_shell_to_solid(shape):
     if shape.ShapeType() == TopAbs_SOLID:
         return shape
 
-    try:
-        # Sew the faces into a shell
-        sew = BRepBuilderAPI_Sewing(1e-6)
-        sew.Add(shape)
-        sew.Perform()
-        sewn = sew.SewedShape()
+    for sew_tol in (1e-6, 1e-4, 1e-2):
+        try:
+            # Sew the faces into a shell
+            sew = BRepBuilderAPI_Sewing(sew_tol)
+            sew.Add(shape)
+            sew.Perform()
+            sewn = sew.SewedShape()
 
-        # Try to extract a shell and make a solid
-        if sewn.ShapeType() == TopAbs_SHELL:
-            maker = BRepBuilderAPI_MakeSolid(TopoDS.Shell_s(sewn))
-            if maker.IsDone():
-                return maker.Solid()
-        elif sewn.ShapeType() == TopAbs_SOLID:
-            return sewn
-        elif sewn.ShapeType() == TopAbs_COMPOUND:
-            # Try to find a shell inside the compound
-            from OCP.TopExp import TopExp_Explorer
-            explorer = TopExp_Explorer(sewn, TopAbs_SHELL)
-            if explorer.More():
-                shell = TopoDS.Shell_s(explorer.Current())
-                maker = BRepBuilderAPI_MakeSolid(shell)
+            # Try to extract a shell and make a solid
+            if sewn.ShapeType() == TopAbs_SHELL:
+                maker = BRepBuilderAPI_MakeSolid(TopoDS.Shell_s(sewn))
                 if maker.IsDone():
                     return maker.Solid()
-    except Exception:
-        pass
+            elif sewn.ShapeType() == TopAbs_SOLID:
+                return sewn
+            elif sewn.ShapeType() == TopAbs_COMPOUND:
+                # Try all shells inside the compound
+                explorer = TopExp_Explorer(sewn, TopAbs_SHELL)
+                while explorer.More():
+                    shell = TopoDS.Shell_s(explorer.Current())
+                    maker = BRepBuilderAPI_MakeSolid(shell)
+                    if maker.IsDone():
+                        return maker.Solid()
+                    explorer.Next()
+        except Exception:
+            continue
 
     return shape
 
@@ -730,35 +733,61 @@ def _axis_line(origin, direction):
 def cut_assembly(assy_compound, cutter_shape):
     """Boolean-cut the assembly compound with the cutter.
 
-    Uses fuzzy tolerance for robustness with mixed CAD/mesh geometry.
-    Enables parallel processing and non-destructive mode for speed.
+    Uses progressive fuzzy tolerance for robustness with mixed CAD/mesh geometry.
+    Validates each result with BRepCheck_Analyzer and retries with a larger
+    tolerance when the shape is geometrically invalid (e.g. non-manifold edges
+    produced by near-coplanar faces at tight tolerances).
     """
     from OCP.TopTools import TopTools_ListOfShape
+    from OCP.BRepCheck import BRepCheck_Analyzer
 
     args_list = TopTools_ListOfShape()
     args_list.Append(assy_compound)
     tools_list = TopTools_ListOfShape()
     tools_list.Append(cutter_shape)
 
-    op = BRepAlgoAPI_Cut()
-    op.SetArguments(args_list)
-    op.SetTools(tools_list)
-    op.SetFuzzyValue(1e-5)
-    op.SetRunParallel(True)
-    op.SetNonDestructive(True)
-    op.Build()
-    if not op.IsDone():
-        # Fallback: try with larger tolerance
-        op2 = BRepAlgoAPI_Cut()
-        op2.SetArguments(args_list)
-        op2.SetTools(tools_list)
-        op2.SetFuzzyValue(1e-3)
-        op2.SetRunParallel(True)
-        op2.Build()
-        if not op2.IsDone():
-            raise RuntimeError("Boolean cut operation failed")
-        return op2.Shape()
-    return op.Shape()
+    # Progressively looser tolerances; first attempt uses parallel mode for speed.
+    tolerances = [1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
+    last_result = None
+
+    for i, tol in enumerate(tolerances):
+        op = BRepAlgoAPI_Cut()
+        op.SetArguments(args_list)
+        op.SetTools(tools_list)
+        op.SetFuzzyValue(tol)
+        op.SetRunParallel(i == 0)   # parallel only on first attempt
+        op.SetNonDestructive(True)
+        op.Build()
+
+        if not op.IsDone():
+            continue
+
+        result = op.Shape()
+        if result is None or result.IsNull():
+            continue
+
+        # Accept the result only if the topology is valid; otherwise retry with
+        # a larger tolerance which smooths over near-coincident geometry.
+        if BRepCheck_Analyzer(result).IsValid():
+            return result
+
+        # Keep the best (most recent) result in case all tolerances fail validation
+        last_result = result
+
+    # If no tolerance produced a valid shape, try to heal the best result we got
+    if last_result is not None:
+        try:
+            from OCP.ShapeFix import ShapeFix_Shape
+            fixer = ShapeFix_Shape(last_result)
+            fixer.Perform()
+            fixed = fixer.Shape()
+            if fixed is not None and not fixed.IsNull():
+                return fixed
+        except Exception:
+            pass
+        return last_result
+
+    raise RuntimeError("Boolean cut operation failed after all tolerance attempts")
 
 
 # ===================================================================
