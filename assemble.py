@@ -227,6 +227,16 @@ def translate_shape(shape, dx, dy, dz):
     return BRepBuilderAPI_Transform(shape, trsf, True).Shape()
 
 
+def scale_shape(shape, factor):
+    """Return a uniformly scaled copy of the OCP shape.
+
+    Scales about the origin by *factor*.
+    """
+    trsf = gp_Trsf()
+    trsf.SetScaleFactor(factor)
+    return BRepBuilderAPI_Transform(shape, trsf, True).Shape()
+
+
 def apply_location(shape, loc):
     """Apply a CadQuery Location to an OCP shape, returning transformed shape."""
     if loc is None:
@@ -561,6 +571,163 @@ def parse_part_name(name):
             segment = segment.lower()
         return tier, levels, segment
     return None, None, None
+
+
+# ===================================================================
+# Autoscale helpers
+# ===================================================================
+
+_DIAMETER_PATTERN = re.compile(r"_d(\d+(?:\.\d+)?)", re.IGNORECASE)
+
+
+def _parse_target_diameter(name):
+    """Extract a target diameter from a ``_dN`` suffix in *name*.
+
+    Returns the numeric value as a float, or *None* if no such tag exists.
+
+    Examples:
+        "inner_2_3_d8"     -> 8.0
+        "inner_2_3_d12.5"  -> 12.5
+        "outer_1"          -> None
+    """
+    m = _DIAMETER_PATTERN.search(name)
+    if m:
+        return float(m.group(1))
+    return None
+
+
+def _get_xy_diameter(shape):
+    """Return the XY-plane diameter of *shape* (max of width and depth)."""
+    xn, yn, _, xx, yx, _ = get_tight_bounding_box(shape)
+    return max(xx - xn, yx - yn)
+
+
+# Thresholds used by autoscale unit detection.
+# If inner diameter < outer diameter / INNER_TINY_RATIO, the inner is
+# probably in mm while the outer is in inches.
+_INNER_TINY_RATIO = 5.0
+_MM_TO_INCH = 25.4
+_CM_TO_INCH = 2.54
+
+
+def autoscale_parts(parts):
+    """Detect unit mismatches and ``_dN`` diameter targets and rescale parts.
+
+    Strategy
+    --------
+    1. Use *outer* parts as the reference unit system.
+    2. For each section (level), compare the inner (or mid) part diameter to
+       the outer part diameter.  If the inner is much smaller than expected
+       it was likely modelled in mm while the outer is in inches — scale
+       it up by 25.4.  A factor around 2.54 indicates cm-to-inch.
+    3. If the part name contains ``_dN`` (e.g. ``inner_2_3_d8``), uniformly
+       scale the part so its XY diameter equals *N* in the outer-part units.
+
+    Parameters
+    ----------
+    parts : list[(cq.Workplane, str)]
+        Loaded parts (workplane + filename stem).
+
+    Returns
+    -------
+    list[(cq.Workplane, str)]
+        Parts with geometry scaled in-place where needed.
+    """
+    # Classify parts by tier and level so we can compare within sections.
+    by_level = {}  # level -> {tier -> [(index, wp, name)]}
+    for i, (wp, name) in enumerate(parts):
+        tier, levels, _seg = parse_part_name(name)
+        if tier is None or levels is None:
+            continue
+        for lv in levels:
+            by_level.setdefault(lv, {}).setdefault(tier, []).append(
+                (i, wp, name)
+            )
+
+    # Collect outer reference diameters per level.
+    outer_diams = {}  # level -> diameter
+    for lv, tier_map in by_level.items():
+        if "outer" in tier_map:
+            _idx, wp, _name = tier_map["outer"][0]
+            outer_diams[lv] = _get_xy_diameter(wp.val().wrapped)
+
+    # Build a single "reference outer diameter" (median of all levels).
+    if outer_diams:
+        ref_outer_diam = sorted(outer_diams.values())[len(outer_diams) // 2]
+    else:
+        ref_outer_diam = None
+
+    scaled = list(parts)  # shallow copy; we'll replace entries that change
+
+    for lv, tier_map in by_level.items():
+        outer_diam = outer_diams.get(lv, ref_outer_diam)
+        if outer_diam is None:
+            continue
+
+        for tier in ("mid", "inner"):
+            if tier not in tier_map:
+                continue
+            for idx, wp, name in tier_map[tier]:
+                shape = wp.val().wrapped
+
+                # --- Check for explicit _dN target diameter ---
+                target_diam = _parse_target_diameter(name)
+                if target_diam is not None:
+                    cur_diam = _get_xy_diameter(shape)
+                    if cur_diam > 1e-9:
+                        factor = target_diam / cur_diam
+                        if abs(factor - 1.0) > 0.01:
+                            new_shape = scale_shape(shape, factor)
+                            new_wp = cq.Workplane("XY").newObject(
+                                [cq.Shape(new_shape)]
+                            )
+                            scaled[idx] = (new_wp, name)
+                            print(
+                                f"  Autoscale {name}: diameter "
+                                f"{cur_diam:.2f} -> {target_diam:.2f} "
+                                f"(x{factor:.4f})"
+                            )
+                    continue  # _dN takes precedence; skip unit heuristic
+
+                # --- Heuristic: detect mm-vs-inch mismatch ---
+                cur_diam = _get_xy_diameter(shape)
+                if cur_diam < 1e-9:
+                    continue
+
+                ratio = outer_diam / cur_diam
+                if ratio > _INNER_TINY_RATIO:
+                    # Inner is suspiciously small.  Try mm->inch scale.
+                    test_mm = cur_diam * _MM_TO_INCH
+                    test_cm = cur_diam * _CM_TO_INCH
+                    # Pick the scale that brings diameter closest to
+                    # outer (but still smaller or equal).
+                    best_factor = None
+                    best_diff = float("inf")
+                    for f, label in (
+                        (_MM_TO_INCH, "mm->in"),
+                        (_CM_TO_INCH, "cm->in"),
+                    ):
+                        candidate = cur_diam * f
+                        diff = abs(outer_diam - candidate)
+                        if diff < best_diff:
+                            best_diff = diff
+                            best_factor = f
+                            best_label = label
+
+                    if best_factor is not None and abs(best_factor - 1.0) > 0.01:
+                        new_shape = scale_shape(shape, best_factor)
+                        new_wp = cq.Workplane("XY").newObject(
+                            [cq.Shape(new_shape)]
+                        )
+                        scaled[idx] = (new_wp, name)
+                        print(
+                            f"  Autoscale {name}: {best_label} "
+                            f"(x{best_factor:.2f}), diameter "
+                            f"{cur_diam:.2f} -> {cur_diam * best_factor:.2f} "
+                            f"(outer ref {outer_diam:.2f})"
+                        )
+
+    return scaled
 
 
 # ===================================================================
@@ -1967,6 +2134,11 @@ def run_pipeline(args):
         print("No valid parts loaded. Exiting.")
         return 1
 
+    # 1a. Autoscale (optional) — runs before orient so diameters are correct
+    if getattr(args, "autoscale", False):
+        print("\nAuto-scaling parts (--autoscale)...")
+        parts = autoscale_parts(parts)
+
     # 1b. Cylinder orientation (optional)
     if getattr(args, "cyl", False):
         print("\nOrient parts for cylinder (--cyl)...")
@@ -2200,6 +2372,15 @@ def main():
         help="Run a quick physics simulation: stack parts and release under "
              "gravity so concentric parts nest together.  Reports effective "
              "gaps (which become negative when parts nest inside each other).",
+    )
+    parser.add_argument(
+        "--autoscale", action="store_true",
+        help="Auto-detect unit mismatches between parts and rescale.  "
+             "Compares inner/mid diameters to outer parts; if an inner part "
+             "is tiny relative to its outer, it is scaled up (mm->inch by "
+             "25.4 or cm->inch by 2.54).  Parts with a '_dN' tag in the "
+             "name (e.g. inner_2_3_d8) are scaled to diameter N in the "
+             "outer-part unit system.",
     )
     parser.add_argument(
         "--debug", action="store_true",
