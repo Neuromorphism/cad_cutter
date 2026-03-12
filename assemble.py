@@ -1051,6 +1051,15 @@ def run_pipeline(args):
         bbox_vals = bbox.Get()
         cutter = make_cutter(bbox_vals, args.cut_angle, axis_vec)
 
+        if args.debug:
+            dbg_radius, dbg_height, dbg_origin, dbg_direction = _cutter_params(bbox_vals, axis_vec)
+            print(f"  [DEBUG] Cutter params: radius={dbg_radius:.3f}, height={dbg_height:.3f}, "
+                  f"origin=({dbg_origin.X():.3f}, {dbg_origin.Y():.3f}, {dbg_origin.Z():.3f}), "
+                  f"direction=({dbg_direction.X():.3f}, {dbg_direction.Y():.3f}, {dbg_direction.Z():.3f}), "
+                  f"angle={args.cut_angle} deg")
+            print(f"  [DEBUG] bbox: xmin={bbox_vals[0]:.3f} ymin={bbox_vals[1]:.3f} zmin={bbox_vals[2]:.3f} "
+                  f"xmax={bbox_vals[3]:.3f} ymax={bbox_vals[4]:.3f} zmax={bbox_vals[5]:.3f}")
+
         # Pre-build segment cutters if any parts use a/b splitting
         has_segments = any(seg is not None for _, _, seg in moved_parts)
         seg_cutters = {}
@@ -1079,13 +1088,21 @@ def run_pipeline(args):
                 if not part_bbox.IsVoid():
                     cut_builder.Add(cut_compound, cut_part)
                     cut_ok += 1
+                    if args.debug:
+                        print(f"  [DEBUG] '{pname}': cut succeeded.")
                 else:
                     cut_skip += 1
+                    if args.debug:
+                        print(f"  [DEBUG] '{pname}': fully removed by cutter.")
             except Exception as e:
                 print(f"  Warning: cut failed for '{pname}': {e}")
                 # Include the original uncut part
                 cut_builder.Add(cut_compound, moved_shape)
                 cut_ok += 1
+
+        if args.debug:
+            print("  [DEBUG] Including cutter shape in output STEP as 'CUTTER_DEBUG'.")
+            cut_builder.Add(cut_compound, cutter)
 
         cut_result_shape = cut_compound
         print(f"  Cut complete ({cut_ok} parts cut, {cut_skip} fully removed).")
