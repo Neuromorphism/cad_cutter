@@ -26,6 +26,7 @@ from assemble import (
     get_tight_bounding_box,
     shape_extent,
     translate_shape,
+    scale_shape,
     apply_location,
     load_part,
     pick_color,
@@ -43,6 +44,9 @@ from assemble import (
     expand_inputs,
     orient_to_cylinder,
     _mesh_shell_to_solid,
+    autoscale_parts,
+    _parse_target_diameter,
+    _get_xy_diameter,
     AXIS_MAP,
     MATERIAL_COLORS,
 )
@@ -2593,3 +2597,122 @@ class TestPhysPipeline:
         ret = run_pipeline(args)
         assert ret == 0
         assert os.path.exists(args.output)
+
+
+# ============================================================================
+# Autoscale
+# ============================================================================
+
+class TestParseTargetDiameter:
+    """Tests for _parse_target_diameter helper."""
+
+    def test_basic(self):
+        assert _parse_target_diameter("inner_2_3_d8") == 8.0
+
+    def test_decimal(self):
+        assert _parse_target_diameter("inner_1_d12.5") == 12.5
+
+    def test_no_match(self):
+        assert _parse_target_diameter("outer_1") is None
+
+    def test_case_insensitive(self):
+        assert _parse_target_diameter("inner_1_D10") == 10.0
+
+
+class TestGetXYDiameter:
+    """Tests for _get_xy_diameter helper."""
+
+    def test_box(self):
+        box = cq.Workplane("XY").box(20, 30, 10)
+        diam = _get_xy_diameter(box.val().wrapped)
+        assert abs(diam - 30.0) < 0.5  # max(20, 30) = 30
+
+    def test_cylinder(self):
+        cyl = cq.Workplane("XY").cylinder(10, 5)  # height=10, radius=5
+        diam = _get_xy_diameter(cyl.val().wrapped)
+        assert abs(diam - 10.0) < 0.5  # diameter = 2*radius = 10
+
+
+class TestScaleShape:
+    """Tests for scale_shape helper."""
+
+    def test_double(self):
+        box = cq.Workplane("XY").box(10, 10, 10)
+        shape = box.val().wrapped
+        scaled = scale_shape(shape, 2.0)
+        xn, yn, zn, xx, yx, zx = get_tight_bounding_box(scaled)
+        assert abs((xx - xn) - 20.0) < 0.5
+        assert abs((yx - yn) - 20.0) < 0.5
+        assert abs((zx - zn) - 20.0) < 0.5
+
+    def test_half(self):
+        box = cq.Workplane("XY").box(10, 10, 10)
+        shape = box.val().wrapped
+        scaled = scale_shape(shape, 0.5)
+        xn, yn, zn, xx, yx, zx = get_tight_bounding_box(scaled)
+        assert abs((xx - xn) - 5.0) < 0.5
+
+
+class TestAutoscaleParts:
+    """Tests for autoscale_parts — unit mismatch detection and _dN scaling."""
+
+    def test_no_scaling_when_similar_size(self):
+        """Parts of similar size should not be rescaled."""
+        outer = cq.Workplane("XY").cylinder(10, 25)  # diam ~50
+        inner = cq.Workplane("XY").cylinder(10, 10)  # diam ~20
+        parts = [(outer, "outer_1"), (inner, "inner_1")]
+        result = autoscale_parts(parts)
+        # inner is smaller but not drastically; no scaling expected
+        orig_diam = _get_xy_diameter(inner.val().wrapped)
+        result_diam = _get_xy_diameter(result[1][0].val().wrapped)
+        assert abs(result_diam - orig_diam) < 0.5
+
+    def test_mm_to_inch_detection(self):
+        """Inner modelled in mm should be scaled up by ~25.4 when outer is in inches."""
+        # Outer is 2 inches diameter = 50.8 mm, but in inches it's diam=2
+        outer = cq.Workplane("XY").cylinder(10, 25)   # diam=50 (inch units)
+        # Inner is 1.5 inches = 38.1 mm, but modelled in mm so diam=1.5
+        inner = cq.Workplane("XY").cylinder(10, 0.75)  # diam=1.5 (mm value)
+        parts = [(outer, "outer_1"), (inner, "inner_1")]
+        result = autoscale_parts(parts)
+        result_diam = _get_xy_diameter(result[1][0].val().wrapped)
+        # 1.5 * 25.4 = 38.1, which is closer to 50 than 1.5 * 2.54 = 3.81
+        assert result_diam > 30.0, f"Expected scaled up diameter, got {result_diam}"
+
+    def test_d_tag_scaling(self):
+        """Parts with _dN tag should be scaled to diameter N."""
+        outer = cq.Workplane("XY").cylinder(10, 25)  # diam=50
+        inner = cq.Workplane("XY").cylinder(10, 5)   # diam=10
+        parts = [(outer, "outer_1"), (inner, "inner_1_d30")]
+        result = autoscale_parts(parts)
+        result_diam = _get_xy_diameter(result[1][0].val().wrapped)
+        assert abs(result_diam - 30.0) < 1.0, f"Expected ~30, got {result_diam}"
+
+    def test_outer_not_scaled(self):
+        """Outer parts should never be scaled (they are the reference)."""
+        outer = cq.Workplane("XY").cylinder(10, 25)  # diam=50
+        inner = cq.Workplane("XY").cylinder(10, 0.75)
+        parts = [(outer, "outer_1"), (inner, "inner_1")]
+        result = autoscale_parts(parts)
+        orig_diam = _get_xy_diameter(outer.val().wrapped)
+        result_diam = _get_xy_diameter(result[0][0].val().wrapped)
+        assert abs(result_diam - orig_diam) < 0.1
+
+    def test_multi_level(self):
+        """Each level's inner should be scaled independently."""
+        outer1 = cq.Workplane("XY").cylinder(10, 25)   # diam=50
+        inner1 = cq.Workplane("XY").cylinder(10, 0.75)  # tiny → mm heuristic
+        outer2 = cq.Workplane("XY").cylinder(10, 25)
+        inner2 = cq.Workplane("XY").cylinder(10, 10)   # normal → no scaling
+        parts = [
+            (outer1, "outer_1"), (inner1, "inner_1"),
+            (outer2, "outer_2"), (inner2, "inner_2"),
+        ]
+        result = autoscale_parts(parts)
+        # inner_1 should have been scaled
+        d1 = _get_xy_diameter(result[1][0].val().wrapped)
+        assert d1 > 10.0, f"inner_1 should be scaled up, got {d1}"
+        # inner_2 should NOT have been scaled
+        d2_orig = _get_xy_diameter(inner2.val().wrapped)
+        d2_result = _get_xy_diameter(result[3][0].val().wrapped)
+        assert abs(d2_result - d2_orig) < 0.5
