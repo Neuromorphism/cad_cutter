@@ -1635,7 +1635,7 @@ def _report_nesting(part_info, ax, original_gap, debug):
 
 def export_assembly_step(assy, filepath):
     """Export a CadQuery Assembly to a STEP file."""
-    assy.save(filepath, "STEP")
+    assy.export(filepath, "STEP")
 
 
 def export_shape_step(shape, filepath):
