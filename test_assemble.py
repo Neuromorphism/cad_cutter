@@ -35,6 +35,7 @@ from assemble import (
     export_assembly_step,
     export_shape_step,
     tessellate_shape,
+    expand_inputs,
     _mesh_shell_to_solid,
     AXIS_MAP,
     MATERIAL_COLORS,
@@ -250,6 +251,83 @@ class TestLoadPart:
             f.write("dummy")
         with pytest.raises(ValueError, match="Unsupported"):
             load_part(path)
+
+
+# ============================================================================
+# Test: Glob expansion (expand_inputs)
+# ============================================================================
+
+class TestExpandInputs:
+    """Test that glob patterns and mixed-case extensions are expanded."""
+
+    @pytest.fixture
+    def glob_dir(self, tmp_dir):
+        """Create files with mixed-case extensions for glob testing."""
+        files = {}
+        box = cq.Workplane("XY").box(10, 10, 5)
+        for name, ext in [("outer_1", ".STEP"), ("outer_2", ".step"),
+                          ("inner_1", ".STL"), ("inner_2", ".stl")]:
+            p = os.path.join(tmp_dir, name + ext)
+            if ext.lower() in (".step", ".stp"):
+                cq.exporters.export(box, p)
+            else:
+                cq.exporters.export(box, p, exportType="STL")
+            files[name] = p
+        return tmp_dir, files
+
+    def test_literal_paths_kept(self, glob_dir):
+        d, files = glob_dir
+        result = expand_inputs([files["outer_1"], files["inner_2"]])
+        assert len(result) == 2
+
+    def test_glob_star_step_finds_both_cases(self, glob_dir):
+        d, files = glob_dir
+        result = expand_inputs([os.path.join(d, "*.STEP")])
+        basenames = {os.path.basename(r) for r in result}
+        assert "outer_1.STEP" in basenames
+        assert "outer_2.step" in basenames
+
+    def test_glob_star_stl_finds_both_cases(self, glob_dir):
+        d, files = glob_dir
+        result = expand_inputs([os.path.join(d, "*.stl")])
+        basenames = {os.path.basename(r) for r in result}
+        assert "inner_1.STL" in basenames
+        assert "inner_2.stl" in basenames
+
+    def test_mixed_globs_and_literals(self, glob_dir):
+        d, files = glob_dir
+        result = expand_inputs([
+            files["outer_1"],            # literal
+            os.path.join(d, "*.stl"),    # glob
+        ])
+        assert len(result) == 3  # 1 literal + 2 stl
+
+    def test_deduplication(self, glob_dir):
+        d, files = glob_dir
+        result = expand_inputs([
+            files["outer_1"],
+            os.path.join(d, "*.STEP"),  # includes outer_1.STEP again
+        ])
+        # outer_1.STEP should appear only once
+        count = sum(1 for r in result if "outer_1" in r)
+        assert count == 1
+
+    def test_nonexistent_literal_passed_through(self):
+        result = expand_inputs(["/no/such/file.step"])
+        assert len(result) == 1
+        assert result[0] == "/no/such/file.step"
+
+    def test_glob_no_matches_returns_empty(self, tmp_dir):
+        result = expand_inputs([os.path.join(tmp_dir, "*.xyz")])
+        assert len(result) == 0
+
+    def test_non_cad_files_filtered(self, tmp_dir):
+        # Create a .txt file in the directory
+        txt = os.path.join(tmp_dir, "readme.txt")
+        with open(txt, "w") as f:
+            f.write("not a cad file")
+        result = expand_inputs([os.path.join(tmp_dir, "*")])
+        assert not any(r.endswith(".txt") for r in result)
 
 
 # ============================================================================
