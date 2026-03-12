@@ -60,7 +60,7 @@ from OCP.TopLoc import TopLoc_Location
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
 from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder
 from OCP.TopExp import TopExp_Explorer
-from OCP.TopAbs import TopAbs_FACE
+from OCP.TopAbs import TopAbs_FACE, TopAbs_SOLID
 
 # ---------------------------------------------------------------------------
 # Axis configuration
@@ -788,6 +788,229 @@ def _axis_line(origin, direction):
     return gp_Ax1(origin, direction)
 
 
+# -------------------------------------------------------------------
+# Direct geometry cut  (split-and-filter, no boolean subtraction)
+# -------------------------------------------------------------------
+
+def _cut_half_planes(cut_angle, axis_vec, origin_pt):
+    """Build two large planar faces at angle 0 and *cut_angle* around *axis_vec*.
+
+    The planes pass through *origin_pt* and the stacking axis.  Together they
+    define the boundaries of the removed wedge sector ``[0, cut_angle]``.
+
+    Returns ``(face_at_0, face_at_cut_angle)``.
+    """
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+    from OCP.gp import gp_Pln, gp_Ax3
+
+    cut_rad = math.radians(cut_angle)
+
+    # Perpendicular basis vectors in the plane normal to the stacking axis.
+    if axis_vec.z:
+        p1 = (1, 0, 0)
+        p2 = (0, 1, 0)
+    elif axis_vec.y:
+        p1 = (1, 0, 0)
+        p2 = (0, 0, 1)
+    else:
+        p1 = (0, 1, 0)
+        p2 = (0, 0, 1)
+
+    ox, oy, oz = origin_pt.X(), origin_pt.Y(), origin_pt.Z()
+
+    # Plane at angle 0: contains the axis and perp1.  Normal = perp2.
+    n1 = gp_Dir(p2[0], p2[1], p2[2])
+    pln1 = gp_Pln(gp_Ax3(gp_Pnt(ox, oy, oz), n1))
+    face1 = BRepBuilderAPI_MakeFace(pln1, -1e4, 1e4, -1e4, 1e4).Face()
+
+    # Plane at cut_angle: normal = sin(cut)*perp1 − cos(cut)*perp2.
+    n2x = math.sin(cut_rad) * p1[0] - math.cos(cut_rad) * p2[0]
+    n2y = math.sin(cut_rad) * p1[1] - math.cos(cut_rad) * p2[1]
+    n2z = math.sin(cut_rad) * p1[2] - math.cos(cut_rad) * p2[2]
+    n2 = gp_Dir(n2x, n2y, n2z)
+    pln2 = gp_Pln(gp_Ax3(gp_Pnt(ox, oy, oz), n2))
+    face2 = BRepBuilderAPI_MakeFace(pln2, -1e4, 1e4, -1e4, 1e4).Face()
+
+    return face1, face2
+
+
+def _solid_in_sector(solid, start_angle, end_angle, axis_vec, origin_pt):
+    """Return True if the centre-of-mass of *solid* lies inside the angular
+    sector ``[start_angle, end_angle)`` (degrees) around *axis_vec*.
+    """
+    from OCP.GProp import GProp_GProps
+    from OCP.BRepGProp import BRepGProp
+
+    props = GProp_GProps()
+    BRepGProp.VolumeProperties_s(solid, props)
+    com = props.CentreOfMass()
+
+    ox, oy, oz = origin_pt.X(), origin_pt.Y(), origin_pt.Z()
+    if axis_vec.z:
+        cx, cy = com.X() - ox, com.Y() - oy
+    elif axis_vec.y:
+        cx, cy = com.X() - ox, com.Z() - oz
+    else:
+        cx, cy = com.Y() - oy, com.Z() - oz
+
+    angle = math.degrees(math.atan2(cy, cx)) % 360.0
+    eps = 0.1  # tolerance in degrees
+
+    if start_angle < end_angle:
+        return (start_angle + eps) < angle < (end_angle - eps)
+    # Wraps around 360
+    return angle > (start_angle + eps) or angle < (end_angle - eps)
+
+
+def cut_part_direct(shape, cut_angle, axis_vec, origin_pt):
+    """Cut *shape* by splitting it with half-planes and discarding the wedge.
+
+    Instead of a boolean subtraction (``BRepAlgoAPI_Cut``) this:
+
+    1. Creates two planar faces at the cut boundaries (angle 0 and
+       *cut_angle*).
+    2. Splits the shape along these planes with ``BRepAlgoAPI_Splitter``,
+       which re-trims the underlying surface functions and inserts new
+       planar faces at the cut boundaries automatically.
+    3. Filters the resulting solids, keeping only those whose centre of
+       mass lies outside the removed sector ``(0, cut_angle)``.
+
+    This approach is typically faster than boolean cutting because the
+    splitter only needs to intersect planar tools with the existing
+    geometry rather than subtracting a complex cylinder sector.  It
+    also produces cleaner topology since the new cap faces are exact
+    planar surfaces rather than boolean-operation artefacts.
+
+    Returns the kept compound (may contain one or more solids).
+    Raises ``RuntimeError`` if the splitter operation fails.
+    """
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Splitter
+    from OCP.TopTools import TopTools_ListOfShape
+    from OCP.GProp import GProp_GProps
+    from OCP.BRepGProp import BRepGProp
+
+    face1, face2 = _cut_half_planes(cut_angle, axis_vec, origin_pt)
+
+    args = TopTools_ListOfShape()
+    args.Append(shape)
+    tools = TopTools_ListOfShape()
+    tools.Append(face1)
+    tools.Append(face2)
+
+    splitter = BRepAlgoAPI_Splitter()
+    splitter.SetArguments(args)
+    splitter.SetTools(tools)
+    splitter.Build()
+
+    if not splitter.IsDone():
+        raise RuntimeError("BRepAlgoAPI_Splitter failed on shape")
+
+    result = splitter.Shape()
+
+    # Collect solids and keep those outside the removed sector.
+    exp = TopExp_Explorer(result, TopAbs_SOLID)
+    builder = BRep_Builder()
+    compound = TopoDS_Compound()
+    builder.MakeCompound(compound)
+    kept = 0
+
+    while exp.More():
+        solid = TopoDS.Solid_s(exp.Current())
+        if not _solid_in_sector(solid, 0.0, cut_angle, axis_vec, origin_pt):
+            builder.Add(compound, solid)
+            kept += 1
+        exp.Next()
+
+    if kept == 0:
+        # All solids were inside the cutter — shape fully removed.
+        return None
+
+    return compound
+
+
+def cut_part_direct_segment(shape, cut_angle, axis_vec, origin_pt, segment):
+    """Direct-geometry variant of segment splitting (a/b halves).
+
+    After removing the main wedge ``[0, cut_angle]``, the remaining arc
+    ``[cut_angle, 360]`` is bisected:
+
+    * **segment "a"** keeps ``[cut_angle, midpoint]``
+    * **segment "b"** keeps ``[midpoint, 360]``
+
+    Three half-planes are used: at 0°, *cut_angle*, and *midpoint*.
+    """
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Splitter
+    from OCP.TopTools import TopTools_ListOfShape
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+    from OCP.gp import gp_Pln, gp_Ax3
+
+    remaining = 360.0 - cut_angle
+    midpoint = cut_angle + remaining / 2.0
+
+    # Build three half-planes: at 0, cut_angle, and midpoint.
+    face_0, face_cut = _cut_half_planes(cut_angle, axis_vec, origin_pt)
+
+    # Additional plane at midpoint
+    mid_rad = math.radians(midpoint)
+    if axis_vec.z:
+        p1, p2 = (1, 0, 0), (0, 1, 0)
+    elif axis_vec.y:
+        p1, p2 = (1, 0, 0), (0, 0, 1)
+    else:
+        p1, p2 = (0, 1, 0), (0, 0, 1)
+
+    ox, oy, oz = origin_pt.X(), origin_pt.Y(), origin_pt.Z()
+    nmx = math.sin(mid_rad) * p1[0] - math.cos(mid_rad) * p2[0]
+    nmy = math.sin(mid_rad) * p1[1] - math.cos(mid_rad) * p2[1]
+    nmz = math.sin(mid_rad) * p1[2] - math.cos(mid_rad) * p2[2]
+    nm = gp_Dir(nmx, nmy, nmz)
+    pln_mid = gp_Pln(gp_Ax3(gp_Pnt(ox, oy, oz), nm))
+    face_mid = BRepBuilderAPI_MakeFace(pln_mid, -1e4, 1e4, -1e4, 1e4).Face()
+
+    # Split by all three planes
+    args = TopTools_ListOfShape()
+    args.Append(shape)
+    tools = TopTools_ListOfShape()
+    tools.Append(face_0)
+    tools.Append(face_cut)
+    tools.Append(face_mid)
+
+    splitter = BRepAlgoAPI_Splitter()
+    splitter.SetArguments(args)
+    splitter.SetTools(tools)
+    splitter.Build()
+
+    if not splitter.IsDone():
+        raise RuntimeError("BRepAlgoAPI_Splitter failed (segment split)")
+
+    result = splitter.Shape()
+
+    # Filter solids: segment "a" keeps [cut_angle, midpoint],
+    #                segment "b" keeps [midpoint, 360].
+    if segment == "a":
+        keep_start, keep_end = cut_angle, midpoint
+    else:
+        keep_start, keep_end = midpoint, 360.0
+
+    exp = TopExp_Explorer(result, TopAbs_SOLID)
+    builder = BRep_Builder()
+    compound = TopoDS_Compound()
+    builder.MakeCompound(compound)
+    kept = 0
+
+    while exp.More():
+        solid = TopoDS.Solid_s(exp.Current())
+        if _solid_in_sector(solid, keep_start, keep_end, axis_vec, origin_pt):
+            builder.Add(compound, solid)
+            kept += 1
+        exp.Next()
+
+    if kept == 0:
+        return None
+
+    return compound
+
+
 def cut_assembly(assy_compound, cutter_shape):
     """Boolean-cut the assembly compound with the cutter.
 
@@ -1159,7 +1382,9 @@ def run_pipeline(args):
             print(f"  Warning: Assembly export issue: {e}")
 
         # Build compound and compute global bounding box
-        print(f"\nCutting assembly at {args.cut_angle} degrees...")
+        use_direct = getattr(args, "cut_direct", False)
+        method_label = "direct geometry" if use_direct else "boolean"
+        print(f"\nCutting assembly at {args.cut_angle} degrees ({method_label})...")
         builder = BRep_Builder()
         compound = TopoDS_Compound()
         builder.MakeCompound(compound)
@@ -1172,7 +1397,6 @@ def run_pipeline(args):
         bbox = Bnd_Box()
         BRepBndLib.Add_s(compound, bbox)
         bbox_vals = bbox.Get()
-        cutter = make_cutter(bbox_vals, args.cut_angle, axis_vec)
 
         if args.debug:
             dbg_radius, dbg_height, dbg_origin, dbg_direction = _cutter_params(bbox_vals, axis_vec)
@@ -1183,14 +1407,20 @@ def run_pipeline(args):
             print(f"  [DEBUG] bbox: xmin={bbox_vals[0]:.3f} ymin={bbox_vals[1]:.3f} zmin={bbox_vals[2]:.3f} "
                   f"xmax={bbox_vals[3]:.3f} ymax={bbox_vals[4]:.3f} zmax={bbox_vals[5]:.3f}")
 
-        # Pre-build segment cutters if any parts use a/b splitting
+        # Compute the origin point for direct cutting (XY centroid of bbox)
+        _r, _h, origin_pt, _d = _cutter_params(bbox_vals, axis_vec)
+
+        # Pre-build segment cutters / check for segments
         has_segments = any(seg is not None for _, _, seg in moved_parts)
-        seg_cutters = {}
-        if has_segments:
-            for seg in ("a", "b"):
-                seg_cutters[seg] = make_segment_cutter(
-                    bbox_vals, args.cut_angle, axis_vec, seg
-                )
+
+        if not use_direct:
+            cutter = make_cutter(bbox_vals, args.cut_angle, axis_vec)
+            seg_cutters = {}
+            if has_segments:
+                for seg in ("a", "b"):
+                    seg_cutters[seg] = make_segment_cutter(
+                        bbox_vals, args.cut_angle, axis_vec, seg
+                    )
 
         # Cut each part individually for robustness with mixed geometry
         cut_builder = BRep_Builder()
@@ -1201,10 +1431,31 @@ def run_pipeline(args):
 
         for pname, moved_shape, segment in moved_parts:
             try:
-                if segment in seg_cutters:
-                    cut_part = cut_assembly(moved_shape, seg_cutters[segment])
+                if use_direct:
+                    # --- Direct geometry approach ---
+                    if segment is not None:
+                        cut_part = cut_part_direct_segment(
+                            moved_shape, args.cut_angle, axis_vec,
+                            origin_pt, segment,
+                        )
+                    else:
+                        cut_part = cut_part_direct(
+                            moved_shape, args.cut_angle, axis_vec,
+                            origin_pt,
+                        )
                 else:
-                    cut_part = cut_assembly(moved_shape, cutter)
+                    # --- Boolean approach ---
+                    if segment in seg_cutters:
+                        cut_part = cut_assembly(moved_shape, seg_cutters[segment])
+                    else:
+                        cut_part = cut_assembly(moved_shape, cutter)
+
+                if cut_part is None:
+                    cut_skip += 1
+                    if args.debug:
+                        print(f"  [DEBUG] '{pname}': fully removed by cutter.")
+                    continue
+
                 # Verify the result is not empty
                 part_bbox = Bnd_Box()
                 BRepBndLib.Add_s(cut_part, part_bbox)
@@ -1223,7 +1474,8 @@ def run_pipeline(args):
                 cut_builder.Add(cut_compound, moved_shape)
                 cut_ok += 1
 
-        if args.debug:
+        if args.debug and not use_direct:
+            cutter = make_cutter(bbox_vals, args.cut_angle, axis_vec)
             print("  [DEBUG] Including cutter shape in output STEP as 'CUTTER_DEBUG'.")
             cut_builder.Add(cut_compound, cutter)
 
@@ -1264,7 +1516,8 @@ def run_pipeline(args):
     print(f"  Axis:       {args.axis.upper()}")
     print(f"  Gap:        {args.gap}")
     if args.cut_angle is not None:
-        print(f"  Cut angle:  {args.cut_angle} deg")
+        cut_method = "direct" if getattr(args, "cut_direct", False) else "boolean"
+        print(f"  Cut angle:  {args.cut_angle} deg ({cut_method})")
     print(f"  STEP out:   {output_step}")
     if args.render:
         print(f"  Render out: {args.render}")
@@ -1309,6 +1562,12 @@ def main():
     parser.add_argument(
         "--cyl", action="store_true",
         help="Orient parts so the cylinder height axis aligns with Z before stacking.",
+    )
+    parser.add_argument(
+        "--cut-direct", action="store_true",
+        help="Use direct geometry calculation for cutting instead of boolean "
+             "subtraction.  Splits faces along cut planes and filters solids, "
+             "which is faster and produces cleaner cap surfaces.",
     )
     parser.add_argument(
         "--debug", action="store_true",
