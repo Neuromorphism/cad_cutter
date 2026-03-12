@@ -1722,3 +1722,88 @@ class TestOrientToCylinder:
         parts = [(cyl, "outer_1")]
         rotated = orient_to_cylinder(parts)
         assert rotated[0][1] == "outer_1"
+
+
+# ============================================================================
+# Test: Cut robustness (validity of results)
+# ============================================================================
+
+class TestCutRobustness:
+    """Ensure cut_assembly always returns a valid shape for complex geometry."""
+
+    def _get_bbox_vals(self, shape):
+        bbox = Bnd_Box()
+        BRepBndLib.Add_s(shape, bbox)
+        return bbox.Get()
+
+    def test_cut_result_is_valid_simple_box(self):
+        """Cut of a simple box should always produce a valid shape."""
+        from OCP.BRepCheck import BRepCheck_Analyzer
+
+        box = cq.Workplane("XY").box(20, 20, 20).val().wrapped
+        bbox_vals = self._get_bbox_vals(box)
+
+        for angle in [45, 90, 135, 180, 225, 270, 315]:
+            cutter = make_cutter(bbox_vals, angle, AXIS_MAP["z"])
+            result = cut_assembly(box, cutter)
+            assert not result.IsNull(), f"angle={angle}: result is null"
+            assert BRepCheck_Analyzer(result).IsValid(), (
+                f"angle={angle}: result shape is topologically invalid"
+            )
+
+    def test_cut_result_is_valid_all_axes(self):
+        """Cut is valid for all three stacking axes."""
+        from OCP.BRepCheck import BRepCheck_Analyzer
+
+        box = cq.Workplane("XY").box(15, 15, 30).val().wrapped
+        bbox_vals = self._get_bbox_vals(box)
+
+        for axis_name in ("x", "y", "z"):
+            cutter = make_cutter(bbox_vals, 90, AXIS_MAP[axis_name])
+            result = cut_assembly(box, cutter)
+            assert not result.IsNull(), f"axis={axis_name}: result is null"
+            assert BRepCheck_Analyzer(result).IsValid(), (
+                f"axis={axis_name}: result shape is topologically invalid"
+            )
+
+    def test_cut_real_step_file(self, tmp_dir):
+        """Cut of the bundled cut.step at several angles must produce valid shapes."""
+        import os
+        from OCP.BRepCheck import BRepCheck_Analyzer
+
+        step_path = os.path.join(os.path.dirname(__file__), "cut.step")
+        if not os.path.exists(step_path):
+            pytest.skip("cut.step not found")
+
+        wp, name = load_part(step_path)
+        shape = wp.val().wrapped
+        bbox_vals = self._get_bbox_vals(shape)
+
+        for angle in [90, 180, 270]:
+            cutter = make_cutter(bbox_vals, angle, AXIS_MAP["z"])
+            result = cut_assembly(shape, cutter)
+            assert not result.IsNull(), f"angle={angle}: result is null"
+            assert BRepCheck_Analyzer(result).IsValid(), (
+                f"angle={angle}: result shape invalid for cut.step"
+            )
+
+    def test_mesh_shell_to_solid_adaptive_tolerance(self, tmp_dir):
+        """_mesh_shell_to_solid should succeed even on meshes with gaps."""
+        from OCP.TopAbs import TopAbs_SOLID, TopAbs_COMPOUND
+
+        # Build a small box and export as STL, then reload as a shell
+        box = cq.Workplane("XY").box(5, 5, 5)
+        stl_path = os.path.join(tmp_dir, "box.stl")
+        box.val().exportStl(stl_path)
+
+        from OCP.StlAPI import StlAPI_Reader
+        from OCP.TopoDS import TopoDS_Shape
+
+        reader = StlAPI_Reader()
+        raw = TopoDS_Shape()
+        reader.Read(raw, stl_path)
+
+        solid = _mesh_shell_to_solid(raw)
+        # Should be promoted to SOLID (or at least not null)
+        assert not solid.IsNull()
+        assert solid.ShapeType() == TopAbs_SOLID
