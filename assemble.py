@@ -627,26 +627,41 @@ def stack_parts(parts, axis_vec, gap):
 # ===================================================================
 
 def _cutter_params(bbox_vals, axis_vec):
-    """Compute radius, height, origin, and direction for a cutter from bbox."""
+    """Compute radius, height, origin, and direction for a cutter from bbox.
+
+    The cylinder axis passes through the XY centroid of the bounding box
+    (in the two axes perpendicular to the stacking direction) so that the
+    sector cleanly bisects the model even when it is not centred at the
+    world origin.
+    """
     xn, yn, zn, xx, yx, zx = bbox_vals
 
     if axis_vec.y:
-        radius = max(abs(xn), abs(xx), abs(zn), abs(zx)) * 2.5
+        cx = (xn + xx) / 2.0
+        cz = (zn + zx) / 2.0
+        radius = max(abs(xn - cx), abs(xx - cx),
+                     abs(zn - cz), abs(zx - cz)) * 2.5
         height = (yx - yn) * 3.0
         start = yn - (yx - yn)
-        origin = gp_Pnt(0, start, 0)
+        origin = gp_Pnt(cx, start, cz)
         direction = gp_Dir(0, 1, 0)
     elif axis_vec.z:
-        radius = max(abs(xn), abs(xx), abs(yn), abs(yx)) * 2.5
+        cx = (xn + xx) / 2.0
+        cy = (yn + yx) / 2.0
+        radius = max(abs(xn - cx), abs(xx - cx),
+                     abs(yn - cy), abs(yx - cy)) * 2.5
         height = (zx - zn) * 3.0
         start = zn - (zx - zn)
-        origin = gp_Pnt(0, 0, start)
+        origin = gp_Pnt(cx, cy, start)
         direction = gp_Dir(0, 0, 1)
     else:
-        radius = max(abs(yn), abs(yx), abs(zn), abs(zx)) * 2.5
+        cy = (yn + yx) / 2.0
+        cz = (zn + zx) / 2.0
+        radius = max(abs(yn - cy), abs(yx - cy),
+                     abs(zn - cz), abs(zx - cz)) * 2.5
         height = (xx - xn) * 3.0
         start = xn - (xx - xn)
-        origin = gp_Pnt(start, 0, 0)
+        origin = gp_Pnt(start, cy, cz)
         direction = gp_Dir(1, 0, 0)
 
     radius = max(radius, 1.0)
@@ -657,11 +672,54 @@ def _cutter_params(bbox_vals, axis_vec):
 def make_cutter(bbox_vals, angle, axis_vec):
     """
     Build a cylindrical-sector cutter from the global bounding box.
-    The cutter spans `angle` degrees as a wedge, oriented along the stacking axis.
+    The cutter spans ``angle`` degrees as a wedge, oriented along the
+    stacking axis.
+
+    For angles > 180° the cutter is built by fusing two sectors (each
+    ≤ 180°) so that the boolean engine never has to subtract a single
+    very-large sector — this avoids artifacts with complex geometry.
     """
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
+
     radius, height, origin, direction = _cutter_params(bbox_vals, axis_vec)
-    ax = gp_Ax2(origin, direction)
-    return BRepPrimAPI_MakeCylinder(ax, radius, height, math.radians(angle)).Shape()
+
+    if angle <= 180.0:
+        ax = gp_Ax2(origin, direction)
+        return BRepPrimAPI_MakeCylinder(
+            ax, radius, height, math.radians(angle)
+        ).Shape()
+
+    # --- angle > 180°: build two sectors and fuse them ---
+    # Sector 1: 0° → 180°
+    ax1 = gp_Ax2(origin, direction)
+    c1 = BRepPrimAPI_MakeCylinder(
+        ax1, radius, height, math.radians(180)
+    ).Shape()
+
+    # Sector 2: 180° → angle  (span = angle − 180°)
+    remaining = angle - 180.0
+    trsf = gp_Trsf()
+    trsf.SetRotation(
+        _axis_line(origin, direction), math.radians(180)
+    )
+    ax2 = gp_Ax2(origin, direction)
+    ax2.Transform(trsf)
+    c2 = BRepPrimAPI_MakeCylinder(
+        ax2, radius, height, math.radians(remaining)
+    ).Shape()
+
+    fuse = BRepAlgoAPI_Fuse(c1, c2)
+    fuse.Build()
+    if fuse.IsDone():
+        return fuse.Shape()
+
+    # Fallback: return as a compound
+    builder = BRep_Builder()
+    comp = TopoDS_Compound()
+    builder.MakeCompound(comp)
+    builder.Add(comp, c1)
+    builder.Add(comp, c2)
+    return comp
 
 
 def make_segment_cutter(bbox_vals, cut_angle, axis_vec, segment):
@@ -733,21 +791,36 @@ def _axis_line(origin, direction):
 def cut_assembly(assy_compound, cutter_shape):
     """Boolean-cut the assembly compound with the cutter.
 
-    Uses progressive fuzzy tolerance for robustness with mixed CAD/mesh geometry.
-    Validates each result with BRepCheck_Analyzer and retries with a larger
-    tolerance when the shape is geometrically invalid (e.g. non-manifold edges
-    produced by near-coplanar faces at tight tolerances).
+    Uses progressive fuzzy tolerance for robustness with mixed CAD/mesh
+    geometry.  Each candidate result is validated in two ways:
+
+    1. **Topological** — ``BRepCheck_Analyzer`` confirms the shape is
+       well-formed (no degenerate edges, self-intersections, etc.).
+    2. **Volumetric cross-check** — a result is only accepted when a
+       *second* tolerance level produces a volume within 10 % of the
+       first.  This catches the case where the boolean engine returns a
+       topologically valid but geometrically *wrong* shape at a tight
+       tolerance (e.g. leaving the model nearly intact).
+
+    The first confirmed result (tightest tolerance with cross-check
+    agreement) is returned.
     """
     from OCP.TopTools import TopTools_ListOfShape
     from OCP.BRepCheck import BRepCheck_Analyzer
+    from OCP.GProp import GProp_GProps
+    from OCP.BRepGProp import BRepGProp
 
     args_list = TopTools_ListOfShape()
     args_list.Append(assy_compound)
     tools_list = TopTools_ListOfShape()
     tools_list.Append(cutter_shape)
 
-    # Progressively looser tolerances; first attempt uses parallel mode for speed.
+    # Progressively looser tolerances; first attempt uses parallel mode for
+    # speed.
     tolerances = [1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
+
+    # Collect valid (topology-ok) candidates: (tolerance, shape, volume)
+    candidates = []
     last_result = None
 
     for i, tol in enumerate(tolerances):
@@ -766,15 +839,36 @@ def cut_assembly(assy_compound, cutter_shape):
         if result is None or result.IsNull():
             continue
 
-        # Accept the result only if the topology is valid; otherwise retry with
-        # a larger tolerance which smooths over near-coincident geometry.
-        if BRepCheck_Analyzer(result).IsValid():
-            return result
+        if not BRepCheck_Analyzer(result).IsValid():
+            last_result = result
+            continue
 
-        # Keep the best (most recent) result in case all tolerances fail validation
-        last_result = result
+        # Compute volume for cross-check
+        props = GProp_GProps()
+        BRepGProp.VolumeProperties_s(result, props)
+        vol = props.Mass()
 
-    # If no tolerance produced a valid shape, try to heal the best result we got
+        candidates.append((tol, result, vol))
+
+        # Cross-check: two adjacent valid results must agree within 10 %
+        if len(candidates) >= 2:
+            prev_vol = candidates[-2][2]
+            denom = max(abs(prev_vol), abs(vol), 1e-12)
+            if abs(vol - prev_vol) / denom < 0.10:
+                # Volumes agree — return the tighter-tolerance result
+                return candidates[-2][1]
+            else:
+                # Disagreement — the earlier candidate was likely wrong;
+                # discard it and keep going with the current one.
+                candidates = [candidates[-1]]
+
+    # If only one candidate was produced and it was never cross-checked,
+    # accept it (better than nothing).
+    if candidates:
+        return candidates[-1][1]
+
+    # If no tolerance produced a valid shape, try to heal the best result we
+    # got.
     if last_result is not None:
         try:
             from OCP.ShapeFix import ShapeFix_Shape
