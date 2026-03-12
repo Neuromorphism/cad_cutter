@@ -48,6 +48,8 @@ from OCP.BRepBndLib import BRepBndLib
 from OCP.Bnd import Bnd_Box
 from OCP.BRep import BRep_Builder
 from OCP.TopoDS import TopoDS_Compound
+from OCP.gp import gp_Trsf, gp_Ax1, gp_Pnt, gp_Dir
+from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
 
 
 # ============================================================================
@@ -1630,95 +1632,191 @@ class TestSegmentCutting:
 class TestOrientToCylinder:
     """Tests for orient_to_cylinder()."""
 
-    def _make_parts(self, wp, name="part"):
-        return [(wp, name)]
+    # ------------------------------------------------------------------
+    # Axis alignment
+    # ------------------------------------------------------------------
 
     def test_cylinder_along_x_rotates_to_z(self):
         """A cylinder whose axis is along X should be reoriented so its axis is Z."""
-        # Build a cylinder that is tall along X (height=50, radius=5)
-        cyl_x = (
-            cq.Workplane("YZ")
-            .cylinder(50, 5)
-        )
-        # The cylinder workplane "YZ" extrudes along X; verify initial bbox
+        cyl_x = cq.Workplane("YZ").cylinder(50, 5)
         shape_before = cyl_x.val().wrapped
         xn, yn, zn, xx, yx, zx = get_bounding_box(shape_before)
-        x_span = xx - xn
-        z_span = zx - zn
-        assert x_span > z_span, "Precondition: cylinder is taller along X before orient"
+        assert xx - xn > zx - zn, "Precondition: taller along X"
 
-        parts = self._make_parts(cyl_x, "outer_1")
-        rotated = orient_to_cylinder(parts)
+        rotated = orient_to_cylinder([(cyl_x, "outer_1")])
         assert len(rotated) == 1
-
         shape_after = rotated[0][0].val().wrapped
         xn2, yn2, zn2, xx2, yx2, zx2 = get_bounding_box(shape_after)
-        x_span2 = xx2 - xn2
-        z_span2 = zx2 - zn2
-        assert z_span2 > x_span2, "After orient, cylinder should be taller along Z"
+        assert zx2 - zn2 > xx2 - xn2, "After orient, Z span should exceed X span"
 
     def test_cylinder_along_y_rotates_to_z(self):
         """A cylinder whose axis is along Y should be reoriented so its axis is Z."""
         cyl_y = cq.Workplane("XZ").cylinder(50, 5)
         shape_before = cyl_y.val().wrapped
         xn, yn, zn, xx, yx, zx = get_bounding_box(shape_before)
-        y_span = yx - yn
-        z_span = zx - zn
-        assert y_span > z_span, "Precondition: cylinder is taller along Y before orient"
+        assert yx - yn > zx - zn, "Precondition: taller along Y"
 
-        parts = self._make_parts(cyl_y, "outer_1")
-        rotated = orient_to_cylinder(parts)
-
+        rotated = orient_to_cylinder([(cyl_y, "outer_1")])
         shape_after = rotated[0][0].val().wrapped
         xn2, yn2, zn2, xx2, yx2, zx2 = get_bounding_box(shape_after)
-        y_span2 = yx2 - yn2
-        z_span2 = zx2 - zn2
-        assert z_span2 > y_span2, "After orient, cylinder should be taller along Z"
+        assert zx2 - zn2 > yx2 - yn2, "After orient, Z span should exceed Y span"
 
-    def test_cylinder_already_along_z_unchanged(self):
-        """A cylinder already along Z should not be significantly changed."""
+    def test_cylinder_already_along_z_preserved(self):
+        """A cylinder already along Z should keep the same height."""
         cyl_z = cq.Workplane("XY").cylinder(50, 5)
-        shape_before = cyl_z.val().wrapped
-        xn, yn, zn, xx, yx, zx = get_bounding_box(shape_before)
+        xn, yn, zn, xx, yx, zx = get_bounding_box(cyl_z.val().wrapped)
         z_span_before = zx - zn
 
-        parts = self._make_parts(cyl_z, "outer_1")
-        rotated = orient_to_cylinder(parts)
-
+        rotated = orient_to_cylinder([(cyl_z, "outer_1")])
         shape_after = rotated[0][0].val().wrapped
         xn2, yn2, zn2, xx2, yx2, zx2 = get_bounding_box(shape_after)
-        z_span_after = zx2 - zn2
-        # Z span should be preserved (within floating-point tolerance)
-        assert abs(z_span_after - z_span_before) < 1.0
+        assert abs((zx2 - zn2) - z_span_before) < 1.0
 
     def test_multiple_parts_rotated_consistently(self):
         """All parts in a multi-part set should receive the same rotation."""
-        # Two concentric cylinders along X
         outer = cq.Workplane("YZ").cylinder(50, 10)
         inner = cq.Workplane("YZ").cylinder(50, 5)
 
-        parts = [
-            (outer, "outer_1"),
-            (inner, "inner_1"),
-        ]
-        rotated = orient_to_cylinder(parts)
+        rotated = orient_to_cylinder([(outer, "outer_1"), (inner, "inner_1")])
         assert len(rotated) == 2
-
         for wp, name in rotated:
             shape = wp.val().wrapped
             xn, yn, zn, xx, yx, zx = get_bounding_box(shape)
-            x_span = xx - xn
-            z_span = zx - zn
-            assert z_span > x_span, f"{name}: Z span should exceed X span after orient"
+            assert zx - zn > xx - xn, f"{name}: Z span should exceed X span after orient"
+
+    # ------------------------------------------------------------------
+    # Wider end down (conic parts)
+    # ------------------------------------------------------------------
+
+    def _make_frustum_wide_at_top(self):
+        """Return a frustum (truncated cone) along Z with the wide end at the top."""
+        # Build wide-base-down first, then flip it
+        pts = [(5, 0), (15, 0), (15, 30), (5, 30)]
+        frustum = (
+            cq.Workplane("XZ")
+            .polyline(pts)
+            .close()
+            .revolve(360, (0, 0, 0), (0, 1, 0))
+        )
+        # Flip so wide end is at top
+        flip = gp_Trsf()
+        flip.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(1, 0, 0)), math.pi)
+        flipped = BRepBuilderAPI_Transform(frustum.val().wrapped, flip, True).Shape()
+        return cq.Workplane("XY").newObject([cq.Shape(flipped)])
+
+    def test_cone_wide_end_down_after_orient(self):
+        """A cone/frustum with wide end at top should be flipped so wide end is down."""
+        wp = self._make_frustum_wide_at_top()
+        shape_before = wp.val().wrapped
+        # Verify precondition
+        xn, yn, zn, xx, yx, zx = get_bounding_box(shape_before)
+        verts, _ = tessellate_shape(shape_before, tolerance=0.5)
+        v = np.array(verts)
+        z_mid = (zn + zx) / 2
+        r_bot = np.mean(np.hypot(v[v[:, 2] < z_mid, 0], v[v[:, 2] < z_mid, 1]))
+        r_top = np.mean(np.hypot(v[v[:, 2] >= z_mid, 0], v[v[:, 2] >= z_mid, 1]))
+        assert r_top > r_bot, "Precondition: frustum has wider end at top"
+
+        result = orient_to_cylinder([(wp, "outer_1")])
+        res_shape = result[0][0].val().wrapped
+        xn2, yn2, zn2, xx2, yx2, zx2 = get_bounding_box(res_shape)
+        verts2, _ = tessellate_shape(res_shape, tolerance=0.5)
+        v2 = np.array(verts2)
+        z_mid2 = (zn2 + zx2) / 2
+        r_bot2 = np.mean(np.hypot(v2[v2[:, 2] < z_mid2, 0], v2[v2[:, 2] < z_mid2, 1]))
+        r_top2 = np.mean(np.hypot(v2[v2[:, 2] >= z_mid2, 0], v2[v2[:, 2] >= z_mid2, 1]))
+        assert r_bot2 > r_top2, "After orient, wider end should be at bottom"
+
+    def test_cone_already_wide_end_down_not_flipped(self):
+        """A cone already wide-side-down should not be flipped."""
+        pts = [(5, 0), (15, 0), (15, 30), (5, 30)]
+        frustum = (
+            cq.Workplane("XZ")
+            .polyline(pts)
+            .close()
+            .revolve(360, (0, 0, 0), (0, 1, 0))
+        )
+        shape = frustum.val().wrapped
+        xn, yn, zn, xx, yx, zx = get_bounding_box(shape)
+        verts, _ = tessellate_shape(shape, tolerance=0.5)
+        v = np.array(verts)
+        z_mid = (zn + zx) / 2
+        r_bot = np.mean(np.hypot(v[v[:, 2] < z_mid, 0], v[v[:, 2] < z_mid, 1]))
+        r_top = np.mean(np.hypot(v[v[:, 2] >= z_mid, 0], v[v[:, 2] >= z_mid, 1]))
+        assert r_bot > r_top, "Precondition: frustum already wide-side-down"
+
+        result = orient_to_cylinder([(frustum, "outer_1")])
+        res_shape = result[0][0].val().wrapped
+        xn2, yn2, zn2, xx2, yx2, zx2 = get_bounding_box(res_shape)
+        verts2, _ = tessellate_shape(res_shape, tolerance=0.5)
+        v2 = np.array(verts2)
+        z_mid2 = (zn2 + zx2) / 2
+        r_bot2 = np.mean(np.hypot(v2[v2[:, 2] < z_mid2, 0], v2[v2[:, 2] < z_mid2, 1]))
+        r_top2 = np.mean(np.hypot(v2[v2[:, 2] >= z_mid2, 0], v2[v2[:, 2] >= z_mid2, 1]))
+        assert r_bot2 > r_top2, "Wide end should still be at bottom"
+
+    # ------------------------------------------------------------------
+    # Restacking
+    # ------------------------------------------------------------------
+
+    def test_restack_no_gap_contiguous(self):
+        """After orient, parts should sit directly on top of each other (gap=0)."""
+        # Three cylinders already along Z but offset with gaps between them
+        c1 = cq.Workplane("XY").cylinder(20, 5)
+        c2 = cq.Workplane("XY").cylinder(20, 5).translate((0, 0, 30))
+        c3 = cq.Workplane("XY").cylinder(20, 5).translate((0, 0, 65))
+
+        result = orient_to_cylinder(
+            [(c1, "outer_1"), (c2, "outer_2"), (c3, "outer_3")], gap=0.0
+        )
+        assert len(result) == 3
+
+        bboxes = sorted(
+            [get_bounding_box(wp.val().wrapped) for wp, _ in result],
+            key=lambda b: b[2],
+        )
+
+        tol = 0.1
+        assert bboxes[0][2] == pytest.approx(0.0, abs=tol), "First part bottom at Z=0"
+        assert bboxes[1][2] == pytest.approx(bboxes[0][5], abs=tol), \
+            "Second part bottom should equal first part top"
+        assert bboxes[2][2] == pytest.approx(bboxes[1][5], abs=tol), \
+            "Third part bottom should equal second part top"
+
+    def test_restack_with_gap(self):
+        """After orient with gap>0, parts should have the specified gap between them."""
+        gap = 5.0
+        c1 = cq.Workplane("XY").cylinder(20, 5)
+        c2 = cq.Workplane("XY").cylinder(20, 5).translate((0, 0, 50))
+
+        result = orient_to_cylinder(
+            [(c1, "outer_1"), (c2, "outer_2")], gap=gap
+        )
+        assert len(result) == 2
+
+        bboxes = sorted(
+            [get_bounding_box(wp.val().wrapped) for wp, _ in result],
+            key=lambda b: b[2],
+        )
+        gap_actual = bboxes[1][2] - bboxes[0][5]
+        assert gap_actual == pytest.approx(gap, abs=0.1), \
+            f"Gap should be {gap}, got {gap_actual}"
+
+    def test_restack_bottom_at_zero(self):
+        """After orient, the bottommost part's minimum Z should be 0."""
+        cyl = cq.Workplane("YZ").cylinder(30, 8).translate((50, 0, 0))
+        result = orient_to_cylinder([(cyl, "outer_1")])
+        xn, yn, zn, xx, yx, zx = get_bounding_box(result[0][0].val().wrapped)
+        assert zn == pytest.approx(0.0, abs=0.1)
+
+    # ------------------------------------------------------------------
+    # Edge cases
+    # ------------------------------------------------------------------
 
     def test_empty_parts_list_returns_empty(self):
-        """An empty parts list should be returned unchanged."""
-        result = orient_to_cylinder([])
-        assert result == []
+        assert orient_to_cylinder([]) == []
 
     def test_names_preserved(self):
-        """Part names should be unchanged after orientation."""
         cyl = cq.Workplane("YZ").cylinder(50, 5)
-        parts = [(cyl, "outer_1")]
-        rotated = orient_to_cylinder(parts)
-        assert rotated[0][1] == "outer_1"
+        result = orient_to_cylinder([(cyl, "outer_1")])
+        assert result[0][1] == "outer_1"
