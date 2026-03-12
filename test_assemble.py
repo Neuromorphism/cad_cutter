@@ -2317,6 +2317,8 @@ from assemble import (
     simulate_physics,
     _shape_to_clean_trimesh,
     _find_support_drop,
+    _find_support_drop_raycast,
+    _find_support_drop_collision,
     _report_nesting,
 )
 
@@ -2480,6 +2482,91 @@ class TestPhysicsSimulation:
         bb = get_bounding_box(moved)
         # x_min should settle near 0 (floor along X)
         assert abs(bb[0]) < 2.0, f"Box x_min should be near 0, got {bb[0]}"
+
+
+class TestTubeNestingCollision:
+    """Regression tests: a smaller-diameter tube must not fall through a
+    larger-diameter tube.  The collision-based binary search in
+    ``_find_support_drop`` detects radial wall-to-wall contact that
+    vertical ray-casting misses.
+    """
+
+    def _make_tube(self, height, outer_r, inner_r):
+        """Create a hollow tube (open ends) centered at the origin."""
+        tube = cq.Workplane("XY").cylinder(height, outer_r).cut(
+            cq.Workplane("XY").cylinder(height, inner_r)
+        )
+        return tube.val().wrapped
+
+    def test_smaller_tube_does_not_fall_through_larger(self):
+        """A tube with OD < the outer tube's ID should be caught by the
+        collision check when the wall thicknesses overlap radially.
+
+        Setup: outer tube (h=100, OD=60, ID=50) sitting on the floor.
+               inner tube (h=80, OD=52, ID=44) placed above.
+
+        The inner tube's outer wall (r=26) exceeds the outer tube's inner
+        wall (r=25) by 1 mm, so it can only nest ~partially before the
+        walls collide.  Without the collision fix, the ray grid misses
+        the wall entirely and the inner tube falls to the floor.
+        """
+        outer_shape = self._make_tube(100, 30, 25)  # OD=60, ID=50
+        inner_shape = self._make_tube(80, 26, 22)   # OD=52, ID=44
+
+        part_info = [
+            ("outer_1", outer_shape, Location(Vector(0, 0, 0)),
+             (0.5, 0.5, 0.5), None),
+            ("inner_1", inner_shape, Location(Vector(0, 0, 100)),
+             (0.8, 0.3, 0.3), None),
+        ]
+
+        result = simulate_physics(
+            part_info, Vector(0, 0, 1), gap=0.0,
+        )
+
+        moved_outer = apply_location(result[0][1], result[0][2])
+        moved_inner = apply_location(result[1][1], result[1][2])
+        bb_outer = get_bounding_box(moved_outer)
+        bb_inner = get_bounding_box(moved_inner)
+
+        outer_zmax = bb_outer[5]
+        inner_zmin = bb_inner[2]
+
+        # The inner tube should NOT have fallen to the floor (z_min ≈ 0).
+        # It should rest with its bottom near the outer tube's top, with
+        # some nesting overlap but NOT full pass-through.
+        assert inner_zmin > 10.0, (
+            f"Inner tube fell through outer tube: inner z_min={inner_zmin:.1f} "
+            f"(expected > 10, i.e. NOT at floor level)"
+        )
+
+    def test_collision_drop_detects_wall_contact(self):
+        """Directly test _find_support_drop_collision on concentric tubes."""
+        import trimesh
+
+        outer_shape = self._make_tube(100, 30, 25)
+        inner_shape = self._make_tube(80, 26, 22)
+
+        outer_moved = apply_location(outer_shape, Location(Vector(0, 0, 0)))
+        inner_moved = apply_location(inner_shape, Location(Vector(0, 0, 100)))
+
+        outer_mesh = _shape_to_clean_trimesh(outer_moved)
+        inner_mesh = _shape_to_clean_trimesh(inner_moved)
+
+        assert outer_mesh is not None
+        assert inner_mesh is not None
+
+        drop = _find_support_drop_collision(inner_mesh, outer_mesh, ax=2)
+
+        # Should detect a collision limit before the inner tube reaches the
+        # floor (drop < 100).
+        assert drop is not None, (
+            "Collision detection returned None — wall contact not detected"
+        )
+        assert drop < 95.0, (
+            f"Collision drop={drop:.1f}, expected < 95 (should stop before "
+            f"inner tube exits outer tube)"
+        )
 
 
 class TestPhysPipeline:
