@@ -37,6 +37,7 @@ from assemble import (
     export_shape_step,
     tessellate_shape,
     expand_inputs,
+    orient_to_cylinder,
     _mesh_shell_to_solid,
     AXIS_MAP,
     MATERIAL_COLORS,
@@ -1620,3 +1621,104 @@ class TestSegmentCutting:
                     moved = apply_location(shape, loc)
                     result = cut_assembly(moved, cutter_a)
                     assert not result.IsNull(), f"Cut failed for angle {angle}"
+
+
+# ============================================================================
+# Cylinder orientation (--cyl)
+# ============================================================================
+
+class TestOrientToCylinder:
+    """Tests for orient_to_cylinder()."""
+
+    def _make_parts(self, wp, name="part"):
+        return [(wp, name)]
+
+    def test_cylinder_along_x_rotates_to_z(self):
+        """A cylinder whose axis is along X should be reoriented so its axis is Z."""
+        # Build a cylinder that is tall along X (height=50, radius=5)
+        cyl_x = (
+            cq.Workplane("YZ")
+            .cylinder(50, 5)
+        )
+        # The cylinder workplane "YZ" extrudes along X; verify initial bbox
+        shape_before = cyl_x.val().wrapped
+        xn, yn, zn, xx, yx, zx = get_bounding_box(shape_before)
+        x_span = xx - xn
+        z_span = zx - zn
+        assert x_span > z_span, "Precondition: cylinder is taller along X before orient"
+
+        parts = self._make_parts(cyl_x, "outer_1")
+        rotated = orient_to_cylinder(parts)
+        assert len(rotated) == 1
+
+        shape_after = rotated[0][0].val().wrapped
+        xn2, yn2, zn2, xx2, yx2, zx2 = get_bounding_box(shape_after)
+        x_span2 = xx2 - xn2
+        z_span2 = zx2 - zn2
+        assert z_span2 > x_span2, "After orient, cylinder should be taller along Z"
+
+    def test_cylinder_along_y_rotates_to_z(self):
+        """A cylinder whose axis is along Y should be reoriented so its axis is Z."""
+        cyl_y = cq.Workplane("XZ").cylinder(50, 5)
+        shape_before = cyl_y.val().wrapped
+        xn, yn, zn, xx, yx, zx = get_bounding_box(shape_before)
+        y_span = yx - yn
+        z_span = zx - zn
+        assert y_span > z_span, "Precondition: cylinder is taller along Y before orient"
+
+        parts = self._make_parts(cyl_y, "outer_1")
+        rotated = orient_to_cylinder(parts)
+
+        shape_after = rotated[0][0].val().wrapped
+        xn2, yn2, zn2, xx2, yx2, zx2 = get_bounding_box(shape_after)
+        y_span2 = yx2 - yn2
+        z_span2 = zx2 - zn2
+        assert z_span2 > y_span2, "After orient, cylinder should be taller along Z"
+
+    def test_cylinder_already_along_z_unchanged(self):
+        """A cylinder already along Z should not be significantly changed."""
+        cyl_z = cq.Workplane("XY").cylinder(50, 5)
+        shape_before = cyl_z.val().wrapped
+        xn, yn, zn, xx, yx, zx = get_bounding_box(shape_before)
+        z_span_before = zx - zn
+
+        parts = self._make_parts(cyl_z, "outer_1")
+        rotated = orient_to_cylinder(parts)
+
+        shape_after = rotated[0][0].val().wrapped
+        xn2, yn2, zn2, xx2, yx2, zx2 = get_bounding_box(shape_after)
+        z_span_after = zx2 - zn2
+        # Z span should be preserved (within floating-point tolerance)
+        assert abs(z_span_after - z_span_before) < 1.0
+
+    def test_multiple_parts_rotated_consistently(self):
+        """All parts in a multi-part set should receive the same rotation."""
+        # Two concentric cylinders along X
+        outer = cq.Workplane("YZ").cylinder(50, 10)
+        inner = cq.Workplane("YZ").cylinder(50, 5)
+
+        parts = [
+            (outer, "outer_1"),
+            (inner, "inner_1"),
+        ]
+        rotated = orient_to_cylinder(parts)
+        assert len(rotated) == 2
+
+        for wp, name in rotated:
+            shape = wp.val().wrapped
+            xn, yn, zn, xx, yx, zx = get_bounding_box(shape)
+            x_span = xx - xn
+            z_span = zx - zn
+            assert z_span > x_span, f"{name}: Z span should exceed X span after orient"
+
+    def test_empty_parts_list_returns_empty(self):
+        """An empty parts list should be returned unchanged."""
+        result = orient_to_cylinder([])
+        assert result == []
+
+    def test_names_preserved(self):
+        """Part names should be unchanged after orientation."""
+        cyl = cq.Workplane("YZ").cylinder(50, 5)
+        parts = [(cyl, "outer_1")]
+        rotated = orient_to_cylinder(parts)
+        assert rotated[0][1] == "outer_1"
