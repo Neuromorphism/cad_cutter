@@ -1280,6 +1280,318 @@ def cut_assembly(assy_compound, cutter_shape):
 
 
 # ===================================================================
+# Physics simulation
+# ===================================================================
+
+def _shape_to_clean_trimesh(shape, tolerance=0.05, angular=0.5):
+    """Convert an OCP shape to a cleaned trimesh, removing degenerate faces."""
+    import trimesh
+
+    verts, faces_pv = tessellate_shape(shape, tolerance=tolerance, angular=angular)
+    if len(verts) == 0:
+        return None
+
+    # PyVista face format [3, i, j, k, ...] -> trimesh (N,3)
+    tri_faces = []
+    i = 0
+    while i < len(faces_pv):
+        n = faces_pv[i][0] if hasattr(faces_pv[i], '__len__') else faces_pv[i, 0]
+        for t in range(1, n - 1):
+            tri_faces.append([faces_pv[i, 1],
+                              faces_pv[i, 1 + t],
+                              faces_pv[i, 2 + t]])
+        i += 1
+
+    if not tri_faces:
+        return None
+
+    mesh = trimesh.Trimesh(vertices=verts, faces=np.array(tri_faces),
+                           process=False)
+
+    # Remove degenerate faces (zero-area or collapsed)
+    face_areas = mesh.area_faces
+    valid_mask = face_areas > 0
+    if not valid_mask.all():
+        mesh.update_faces(valid_mask)
+    mesh.remove_unreferenced_vertices()
+
+    # Merge duplicate vertices and remove duplicate faces
+    mesh.merge_vertices()
+
+    # Repair normals and fill small holes
+    mesh.fix_normals()
+
+    if len(mesh.faces) == 0:
+        return None
+
+    # Make sure it's watertight for volume checks
+    if not mesh.is_watertight:
+        trimesh.repair.fill_holes(mesh)
+        trimesh.repair.fix_winding(mesh)
+
+    return mesh
+
+
+def _mesh_convex_hull(mesh):
+    """Return the convex hull of a trimesh for fast collision checks."""
+    try:
+        return mesh.convex_hull
+    except Exception:
+        return mesh
+
+
+def simulate_physics(part_info, axis_vec, gap, max_iters=50,
+                     settle_threshold=1e-4, debug=False):
+    """Run a quick gravity-settle simulation on assembled parts.
+
+    Each part is dropped along the assembly axis until it rests on the floor
+    (at the origin) or on another already-settled part.  Concave nesting is
+    resolved by ray-casting through the mesh interiors, so hollow parts like
+    outer_1/outer_2 will nest together and produce negative bounding-box gaps.
+
+    Parts are tessellated into cleaned meshes (degenerate faces removed)
+    before simulation.
+
+    Returns an updated part_info list with adjusted locations reflecting the
+    settled positions.
+    """
+    import trimesh
+
+    if not part_info:
+        return part_info
+
+    # Determine axis index (0=x, 1=y, 2=z)
+    if axis_vec.x:
+        ax = 0
+    elif axis_vec.y:
+        ax = 1
+    else:
+        ax = 2
+
+    # -- Build cleaned meshes and track offsets --
+    bodies = []  # (name, mesh, offset[3], ocp_shape, loc, rgb, segment)
+    for name, shape, loc, rgb, segment in part_info:
+        moved = apply_location(shape, loc)
+        mesh = _shape_to_clean_trimesh(moved)
+        if mesh is None:
+            bodies.append((name, None, np.zeros(3), shape, loc, rgb, segment))
+            continue
+        hull = _mesh_convex_hull(mesh)
+        bodies.append((name, mesh, np.zeros(3), shape, loc, rgb, segment))
+
+    if debug:
+        print(f"  [PHYS] Settling {len(bodies)} bodies along axis={ax}")
+
+    # -- Sort by position along axis (highest first = drop order) --
+    def _axis_min(b):
+        if b[1] is None:
+            return 0.0
+        return b[1].bounds[0, ax]
+
+    bodies.sort(key=_axis_min)
+
+    # Floor at z=0
+    floor_z = 0.0
+
+    # -- Drop each body iteratively --
+    # Process from lowest to highest: the lowest body settles on the floor,
+    # then each successive body settles on whatever is below it.
+    settled_meshes = []  # list of meshes already in their final positions
+
+    for idx in range(len(bodies)):
+        name, mesh, offset, shape, loc, rgb, segment = bodies[idx]
+        if mesh is None:
+            continue
+
+        current_mesh = mesh.copy()
+
+        # Find the resting position by dropping along the axis
+        # Start: current mesh position. Target: as low as possible.
+        current_min = current_mesh.bounds[0, ax]
+
+        # 1) Floor constraint: how far can we drop before hitting the floor?
+        drop_to_floor = current_min - floor_z
+
+        # 2) Check against all settled meshes for support surfaces
+        best_drop = drop_to_floor  # maximum we can drop
+
+        for settled in settled_meshes:
+            # Quick AABB overlap check in the non-axis directions
+            my_bounds = current_mesh.bounds
+            ot_bounds = settled.bounds
+
+            # Check overlap in the two non-axis dimensions
+            other_axes = [d for d in range(3) if d != ax]
+            overlap = True
+            for oa in other_axes:
+                if my_bounds[0, oa] >= ot_bounds[1, oa] or \
+                   my_bounds[1, oa] <= ot_bounds[0, oa]:
+                    overlap = False
+                    break
+            if not overlap:
+                continue
+
+            # Ray-cast to find support surface on the settled mesh
+            support_drop = _find_support_drop(current_mesh, settled, ax)
+            if support_drop is not None and support_drop < best_drop:
+                best_drop = support_drop
+
+        # Apply the drop
+        if best_drop > settle_threshold:
+            translation = np.zeros(3)
+            translation[ax] = -best_drop
+            current_mesh.apply_translation(translation)
+            offset_new = offset.copy()
+            offset_new[ax] -= best_drop
+            bodies[idx] = (name, mesh, offset_new, shape, loc, rgb, segment)
+
+            if debug:
+                print(f"  [PHYS] '{name}': dropped {best_drop:.4f} along axis")
+        else:
+            if debug:
+                print(f"  [PHYS] '{name}': already settled")
+
+        # Add the settled mesh to the list (in final position)
+        settled_copy = mesh.copy()
+        final_offset = bodies[idx][2]
+        settled_copy.apply_translation(final_offset)
+        settled_meshes.append(settled_copy)
+
+    # -- Build updated part_info with new locations --
+    updated = []
+    for body in bodies:
+        name, mesh, offset, shape, loc, rgb, segment = body
+        if mesh is None:
+            updated.append((name, shape, loc, rgb, segment))
+        else:
+            dx, dy, dz = offset[0], offset[1], offset[2]
+            if abs(dx) < 1e-8 and abs(dy) < 1e-8 and abs(dz) < 1e-8:
+                updated.append((name, shape, loc, rgb, segment))
+            else:
+                # Compose: apply original loc, then translate by sim offset
+                new_loc = Location(Vector(dx, dy, dz)) * loc
+                updated.append((name, shape, new_loc, rgb, segment))
+
+    # -- Report bbox gap changes --
+    _report_nesting(updated, ax, gap, debug)
+
+    return updated
+
+
+def _find_support_drop(falling_mesh, settled_mesh, ax):
+    """Find how far *falling_mesh* can drop along *ax* before resting on
+    *settled_mesh*.
+
+    Casts a grid of rays downward from the bottom face of the falling mesh
+    through the settled mesh.  For each ray that hits the settled surface,
+    the drop distance is the gap between the falling mesh bottom and the
+    topmost hit (the support surface).
+
+    For concave/hollow parts the rays may enter the interior and find an
+    inner floor, enabling nesting.
+
+    Returns the maximum safe drop distance, or None if there is no
+    interaction (the meshes don't overlap in the lateral dimensions).
+    """
+    bounds_f = falling_mesh.bounds
+    bounds_s = settled_mesh.bounds
+
+    # Sample grid on the XY footprint of the falling mesh
+    n_samples = 10
+    other_axes = [d for d in range(3) if d != ax]
+    margin_u = (bounds_f[1, other_axes[0]] - bounds_f[0, other_axes[0]]) * 0.02
+    margin_v = (bounds_f[1, other_axes[1]] - bounds_f[0, other_axes[1]]) * 0.02
+
+    u_range = np.linspace(bounds_f[0, other_axes[0]] + margin_u,
+                          bounds_f[1, other_axes[0]] - margin_u, n_samples)
+    v_range = np.linspace(bounds_f[0, other_axes[1]] + margin_v,
+                          bounds_f[1, other_axes[1]] - margin_v, n_samples)
+
+    origins = []
+    dir_down = np.zeros(3)
+    dir_down[ax] = -1.0
+
+    for u in u_range:
+        for v in v_range:
+            o = np.zeros(3)
+            o[other_axes[0]] = u
+            o[other_axes[1]] = v
+            o[ax] = bounds_f[0, ax]  # bottom of falling mesh
+            origins.append(o)
+
+    if not origins:
+        return None
+
+    origins = np.array(origins)
+    directions = np.tile(dir_down, (len(origins), 1))
+
+    # Cast rays downward against the settled mesh
+    try:
+        hits, ray_ids, _ = settled_mesh.ray.intersects_location(
+            origins, directions, multiple_hits=True
+        )
+    except Exception:
+        return None
+
+    if len(hits) == 0:
+        return None
+
+    # For each ray, find the topmost hit on the settled mesh.
+    # The hit with the highest coordinate along ax is the support surface
+    # (closest point below the falling part).
+    ray_support = {}
+    for hit, rid in zip(hits, ray_ids):
+        hit_val = hit[ax]
+        if rid not in ray_support or hit_val > ray_support[rid]:
+            ray_support[rid] = hit_val
+
+    if not ray_support:
+        return None
+
+    # The support level is the highest surface point found.
+    # The drop is how far the falling mesh bottom is above that surface.
+    support_level = max(ray_support.values())
+    drop = bounds_f[0, ax] - support_level
+
+    if drop > 0:
+        return drop
+
+    return 0.0
+
+
+def _report_nesting(part_info, ax, original_gap, debug):
+    """Print nesting report showing effective gaps vs bounding-box gaps."""
+    if not part_info:
+        return
+
+    # Compute bounding boxes of final positioned parts
+    positioned = []
+    for name, shape, loc, rgb, segment in part_info:
+        moved = apply_location(shape, loc)
+        bb = get_bounding_box(moved)
+        # bb = (xmin, ymin, zmin, xmax, ymax, zmax)
+        ax_min = bb[ax]
+        ax_max = bb[ax + 3]
+        positioned.append((name, ax_min, ax_max))
+
+    positioned.sort(key=lambda x: x[1])
+
+    print("\n  Physics nesting report:")
+    print(f"  {'Part':<25s} {'AxisMin':>10s} {'AxisMax':>10s} {'Gap':>10s}")
+    print(f"  {'-'*25} {'-'*10} {'-'*10} {'-'*10}")
+    prev_max = None
+    for name, ax_min, ax_max in positioned:
+        if prev_max is not None:
+            gap_val = ax_min - prev_max
+            gap_str = f"{gap_val:+.4f}"
+        else:
+            gap_str = "—"
+        print(f"  {name:<25s} {ax_min:10.4f} {ax_max:10.4f} {gap_str:>10s}")
+        if prev_max is None or ax_max > prev_max:
+            prev_max = ax_max
+
+
+# ===================================================================
 # STEP export
 # ===================================================================
 
@@ -1540,6 +1852,21 @@ def run_pipeline(args):
     assy, part_info = stack_parts(parts, axis_vec, args.gap)
     print(f"  Assembly created with {len(part_info)} part(s).")
 
+    # 2b. Physics simulation (optional)
+    if getattr(args, "phys", False):
+        print("\nRunning physics simulation (--phys)...")
+        part_info = simulate_physics(
+            part_info, axis_vec, args.gap,
+            debug=getattr(args, "debug", False),
+        )
+        # Rebuild assembly with updated locations
+        assy = Assembly()
+        for name, shape, loc, rgb, segment in part_info:
+            wp = cq.Workplane("XY").newObject([cq.Shape(shape)])
+            cq_color = Color(*rgb) if len(rgb) == 3 else Color(*rgb[:3])
+            assy.add(wp, name=name, loc=loc, color=cq_color)
+        print("  Physics simulation complete.")
+
     # 3. Cut (optional) and export STEP
     output_step = args.output
     cut_result_shape = None
@@ -1685,6 +2012,7 @@ def run_pipeline(args):
     print("\n=== Pipeline Complete ===")
     print(f"  Parts:      {len(parts)}")
     print(f"  Cyl orient: {getattr(args, 'cyl', False)}")
+    print(f"  Physics:    {getattr(args, 'phys', False)}")
     print(f"  Axis:       {args.axis.upper()}")
     print(f"  Gap:        {args.gap}")
     if args.cut_angle is not None:
@@ -1740,6 +2068,12 @@ def main():
         help="Use direct geometry calculation for cutting instead of boolean "
              "subtraction.  Splits faces along cut planes and filters solids, "
              "which is faster and produces cleaner cap surfaces.",
+    )
+    parser.add_argument(
+        "--phys", action="store_true",
+        help="Run a quick physics simulation: stack parts and release under "
+             "gravity so concentric parts nest together.  Reports effective "
+             "gaps (which become negative when parts nest inside each other).",
     )
     parser.add_argument(
         "--debug", action="store_true",

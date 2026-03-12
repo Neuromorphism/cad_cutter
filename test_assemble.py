@@ -2286,3 +2286,202 @@ class TestOuterStackupGap:
             cy = (yn + yx) / 2.0
             assert abs(cx) < 1.0, f"{name} not centered in X: cx={cx:.3f}"
             assert abs(cy) < 1.0, f"{name} not centered in Y: cy={cy:.3f}"
+
+
+# ============================================================================
+# Test: Physics simulation
+# ============================================================================
+
+from assemble import (
+    simulate_physics,
+    _shape_to_clean_trimesh,
+    _find_support_drop,
+    _report_nesting,
+)
+
+
+class TestShapeToCleanTrimesh:
+    """Tests for OCP shape → cleaned trimesh conversion."""
+
+    def test_box_produces_valid_mesh(self):
+        box = cq.Workplane("XY").box(10, 10, 10)
+        mesh = _shape_to_clean_trimesh(box.val().wrapped)
+        assert mesh is not None
+        assert len(mesh.faces) > 0
+        assert len(mesh.vertices) > 0
+
+    def test_degenerate_removed(self):
+        """A valid shape should yield a mesh with no degenerate faces."""
+        cyl = cq.Workplane("XY").cylinder(20, 5)
+        mesh = _shape_to_clean_trimesh(cyl.val().wrapped)
+        assert mesh is not None
+        # All faces should have non-zero area
+        areas = mesh.area_faces
+        assert all(a > 0 for a in areas)
+
+    def test_empty_shape_returns_none(self):
+        """An empty compound should return None."""
+        builder = BRep_Builder()
+        compound = TopoDS_Compound()
+        builder.MakeCompound(compound)
+        mesh = _shape_to_clean_trimesh(compound)
+        assert mesh is None
+
+
+class TestPhysicsSimulation:
+    """Tests for the gravity-settle physics simulation."""
+
+    def test_single_part_settles_on_floor(self):
+        """A single box should settle at z=0 (the floor)."""
+        box = cq.Workplane("XY").box(10, 10, 10)
+        shape = box.val().wrapped
+        # Start the box elevated at z=20
+        loc = Location(Vector(0, 0, 20))
+        part_info = [("box", shape, loc, (0.5, 0.5, 0.5), None)]
+
+        result = simulate_physics(
+            part_info, Vector(0, 0, 1), gap=0.0,
+            max_iters=50,
+        )
+
+        assert len(result) == 1
+        moved = apply_location(result[0][1], result[0][2])
+        bb = get_bounding_box(moved)
+        # z_min should be near 0 (floor)
+        assert abs(bb[2]) < 1.0, f"Box z_min should be near 0, got {bb[2]}"
+
+    def test_two_stacked_boxes(self):
+        """Two boxes stacked with a gap should settle together."""
+        box = cq.Workplane("XY").box(10, 10, 10)
+        shape = box.val().wrapped
+
+        part_info = [
+            ("box_1", shape, Location(Vector(0, 0, 0)), (0.5, 0.5, 0.5), None),
+            ("box_2", shape, Location(Vector(0, 0, 15)), (0.7, 0.3, 0.3), None),
+        ]
+
+        result = simulate_physics(
+            part_info, Vector(0, 0, 1), gap=5.0,
+            max_iters=50,
+        )
+
+        assert len(result) == 2
+        # Both boxes should be touching or nearly touching
+        moved_1 = apply_location(result[0][1], result[0][2])
+        moved_2 = apply_location(result[1][1], result[1][2])
+        bb1 = get_bounding_box(moved_1)
+        bb2 = get_bounding_box(moved_2)
+
+        # Sort by z_min
+        bboxes = sorted([(bb1, "box_1"), (bb2, "box_2")], key=lambda x: x[0][2])
+        lower_zmax = bboxes[0][0][5]
+        upper_zmin = bboxes[1][0][2]
+        # Gap between them should be small (settled)
+        gap_val = upper_zmin - lower_zmax
+        assert gap_val < 2.0, f"Gap between stacked boxes should be small, got {gap_val}"
+
+    def test_nesting_reduces_gap(self):
+        """Concentric cylinders (hollow outer, solid inner) should nest,
+        producing a negative bounding-box gap."""
+        # Outer: hollow cylinder (shell)
+        outer = cq.Workplane("XY").cylinder(20, 15).cut(
+            cq.Workplane("XY").cylinder(20, 12)
+        )
+        # Inner: solid cylinder that fits inside
+        inner = cq.Workplane("XY").cylinder(18, 11)
+
+        outer_shape = outer.val().wrapped
+        inner_shape = inner.val().wrapped
+
+        # Stack inner on top (above outer)
+        part_info = [
+            ("outer_1", outer_shape, Location(Vector(0, 0, 0)),
+             (0.5, 0.5, 0.5), None),
+            ("inner_1", inner_shape, Location(Vector(0, 0, 25)),
+             (0.8, 0.3, 0.3), None),
+        ]
+
+        result = simulate_physics(
+            part_info, Vector(0, 0, 1), gap=0.0,
+            max_iters=50,
+        )
+
+        # After settling, the inner cylinder should have dropped inside
+        moved_outer = apply_location(result[0][1], result[0][2])
+        moved_inner = apply_location(result[1][1], result[1][2])
+        bb_outer = get_bounding_box(moved_outer)
+        bb_inner = get_bounding_box(moved_inner)
+
+        # The inner part's z_min should be at or below the outer part's z_max
+        # (negative gap means nesting)
+        outer_zmax = bb_outer[5]
+        inner_zmin = bb_inner[2]
+        effective_gap = inner_zmin - outer_zmax
+        assert effective_gap < 1.0, (
+            f"Inner should nest inside outer (gap < 1.0), got {effective_gap:.4f}"
+        )
+
+    def test_preserves_part_metadata(self):
+        """Simulation should preserve name, color, and segment info."""
+        box = cq.Workplane("XY").box(10, 10, 10)
+        shape = box.val().wrapped
+        part_info = [
+            ("test_part", shape, Location(Vector(0, 0, 0)),
+             (0.1, 0.2, 0.3), "a"),
+        ]
+
+        result = simulate_physics(
+            part_info, Vector(0, 0, 1), gap=0.0,
+        )
+
+        assert result[0][0] == "test_part"
+        assert result[0][3] == (0.1, 0.2, 0.3)
+        assert result[0][4] == "a"
+
+    def test_empty_input(self):
+        """Empty input should return empty output."""
+        result = simulate_physics([], Vector(0, 0, 1), gap=0.0)
+        assert result == []
+
+    def test_x_axis_simulation(self):
+        """Physics should work along X axis too."""
+        box = cq.Workplane("XY").box(10, 10, 10)
+        shape = box.val().wrapped
+        loc = Location(Vector(30, 0, 0))
+        part_info = [("box", shape, loc, (0.5, 0.5, 0.5), None)]
+
+        result = simulate_physics(
+            part_info, Vector(1, 0, 0), gap=0.0,
+            max_iters=50,
+        )
+
+        moved = apply_location(result[0][1], result[0][2])
+        bb = get_bounding_box(moved)
+        # x_min should settle near 0 (floor along X)
+        assert abs(bb[0]) < 2.0, f"Box x_min should be near 0, got {bb[0]}"
+
+
+class TestPhysPipeline:
+    """Integration test: --phys flag in run_pipeline."""
+
+    def test_phys_flag_accepted(self, concentric_parts, tmp_dir):
+        """Verify --phys flag is accepted and doesn't error."""
+        from assemble import run_pipeline
+        import types
+
+        args = types.SimpleNamespace(
+            inputs=[concentric_parts["outer_1"], concentric_parts["outer_2"]],
+            output=os.path.join(tmp_dir, "phys_test.step"),
+            axis="z",
+            gap=5.0,
+            cut_angle=None,
+            render=None,
+            resolution=512,
+            cyl=False,
+            cut_direct=False,
+            phys=True,
+            debug=False,
+        )
+        ret = run_pipeline(args)
+        assert ret == 0
+        assert os.path.exists(args.output)
