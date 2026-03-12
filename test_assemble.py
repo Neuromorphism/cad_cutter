@@ -33,6 +33,9 @@ from assemble import (
     make_cutter,
     make_segment_cutter,
     cut_assembly,
+    cut_part_direct,
+    cut_part_direct_segment,
+    _cutter_params,
     export_assembly_step,
     export_shape_step,
     tessellate_shape,
@@ -1807,3 +1810,202 @@ class TestCutRobustness:
         # Should be promoted to SOLID (or at least not null)
         assert not solid.IsNull()
         assert solid.ShapeType() == TopAbs_SOLID
+
+
+# ============================================================================
+# Test: Direct geometry cutting
+# ============================================================================
+
+class TestDirectGeometryCut:
+    """Tests for cut_part_direct() — the split-and-filter approach."""
+
+    def _get_volume(self, shape):
+        from OCP.GProp import GProp_GProps
+        from OCP.BRepGProp import BRepGProp
+        props = GProp_GProps()
+        BRepGProp.VolumeProperties_s(shape, props)
+        return props.Mass()
+
+    def _origin_for(self, shape, axis_vec):
+        bbox = Bnd_Box()
+        BRepBndLib.Add_s(shape, bbox)
+        bbox_vals = bbox.Get()
+        _, _, origin_pt, _ = _cutter_params(bbox_vals, axis_vec)
+        return origin_pt
+
+    def test_direct_cut_90_cylinder(self):
+        """90° direct cut of a cylinder removes exactly one quarter."""
+        cyl = cq.Workplane("XY").cylinder(30, 8).val().wrapped
+        orig_vol = self._get_volume(cyl)
+        origin = self._origin_for(cyl, AXIS_MAP["z"])
+
+        result = cut_part_direct(cyl, 90, AXIS_MAP["z"], origin)
+        assert result is not None
+        result_vol = self._get_volume(result)
+        assert abs(result_vol / orig_vol - 0.75) < 0.02, (
+            f"Expected ~75% kept, got {result_vol/orig_vol:.4f}"
+        )
+
+    def test_direct_cut_180_cylinder(self):
+        """180° direct cut of a cylinder removes exactly one half."""
+        cyl = cq.Workplane("XY").cylinder(30, 8).val().wrapped
+        orig_vol = self._get_volume(cyl)
+        origin = self._origin_for(cyl, AXIS_MAP["z"])
+
+        result = cut_part_direct(cyl, 180, AXIS_MAP["z"], origin)
+        assert result is not None
+        result_vol = self._get_volume(result)
+        assert abs(result_vol / orig_vol - 0.50) < 0.02, (
+            f"Expected ~50% kept, got {result_vol/orig_vol:.4f}"
+        )
+
+    def test_direct_cut_90_box(self):
+        """90° direct cut of a box removes approximately one quarter."""
+        box = cq.Workplane("XY").box(20, 20, 10).val().wrapped
+        orig_vol = self._get_volume(box)
+        origin = self._origin_for(box, AXIS_MAP["z"])
+
+        result = cut_part_direct(box, 90, AXIS_MAP["z"], origin)
+        assert result is not None
+        result_vol = self._get_volume(result)
+        assert abs(result_vol / orig_vol - 0.75) < 0.02
+
+    def test_direct_cut_flange(self):
+        """Direct cut of a flange (cylinder with hex cutout)."""
+        flange = (
+            cq.Workplane("XY")
+            .circle(15).extrude(5)
+            .faces(">Z").workplane()
+            .polygon(6, 12).cutBlind(-5)
+        ).val().wrapped
+        orig_vol = self._get_volume(flange)
+        origin = self._origin_for(flange, AXIS_MAP["z"])
+
+        result = cut_part_direct(flange, 90, AXIS_MAP["z"], origin)
+        assert result is not None
+        result_vol = self._get_volume(result)
+        assert abs(result_vol / orig_vol - 0.75) < 0.05
+
+    def test_direct_cut_all_axes(self):
+        """Direct cut works for all three stacking axes."""
+        box = cq.Workplane("XY").box(15, 15, 30).val().wrapped
+
+        for axis_name in ("x", "y", "z"):
+            axis_vec = AXIS_MAP[axis_name]
+            origin = self._origin_for(box, axis_vec)
+            result = cut_part_direct(box, 90, axis_vec, origin)
+            assert result is not None, f"axis={axis_name}: result is None"
+            bbox = Bnd_Box()
+            BRepBndLib.Add_s(result, bbox)
+            assert not bbox.IsVoid(), f"axis={axis_name}: result bbox is void"
+
+    def test_direct_cut_multiple_angles(self):
+        """Direct cut produces valid results for a range of angles."""
+        cyl = cq.Workplane("XY").cylinder(20, 10).val().wrapped
+        orig_vol = self._get_volume(cyl)
+        origin = self._origin_for(cyl, AXIS_MAP["z"])
+
+        for angle in [45, 90, 120, 180, 270]:
+            result = cut_part_direct(cyl, angle, AXIS_MAP["z"], origin)
+            assert result is not None, f"angle={angle}: result is None"
+            result_vol = self._get_volume(result)
+            expected_ratio = (360 - angle) / 360.0
+            assert abs(result_vol / orig_vol - expected_ratio) < 0.03, (
+                f"angle={angle}: expected {expected_ratio:.3f}, "
+                f"got {result_vol/orig_vol:.3f}"
+            )
+
+    def test_direct_cut_produces_cap_faces(self):
+        """Direct cut should produce planar cap faces at the cut boundaries."""
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopAbs import TopAbs_FACE
+        from OCP.TopoDS import TopoDS
+        from OCP.BRep import BRep_Tool
+        from OCP.GeomAdaptor import GeomAdaptor_Surface
+        from OCP.GeomAbs import GeomAbs_Plane
+
+        cyl = cq.Workplane("XY").cylinder(30, 8).val().wrapped
+        origin = self._origin_for(cyl, AXIS_MAP["z"])
+
+        result = cut_part_direct(cyl, 90, AXIS_MAP["z"], origin)
+        assert result is not None
+
+        # Count planar faces — original cylinder has 2 (top+bottom),
+        # direct cut should add 2 more (cap at 0° and cap at 90°)
+        plane_count = 0
+        explorer = TopExp_Explorer(result, TopAbs_FACE)
+        while explorer.More():
+            face = TopoDS.Face_s(explorer.Current())
+            surface = BRep_Tool.Surface_s(face)
+            adaptor = GeomAdaptor_Surface(surface)
+            if adaptor.GetType() == GeomAbs_Plane:
+                plane_count += 1
+            explorer.Next()
+
+        # Original has 2 plane faces; after 90° cut the splitter creates
+        # additional planar caps. Expect at least 4 planar faces.
+        assert plane_count >= 4, (
+            f"Expected at least 4 planar faces (2 original + 2 caps), "
+            f"got {plane_count}"
+        )
+
+    def test_direct_cut_result_exportable(self, tmp_dir):
+        """Direct cut result can be exported as STEP."""
+        box = cq.Workplane("XY").box(20, 20, 10).val().wrapped
+        origin = self._origin_for(box, AXIS_MAP["z"])
+
+        result = cut_part_direct(box, 90, AXIS_MAP["z"], origin)
+        assert result is not None
+
+        out_path = os.path.join(tmp_dir, "direct_cut.step")
+        export_shape_step(result, out_path)
+        assert os.path.exists(out_path)
+        assert os.path.getsize(out_path) > 100
+
+    def test_direct_segment_a_and_b(self):
+        """Direct segment cut splits the remaining arc into two halves."""
+        cyl = cq.Workplane("XY").cylinder(30, 8).val().wrapped
+        orig_vol = self._get_volume(cyl)
+        origin = self._origin_for(cyl, AXIS_MAP["z"])
+        cut_angle = 90.0
+
+        seg_a = cut_part_direct_segment(
+            cyl, cut_angle, AXIS_MAP["z"], origin, "a"
+        )
+        seg_b = cut_part_direct_segment(
+            cyl, cut_angle, AXIS_MAP["z"], origin, "b"
+        )
+
+        assert seg_a is not None
+        assert seg_b is not None
+
+        vol_a = self._get_volume(seg_a)
+        vol_b = self._get_volume(seg_b)
+
+        # Each segment should be roughly half of the remaining arc (270°/2 = 135°)
+        expected_each = orig_vol * 135.0 / 360.0
+        assert abs(vol_a - expected_each) / expected_each < 0.05, (
+            f"Segment a: expected ~{expected_each:.1f}, got {vol_a:.1f}"
+        )
+        assert abs(vol_b - expected_each) / expected_each < 0.05, (
+            f"Segment b: expected ~{expected_each:.1f}, got {vol_b:.1f}"
+        )
+
+    def test_direct_cut_real_step_file(self):
+        """Direct cut of the bundled cut.step at several angles."""
+        step_path = os.path.join(os.path.dirname(__file__), "cut.step")
+        if not os.path.exists(step_path):
+            pytest.skip("cut.step not found")
+
+        wp, name = load_part(step_path)
+        shape = wp.val().wrapped
+        origin = self._origin_for(shape, AXIS_MAP["z"])
+
+        for angle in [90, 180]:
+            result = cut_part_direct(shape, angle, AXIS_MAP["z"], origin)
+            assert result is not None, f"angle={angle}: result is None"
+            result_bbox = Bnd_Box()
+            BRepBndLib.Add_s(result, result_bbox)
+            assert not result_bbox.IsVoid(), (
+                f"angle={angle}: result bbox is void"
+            )
