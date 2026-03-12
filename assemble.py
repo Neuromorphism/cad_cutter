@@ -52,7 +52,7 @@ from OCP.TopoDS import TopoDS_Shape, TopoDS_Compound, TopoDS
 from OCP.BRep import BRep_Builder, BRep_Tool
 from OCP.BRepBndLib import BRepBndLib
 from OCP.Bnd import Bnd_Box
-from OCP.gp import gp_Trsf, gp_Vec, gp_Ax2, gp_Pnt, gp_Dir
+from OCP.gp import gp_Trsf, gp_Vec, gp_Ax1, gp_Ax2, gp_Pnt, gp_Dir
 from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
 from OCP.IFSelect import IFSelect_RetDone
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
@@ -214,6 +214,81 @@ def apply_location(shape, loc):
     cq_shape = cq.Shape(shape)
     moved = cq_shape.moved(loc)
     return moved.wrapped
+
+
+# ===================================================================
+# Cylinder orientation
+# ===================================================================
+
+def orient_to_cylinder(parts):
+    """Rotate all parts so the cylinder height axis aligns with Z.
+
+    Uses PCA on the combined vertex cloud of all parts to find the principal
+    axis (direction of maximum variance), which corresponds to the cylinder
+    height direction.  All parts are rotated together by the same transform so
+    that axis → +Z.
+
+    Returns a list of (cq.Workplane, name) tuples with rotated shapes.
+    """
+    # Collect all vertices via coarse tessellation (speed over accuracy)
+    all_verts = []
+    for wp, name in parts:
+        shape = wp.val().wrapped
+        verts, _ = tessellate_shape(shape, tolerance=1.0)
+        if len(verts) > 0:
+            all_verts.append(verts)
+
+    if not all_verts:
+        return parts
+
+    vertices = np.vstack(all_verts)
+    center = vertices.mean(axis=0)
+    centered = vertices - center
+
+    # 3×3 covariance matrix; eigenvector with largest eigenvalue = principal axis
+    cov = (centered.T @ centered) / len(vertices)
+    eigenvalues, eigenvectors = np.linalg.eigh(cov)
+
+    # Largest eigenvalue index → cylinder height axis
+    principal = eigenvectors[:, np.argmax(eigenvalues)]
+
+    # Prefer orientation with positive Z component for consistency
+    if principal[2] < 0:
+        principal = -principal
+
+    z = np.array([0.0, 0.0, 1.0])
+    dot = float(np.clip(np.dot(principal, z), -1.0, 1.0))
+
+    px, py, pz = principal
+    print(f"  Cylinder axis detected: ({px:.3f}, {py:.3f}, {pz:.3f})")
+
+    # Already aligned with +Z — nothing to do
+    if abs(dot) > 1.0 - 1e-6:
+        print("  Parts already aligned with Z-axis.")
+        return parts
+
+    # Rotation axis = cross(principal, z), then normalize
+    rot_axis = np.cross(principal, z)
+    rot_axis = rot_axis / np.linalg.norm(rot_axis)
+    angle = math.acos(dot)
+
+    print(f"  Rotating {math.degrees(angle):.1f}° to align cylinder axis with Z.")
+
+    trsf = gp_Trsf()
+    ax1 = gp_Ax1(
+        gp_Pnt(0.0, 0.0, 0.0),
+        gp_Dir(float(rot_axis[0]), float(rot_axis[1]), float(rot_axis[2])),
+    )
+    trsf.SetRotation(ax1, angle)
+
+    rotated_parts = []
+    for wp, name in parts:
+        shape = wp.val().wrapped
+        rotated = BRepBuilderAPI_Transform(shape, trsf, True).Shape()
+        new_wp = cq.Workplane("XY").newObject([cq.Shape(rotated)])
+        rotated_parts.append((new_wp, name))
+
+    return rotated_parts
 
 
 # ===================================================================
@@ -936,6 +1011,11 @@ def run_pipeline(args):
         print("No valid parts loaded. Exiting.")
         return 1
 
+    # 1b. Cylinder orientation (optional)
+    if getattr(args, "cyl", False):
+        print("\nOrient parts for cylinder (--cyl): aligning cylinder axis with Z...")
+        parts = orient_to_cylinder(parts)
+
     # 2. Stack parts
     axis_vec = AXIS_MAP[args.axis]
     print(f"\nStacking {len(parts)} part(s) along {args.axis.upper()}-axis (gap={args.gap})...")
@@ -1040,6 +1120,7 @@ def run_pipeline(args):
     # 5. Summary
     print("\n=== Pipeline Complete ===")
     print(f"  Parts:      {len(parts)}")
+    print(f"  Cyl orient: {getattr(args, 'cyl', False)}")
     print(f"  Axis:       {args.axis.upper()}")
     print(f"  Gap:        {args.gap}")
     if args.cut_angle is not None:
@@ -1084,6 +1165,10 @@ def main():
     parser.add_argument(
         "--resolution", type=int, default=2048,
         help="Render resolution in pixels (default: 2048)",
+    )
+    parser.add_argument(
+        "--cyl", action="store_true",
+        help="Orient parts so the cylinder height axis aligns with Z before stacking.",
     )
     parser.add_argument(
         "--debug", action="store_true",
