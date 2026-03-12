@@ -34,6 +34,7 @@ Usage examples:
 import sys
 import os
 import re
+import glob
 import argparse
 import math
 import tempfile
@@ -119,6 +120,65 @@ DEFAULT_PALETTE = [
 
 CAD_EXTENSIONS = {".step", ".stp", ".iges", ".igs", ".brep"}
 MESH_EXTENSIONS = {".stl", ".obj", ".ply", ".3mf"}
+ALL_EXTENSIONS = CAD_EXTENSIONS | MESH_EXTENSIONS
+
+
+def expand_inputs(raw_inputs):
+    """Expand glob patterns and filter to recognized CAD/mesh files.
+
+    Handles three cases:
+    1. An existing file path   → kept as-is
+    2. A glob pattern (*/?)    → expanded (case-insensitive on all platforms)
+    3. A non-existing literal  → kept so the caller can warn about it
+
+    Returns a deduplicated list of paths in stable order.
+    """
+    result = []
+    seen = set()
+
+    for entry in raw_inputs:
+        if os.path.exists(entry):
+            # Literal file that exists — keep it
+            real = os.path.realpath(entry)
+            if real not in seen:
+                seen.add(real)
+                result.append(entry)
+        elif any(c in entry for c in ("*", "?", "[", "]")):
+            # Glob pattern — expand with case-insensitive matching so
+            # *.STEP finds .step/.Step/.STEP and vice versa.
+            ci_pattern = _case_insensitive_glob(entry)
+            matches = glob.glob(ci_pattern)
+            if not matches:
+                # Fallback to the original pattern (e.g. already has [])
+                matches = glob.glob(entry)
+            matches.sort()
+            for m in matches:
+                ext = os.path.splitext(m)[1].lower()
+                if ext in ALL_EXTENSIONS:
+                    real = os.path.realpath(m)
+                    if real not in seen:
+                        seen.add(real)
+                        result.append(m)
+        else:
+            # Literal path that doesn't exist — pass through so caller warns
+            result.append(entry)
+
+    return result
+
+
+def _case_insensitive_glob(pattern):
+    """Convert a glob pattern to a case-insensitive version.
+
+    *.STEP  →  *.[sS][tT][eE][pP]
+    Works character-by-character on the extension portion.
+    """
+    parts = []
+    for ch in pattern:
+        if ch.isalpha():
+            parts.append(f"[{ch.lower()}{ch.upper()}]")
+        else:
+            parts.append(ch)
+    return "".join(parts)
 
 
 def get_bounding_box(shape):
@@ -731,10 +791,15 @@ def render_assembly(parts_data, output_path, resolution=2048, cut_shape=None):
 
 def run_pipeline(args):
     """Execute the full assembly pipeline."""
-    # 1. Load all parts
-    print(f"Loading {len(args.inputs)} part(s)...")
+    # 1. Expand globs and load all parts
+    filepaths = expand_inputs(args.inputs)
+    if not filepaths:
+        print("No matching files found. Exiting.")
+        return 1
+
+    print(f"Loading {len(filepaths)} part(s)...")
     parts = []
-    for filepath in args.inputs:
+    for filepath in filepaths:
         if not os.path.exists(filepath):
             print(f"  WARNING: '{filepath}' not found, skipping.")
             continue
