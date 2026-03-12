@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from assemble import (
     get_bounding_box,
+    get_tight_bounding_box,
     shape_extent,
     translate_shape,
     apply_location,
@@ -2156,51 +2157,62 @@ class TestOuterStackupGap:
 
     def test_without_cyl_outer1_height_is_diameter_not_length(self):
         """Without --cyl, outer_1's stacked Z-height equals its tube diameter
-        (~511 mm), NOT its actual tube length (~917 mm).  This is the root
-        cause of the large stackup gap."""
+        (~511 mm), NOT its actual tube length (~495 mm).  This is the root
+        cause of the visual stackup issue."""
         moved = self._load_and_stack(use_cyl=False)
         outer1 = next(s for n, s in moved if n == "outer_1")
-        _, _, zn, _, _, zx = get_bounding_box(outer1)
+        _, _, zn, _, _, zx = get_tight_bounding_box(outer1)
         height = zx - zn
-        # Should be ~511 mm (diameter), not ~917 mm (length)
+        # Should be ~511 mm (diameter), not ~495 mm (tube length)
         assert abs(height - 510.7) < 5.0, (
             f"Expected ~510.7 mm (tube diameter), got {height:.1f} mm"
         )
 
     def test_without_cyl_large_y_direction_gap(self):
-        """Without --cyl, outer_1's Y extent (~917 mm) is nearly twice
-        outer_2's Y extent (~498 mm).  The ~209 mm overhang at each end
-        is the large visual gap the user observes in the stackup."""
+        """Without --cyl, the tube long-axes lie along Y.  Both tubes have
+        similar Y extents (their actual tube lengths, ~495–500 mm each).
+        The visual problem without --cyl is that Z-stacking uses the tube
+        *diameter* (~511 mm / ~440 mm) instead of the tube length, so the
+        assembly looks wrong in 3-D even though the Z bboxes touch.
+
+        We verify the tight Y extents are the actual tube lengths (both
+        ≈495–502 mm) — confirming the degenerate-face-inflated value
+        (~917 mm) is NOT used for positioning."""
         moved = self._load_and_stack(use_cyl=False)
         outer1 = next(s for n, s in moved if n == "outer_1")
         outer2 = next(s for n, s in moved if n == "outer_2")
 
-        _, y1n, _, _, y1x, _ = get_bounding_box(outer1)
-        _, y2n, _, _, y2x, _ = get_bounding_box(outer2)
-        y_extent_1 = y1x - y1n  # ~917 mm (tube length of outer_1)
-        y_extent_2 = y2x - y2n  # ~498 mm (tube length of outer_2)
+        # After stack_parts runs (which internally calls get_tight_bounding_box),
+        # BRepMesh side-effects mean get_bounding_box also returns tight bbox.
+        _, y1n, _, _, y1x, _ = get_tight_bounding_box(outer1)
+        _, y2n, _, _, y2x, _ = get_tight_bounding_box(outer2)
+        y_extent_1 = y1x - y1n  # actual tube length of outer_1, ~495 mm
+        y_extent_2 = y2x - y2n  # actual tube length of outer_2, ~499 mm
 
-        assert y_extent_1 > 850.0, (
-            f"outer_1 Y extent expected >850 mm, got {y_extent_1:.1f} mm"
+        # Neither tube's Y extent should be inflated to ~917 mm.
+        assert y_extent_1 < 560.0, (
+            f"outer_1 tight Y extent should be tube length (<560 mm), "
+            f"got {y_extent_1:.1f} mm — degenerate face may be inflating bbox"
         )
         assert y_extent_2 < 560.0, (
-            f"outer_2 Y extent expected <560 mm, got {y_extent_2:.1f} mm"
+            f"outer_2 tight Y extent should be tube length (<560 mm), "
+            f"got {y_extent_2:.1f} mm"
         )
-
-        gap_each_end = (y_extent_1 - y_extent_2) / 2.0
-        assert gap_each_end > 150.0, (
-            f"Expected large Y-direction gap >150 mm per end, "
-            f"got {gap_each_end:.1f} mm"
+        # Both tubes have similar lengths (within 10 mm of each other).
+        assert abs(y_extent_1 - y_extent_2) < 10.0, (
+            f"Tube Y extents should be similar (both ~495–500 mm), "
+            f"got outer_1={y_extent_1:.1f} mm, outer_2={y_extent_2:.1f} mm"
         )
 
     def test_without_cyl_z_bboxes_touch(self):
         """Without --cyl the Z bounding boxes still touch (gap=0 in Z).
-        The gap is purely visual / in the Y direction, not a Z gap."""
+        The visual problem is the wrong stacking height (diameter not length),
+        not a Z gap."""
         moved = self._load_and_stack(use_cyl=False)
         outer1 = next(s for n, s in moved if n == "outer_1")
         outer2 = next(s for n, s in moved if n == "outer_2")
-        _, _, _, _, _, z1x = get_bounding_box(outer1)
-        _, _, z2n, _, _, _  = get_bounding_box(outer2)
+        _, _, _, _, _, z1x = get_tight_bounding_box(outer1)
+        _, _, z2n, _, _, _  = get_tight_bounding_box(outer2)
         assert abs(z2n - z1x) < 1.0, (
             f"Z gap without --cyl: {z2n - z1x:.3f} mm (expected 0)"
         )
@@ -2211,13 +2223,14 @@ class TestOuterStackupGap:
 
     def test_with_cyl_outer1_height_is_tube_length(self):
         """With --cyl, outer_1's stacked Z-height equals its actual tube
-        length (~917 mm), not its diameter."""
+        body height (~498.5 mm), not the degenerate-face-inflated value
+        (~917 mm) nor the tube diameter."""
         moved = self._load_and_stack(use_cyl=True)
         outer1 = next(s for n, s in moved if n == "outer_1")
-        _, _, zn, _, _, zx = get_bounding_box(outer1)
+        xn, yn, zn, xx, yx, zx = get_tight_bounding_box(outer1)
         height = zx - zn
-        assert abs(height - 916.9) < 5.0, (
-            f"Expected ~916.9 mm (tube length), got {height:.1f} mm"
+        assert abs(height - 498.5) < 5.0, (
+            f"Expected ~498.5 mm (tube body height), got {height:.1f} mm"
         )
 
     def test_with_cyl_outer2_height_is_tube_length(self):
@@ -2225,7 +2238,7 @@ class TestOuterStackupGap:
         length (~499 mm), not its diameter."""
         moved = self._load_and_stack(use_cyl=True)
         outer2 = next(s for n, s in moved if n == "outer_2")
-        _, _, zn, _, _, zx = get_bounding_box(outer2)
+        _, _, zn, _, _, zx = get_tight_bounding_box(outer2)
         height = zx - zn
         assert abs(height - 499.0) < 5.0, (
             f"Expected ~499.0 mm (tube length), got {height:.1f} mm"
@@ -2236,8 +2249,8 @@ class TestOuterStackupGap:
         moved = self._load_and_stack(use_cyl=True)
         outer1 = next(s for n, s in moved if n == "outer_1")
         outer2 = next(s for n, s in moved if n == "outer_2")
-        _, _, _, _, _, z1x = get_bounding_box(outer1)
-        _, _, z2n, _, _, _  = get_bounding_box(outer2)
+        _, _, _, _, _, z1x = get_tight_bounding_box(outer1)
+        _, _, z2n, _, _, _  = get_tight_bounding_box(outer2)
         assert abs(z2n - z1x) < 1.0, (
             f"Z gap with --cyl: {z2n - z1x:.3f} mm (expected 0)"
         )
@@ -2246,7 +2259,7 @@ class TestOuterStackupGap:
         """With --cyl, outer_1's base is placed at z=0."""
         moved = self._load_and_stack(use_cyl=True)
         outer1 = next(s for n, s in moved if n == "outer_1")
-        _, _, zn, _, _, _ = get_bounding_box(outer1)
+        _, _, zn, _, _, _ = get_tight_bounding_box(outer1)
         assert abs(zn) < 1.0, f"outer_1 base at z={zn:.3f}, expected ~0"
 
     def test_with_cyl_small_y_direction_gap(self):
@@ -2257,8 +2270,8 @@ class TestOuterStackupGap:
         outer1 = next(s for n, s in moved if n == "outer_1")
         outer2 = next(s for n, s in moved if n == "outer_2")
 
-        _, y1n, _, _, y1x, _ = get_bounding_box(outer1)
-        _, y2n, _, _, y2x, _ = get_bounding_box(outer2)
+        _, y1n, _, _, y1x, _ = get_tight_bounding_box(outer1)
+        _, y2n, _, _, y2x, _ = get_tight_bounding_box(outer2)
         y_extent_1 = y1x - y1n  # ~511 mm (outer_1 diameter)
         y_extent_2 = y2x - y2n  # ~440 mm (outer_2 diameter)
 
@@ -2278,7 +2291,15 @@ class TestOuterStackupGap:
         )
 
     def test_with_cyl_both_xy_centered(self):
-        """With --cyl, both parts are XY-centered at the origin."""
+        """With --cyl, both parts are XY-centered at the origin.
+
+        Use the exact (analytical) bbox rather than the tight/triangulation bbox
+        here because apply_location returns a shape with a TopLoc_Location, and
+        BRepBndLib with useTriangulation=True does not reliably apply that
+        location to the mesh vertices in all OCC versions.  The exact bbox is
+        always location-aware.  After the --cyl rotation, the degenerate BSpline
+        face inflates only the Z bbox (tube axis), not X or Y, so the exact XY
+        extents are correct for this check."""
         moved = self._load_and_stack(use_cyl=True)
         for name, shape in moved:
             xn, yn, _, xx, yx, _ = get_bounding_box(shape)

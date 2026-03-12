@@ -189,6 +189,26 @@ def get_bounding_box(shape):
     return bbox.Get()
 
 
+def get_tight_bounding_box(shape, tol=1.0):
+    """Return (xmin,ymin,zmin, xmax,ymax,zmax) using the mesh triangulation.
+
+    Some STEP files contain degenerate parametric faces (e.g. a BSpline with
+    a tiny physical area but a huge parametric domain) whose exact bounding
+    box inflates the overall bbox far beyond the visible geometry.
+    Meshing first and querying with useTriangulation=True restricts the bbox
+    to actual triangulated surfaces, which avoids this inflation.
+
+    Falls back to the exact bbox if meshing produces a void result.
+    """
+    BRepMesh_IncrementalMesh(shape, tol)
+    bbox = Bnd_Box()
+    BRepBndLib.Add_s(shape, bbox, True)  # True = useTriangulation
+    if bbox.IsVoid():
+        bbox = Bnd_Box()
+        BRepBndLib.Add_s(shape, bbox)
+    return bbox.Get()
+
+
 def shape_extent(shape, axis):
     """Return (min, max) along the given axis vector."""
     xn, yn, zn, xx, yx, zx = get_bounding_box(shape)
@@ -324,7 +344,7 @@ def orient_to_cylinder(parts, gap=0.0):
     # ------------------------------------------------------------------
     def _cz(wp_name):
         shape = wp_name[0].val().wrapped
-        xn, yn, zn, xx, yx, zx = get_bounding_box(shape)
+        xn, yn, zn, xx, yx, zx = get_tight_bounding_box(shape)
         return (zn + zx) / 2.0
 
     current_parts.sort(key=_cz)
@@ -337,7 +357,7 @@ def orient_to_cylinder(parts, gap=0.0):
     z_cursor = 0.0
     for wp, name in current_parts:
         shape = wp.val().wrapped
-        xn, yn, zn, xx, yx, zx = get_bounding_box(shape)
+        xn, yn, zn, xx, yx, zx = get_tight_bounding_box(shape)
         height = zx - zn
         dz = z_cursor - zn
         if abs(dz) > 1e-9:
@@ -623,24 +643,42 @@ def stack_parts(parts, axis_vec, gap):
             level_z_top[level] = z_cursor
             continue
 
+        # Phase 1: compute tight XY centers before Phase 2/3 Z computations.
+        # Shapes from orient_to_cylinder are fresh copies (BRepBuilderAPI_Transform
+        # with copy=True in Step 4) that have no mesh yet.  The exact bbox on an
+        # unmeshed shape is computed from the analytical parametric surfaces, which
+        # can be inflated by degenerate BSpline faces (e.g. outer_1 exact X center
+        # is -17.7 mm while the tight/real X center is +0.9 mm).  Using the tight
+        # bbox here avoids that inflation and gives the correct XY center.
+        # After this phase all shapes in this level are meshed, so subsequent
+        # get_tight_bounding_box calls in Phase 2/3 are fast (no-op remesh).
+        tight_xy = {}  # name -> (cx, cy)
+        for t in ("outer", "mid", "inner"):
+            if t not in tier_group:
+                continue
+            for _wp, _nm, _idx, _seg in tier_group[t]:
+                _sh = _wp.val().wrapped
+                _xn, _yn, _, _xx, _yx, _ = get_tight_bounding_box(_sh)
+                tight_xy[_nm] = ((_xn + _xx) / 2.0, (_yn + _yx) / 2.0)
+
+        # Phase 2: compute level height from the reference part's tight bbox.
         outer_wp = ref_entry[0]
         outer_shape = outer_wp.val().wrapped
-        oxn, oyn, ozn, oxx, oyx, ozx = get_bounding_box(outer_shape)
-        outer_height = ozx - ozn
+        _, _, ozn_tight, _, _, ozx_tight = get_tight_bounding_box(outer_shape)
+        outer_height = ozx_tight - ozn_tight
 
-        # Process each tier at this level
+        # Phase 3: position every part using pre-computed exact XY and tight Z.
         for tier in ("outer", "mid", "inner"):
             if tier not in tier_group:
                 continue
             for wp, name, idx, segment in tier_group[tier]:
                 shape = wp.val().wrapped
-                pxn, pyn, pzn, pxx, pyx, pzx = get_bounding_box(shape)
-                part_cx = (pxn + pxx) / 2.0
-                part_cy = (pyn + pyx) / 2.0
+                part_cx, part_cy = tight_xy[name]
+                _, _, pzn_tight, _, _, _ = get_tight_bounding_box(shape)
 
                 dx = -part_cx  # center XY at origin
                 dy = -part_cy
-                dz = z_cursor - pzn
+                dz = z_cursor - pzn_tight
 
                 loc = Location(Vector(dx, dy, dz))
                 cq_color, rgb = pick_color(name, idx)
