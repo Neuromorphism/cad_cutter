@@ -1520,21 +1520,53 @@ def _find_support_drop(falling_mesh, settled_mesh, ax):
     """Find how far *falling_mesh* can drop along *ax* before resting on
     *settled_mesh*.
 
-    Casts a grid of rays downward from the bottom face of the falling mesh
-    through the settled mesh.  For each ray that hits the settled surface,
-    the drop distance is the gap between the falling mesh bottom and the
-    topmost hit (the support surface).
+    Uses two complementary methods and returns the most restrictive result:
 
-    For concave/hollow parts the rays may enter the interior and find an
-    inner floor, enabling nesting.
+    1. **Ray-casting** — a grid of downward rays from the falling mesh's
+       bottom face detects horizontal support surfaces on the settled mesh.
+       Works well for solid parts stacking on flat surfaces.
 
-    Returns the maximum safe drop distance, or None if there is no
-    interaction (the meshes don't overlap in the lateral dimensions).
+    2. **Collision binary-search** — samples vertices from the falling mesh
+       and binary-searches for the maximum drop before any vertex enters the
+       settled mesh's solid volume (via ``trimesh.contains``).  This catches
+       radial / lateral collisions that vertical rays miss — e.g. when a
+       smaller-diameter tube slides into a larger-diameter tube.
+
+    Returns the maximum safe drop distance, or ``None`` if there is no
+    interaction.
     """
     bounds_f = falling_mesh.bounds
     bounds_s = settled_mesh.bounds
 
-    # Sample grid on the XY footprint of the falling mesh
+    # ------------------------------------------------------------------
+    # Method 1: Ray-casting (surface-to-surface support)
+    # ------------------------------------------------------------------
+    ray_drop = _find_support_drop_raycast(falling_mesh, settled_mesh, ax)
+
+    # ------------------------------------------------------------------
+    # Method 2: Collision binary-search (volume-to-volume penetration)
+    # ------------------------------------------------------------------
+    collision_drop = _find_support_drop_collision(
+        falling_mesh, settled_mesh, ax,
+    )
+
+    # Take the most restrictive (smallest) drop from either method.
+    if ray_drop is not None and collision_drop is not None:
+        return min(ray_drop, collision_drop)
+    if ray_drop is not None:
+        return ray_drop
+    if collision_drop is not None:
+        return collision_drop
+    return None
+
+
+def _find_support_drop_raycast(falling_mesh, settled_mesh, ax):
+    """Ray-cast method: grid of downward rays from the falling mesh bottom.
+
+    Returns drop distance or ``None``.
+    """
+    bounds_f = falling_mesh.bounds
+
     n_samples = 10
     other_axes = [d for d in range(3) if d != ax]
     margin_u = (bounds_f[1, other_axes[0]] - bounds_f[0, other_axes[0]]) * 0.02
@@ -1563,7 +1595,6 @@ def _find_support_drop(falling_mesh, settled_mesh, ax):
     origins = np.array(origins)
     directions = np.tile(dir_down, (len(origins), 1))
 
-    # Cast rays downward against the settled mesh
     try:
         hits, ray_ids, _ = settled_mesh.ray.intersects_location(
             origins, directions, multiple_hits=True
@@ -1574,9 +1605,6 @@ def _find_support_drop(falling_mesh, settled_mesh, ax):
     if len(hits) == 0:
         return None
 
-    # For each ray, find the topmost hit on the settled mesh.
-    # The hit with the highest coordinate along ax is the support surface
-    # (closest point below the falling part).
     ray_support = {}
     for hit, rid in zip(hits, ray_ids):
         hit_val = hit[ax]
@@ -1586,8 +1614,6 @@ def _find_support_drop(falling_mesh, settled_mesh, ax):
     if not ray_support:
         return None
 
-    # The support level is the highest surface point found.
-    # The drop is how far the falling mesh bottom is above that surface.
     support_level = max(ray_support.values())
     drop = bounds_f[0, ax] - support_level
 
@@ -1595,6 +1621,68 @@ def _find_support_drop(falling_mesh, settled_mesh, ax):
         return drop
 
     return 0.0
+
+
+def _find_support_drop_collision(falling_mesh, settled_mesh, ax,
+                                 max_points=500, iterations=30,
+                                 tolerance=0.05):
+    """Binary-search for the maximum drop before the falling mesh's vertices
+    penetrate the settled mesh's solid volume.
+
+    Uses ``trimesh.Trimesh.contains()`` which checks whether points lie
+    inside a watertight mesh volume.  For a hollow tube this correctly
+    identifies points inside the *wall material* (not the hollow center).
+
+    Returns drop distance or ``None`` if no collision is possible (meshes
+    don't overlap laterally or settled mesh isn't watertight).
+    """
+    if not settled_mesh.is_watertight:
+        return None
+
+    bounds_f = falling_mesh.bounds
+    bounds_s = settled_mesh.bounds
+
+    # Quick lateral-overlap check (non-axis AABB).
+    other_axes = [d for d in range(3) if d != ax]
+    for oa in other_axes:
+        if bounds_f[0, oa] >= bounds_s[1, oa] or \
+           bounds_f[1, oa] <= bounds_s[0, oa]:
+            return None
+
+    # Maximum meaningful drop: falling mesh bottom → settled mesh bottom.
+    max_drop = bounds_f[0, ax] - bounds_s[0, ax]
+    if max_drop <= tolerance:
+        return None
+
+    # Subsample falling mesh vertices for speed.
+    verts = falling_mesh.vertices
+    if len(verts) > max_points:
+        step = max(1, len(verts) // max_points)
+        verts = verts[::step]
+
+    # Binary search: find the largest drop with no penetration.
+    lo = 0.0   # known safe (no drop)
+    hi = max_drop
+
+    for _ in range(iterations):
+        mid = (lo + hi) * 0.5
+        shifted = verts.copy()
+        shifted[:, ax] -= mid
+        try:
+            inside = settled_mesh.contains(shifted)
+        except Exception:
+            return None
+        if inside.any():
+            hi = mid  # collision — drop less
+        else:
+            lo = mid  # safe — try dropping more
+
+    # Only return a result if the collision limit is meaningfully less than
+    # the full drop (otherwise the ray-cast method is better).
+    if hi < max_drop - tolerance:
+        return lo
+
+    return None
 
 
 def _report_nesting(part_info, ax, original_gap, debug):
