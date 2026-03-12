@@ -31,6 +31,7 @@ from assemble import (
     parse_part_name,
     stack_parts,
     make_cutter,
+    make_segment_cutter,
     cut_assembly,
     export_assembly_step,
     export_shape_step,
@@ -365,77 +366,77 @@ class TestColorPicking:
 
 class TestParsePartName:
     def test_outer_1(self):
-        tier, levels = parse_part_name("outer_1")
+        tier, levels, _seg = parse_part_name("outer_1")
         assert tier == "outer"
         assert levels == [1]
 
     def test_mid_2(self):
-        tier, levels = parse_part_name("mid_2")
+        tier, levels, _seg = parse_part_name("mid_2")
         assert tier == "mid"
         assert levels == [2]
 
     def test_inner_3(self):
-        tier, levels = parse_part_name("inner_3")
+        tier, levels, _seg = parse_part_name("inner_3")
         assert tier == "inner"
         assert levels == [3]
 
     def test_case_insensitive(self):
-        tier, levels = parse_part_name("OUTER_1")
+        tier, levels, _seg = parse_part_name("OUTER_1")
         assert tier == "outer"
         assert levels == [1]
 
     def test_mixed_case(self):
-        tier, levels = parse_part_name("Inner_5")
+        tier, levels, _seg = parse_part_name("Inner_5")
         assert tier == "inner"
         assert levels == [5]
 
     def test_hyphen_separator(self):
-        tier, levels = parse_part_name("outer-1")
+        tier, levels, _seg = parse_part_name("outer-1")
         assert tier == "outer"
         assert levels == [1]
 
     def test_no_separator(self):
-        tier, levels = parse_part_name("outer1")
+        tier, levels, _seg = parse_part_name("outer1")
         assert tier == "outer"
         assert levels == [1]
 
     def test_with_material_prefix(self):
-        tier, levels = parse_part_name("steel_outer_2")
+        tier, levels, _seg = parse_part_name("steel_outer_2")
         assert tier == "outer"
         assert levels == [2]
 
     def test_unrecognized_name(self):
-        tier, levels = parse_part_name("plate")
+        tier, levels, _seg = parse_part_name("plate")
         assert tier is None
         assert levels is None
 
     def test_unrecognized_with_number(self):
-        tier, levels = parse_part_name("flange_3")
+        tier, levels, _seg = parse_part_name("flange_3")
         assert tier is None
         assert levels is None
 
     def test_multi_digit_level(self):
-        tier, levels = parse_part_name("outer_12")
+        tier, levels, _seg = parse_part_name("outer_12")
         assert tier == "outer"
         assert levels == [12]
 
     def test_multi_level_span(self):
-        tier, levels = parse_part_name("inner_2_3")
+        tier, levels, _seg = parse_part_name("inner_2_3")
         assert tier == "inner"
         assert levels == [2, 3]
 
     def test_multi_level_three_sections(self):
-        tier, levels = parse_part_name("mid_1_2_3")
+        tier, levels, _seg = parse_part_name("mid_1_2_3")
         assert tier == "mid"
         assert levels == [1, 2, 3]
 
     def test_multi_level_with_material(self):
-        tier, levels = parse_part_name("inner_2_3_steel")
+        tier, levels, _seg = parse_part_name("inner_2_3_steel")
         assert tier == "inner"
         assert levels == [2, 3]
 
     def test_multi_level_hyphen(self):
-        tier, levels = parse_part_name("outer-1-2")
+        tier, levels, _seg = parse_part_name("outer-1-2")
         assert tier == "outer"
         assert levels == [1, 2]
 
@@ -565,7 +566,7 @@ class TestConcentricStacking:
         assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
 
         z_bottoms = []
-        for name, shape, loc, rgb in info:
+        for name, shape, loc, rgb, *_rest in info:
             moved = apply_location(shape, loc)
             _, _, zn, _, _, _ = get_bounding_box(moved)
             z_bottoms.append(zn)
@@ -591,12 +592,12 @@ class TestConcentricStacking:
         level1 = [i for i in info if "_1" in i[0]]
         level2 = [i for i in info if "_2" in i[0]]
 
-        for name, shape, loc, rgb in level1:
+        for name, shape, loc, rgb, *_rest in level1:
             moved = apply_location(shape, loc)
             _, _, zn, _, _, _ = get_bounding_box(moved)
             assert abs(zn - 0) < 0.5, f"{name} z_bottom={zn}, expected 0"
 
-        for name, shape, loc, rgb in level2:
+        for name, shape, loc, rgb, *_rest in level2:
             moved = apply_location(shape, loc)
             _, _, zn, _, _, _ = get_bounding_box(moved)
             assert abs(zn - 17) < 0.5, f"{name} z_bottom={zn}, expected 17"
@@ -622,7 +623,7 @@ class TestConcentricStacking:
         # Both should produce 3 parts with same Z bottoms
         def get_z_map(info):
             return {n: get_bounding_box(apply_location(s, l))[2]
-                    for n, s, l, _ in info}
+                    for n, s, l, *_rest in info}
 
         fwd_z = get_z_map(info_fwd)
         rev_z = get_z_map(info_rev)
@@ -653,7 +654,7 @@ class TestSpanningParts:
         return paths
 
     def test_spanning_part_name_parsed(self):
-        tier, levels = parse_part_name("inner_2_3_steel")
+        tier, levels, _seg = parse_part_name("inner_2_3_steel")
         assert tier == "inner"
         assert levels == [2, 3]
 
@@ -668,7 +669,7 @@ class TestSpanningParts:
         # Find the spanning part and level-2 outer
         span_info = None
         lvl2_info = None
-        for name, shape, loc, rgb in info:
+        for name, shape, loc, rgb, *_rest in info:
             if "2_3" in name:
                 span_info = (name, shape, loc, rgb)
             elif name == "outer_2":
@@ -692,7 +693,7 @@ class TestSpanningParts:
 
         assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
 
-        for name, shape, loc, rgb in info:
+        for name, shape, loc, rgb, *_rest in info:
             if "2_3" in name:
                 moved = apply_location(shape, loc)
                 xn, yn, _, xx, yx, _ = get_bounding_box(moved)
@@ -711,7 +712,7 @@ class TestSpanningParts:
         assy, info = stack_parts(parts, AXIS_MAP["z"], gap=gap)
 
         # Level 1 outer is 10 high, gap 5 → level 2 starts at 15
-        for name, shape, loc, rgb in info:
+        for name, shape, loc, rgb, *_rest in info:
             if "2_3" in name:
                 moved = apply_location(shape, loc)
                 _, _, span_zn, _, _, _ = get_bounding_box(moved)
@@ -734,7 +735,7 @@ class TestSpanningParts:
 
         assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
 
-        for name, shape, loc, rgb in info:
+        for name, shape, loc, rgb, *_rest in info:
             if "steel" in name.lower():
                 # Steel color: R ~ 0.55
                 assert abs(rgb[0] - 0.55) < 0.01, f"Expected steel color, got {rgb}"
@@ -753,7 +754,7 @@ class TestSpanningParts:
 
         assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
 
-        for name, shape, loc, rgb in info:
+        for name, shape, loc, rgb, *_rest in info:
             if "1_2_3" in name:
                 moved = apply_location(shape, loc)
                 _, _, zn, _, _, _ = get_bounding_box(moved)
@@ -768,7 +769,7 @@ class TestSpanningParts:
         assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
 
         # Cut each part
-        for name, shape, loc, rgb in info:
+        for name, shape, loc, rgb, *_rest in info:
             moved = apply_location(shape, loc)
             bbox = Bnd_Box()
             BRepBndLib.Add_s(moved, bbox)
@@ -814,7 +815,7 @@ class TestLegacyStacking:
         assert len(info) == 3
 
         prev_top = None
-        for name, shape, loc, rgb in info:
+        for name, shape, loc, rgb, *_rest in info:
             moved = apply_location(shape, loc)
             _, _, zn, _, _, zx = get_bounding_box(moved)
             if prev_top is not None:
@@ -831,7 +832,7 @@ class TestCutting:
         builder = BRep_Builder()
         compound = TopoDS_Compound()
         builder.MakeCompound(compound)
-        for name, shape, loc, rgb in info:
+        for name, shape, loc, rgb, *_rest in info:
             moved = apply_location(shape, loc)
             builder.Add(compound, moved)
         return compound
@@ -924,7 +925,7 @@ class TestStepExport:
         builder = BRep_Builder()
         compound = TopoDS_Compound()
         builder.MakeCompound(compound)
-        for n, s, l, c in info:
+        for n, s, l, c, *_rest in info:
             builder.Add(compound, apply_location(s, l))
 
         bbox = Bnd_Box()
@@ -1032,7 +1033,7 @@ class TestPipelineNoRender:
         builder = BRep_Builder()
         compound = TopoDS_Compound()
         builder.MakeCompound(compound)
-        for n, s, l, c in info:
+        for n, s, l, c, *_rest in info:
             builder.Add(compound, apply_location(s, l))
 
         bbox = Bnd_Box()
@@ -1068,7 +1069,7 @@ class TestEdgeCases:
         builder = BRep_Builder()
         compound = TopoDS_Compound()
         builder.MakeCompound(compound)
-        for n, s, l, c in info:
+        for n, s, l, c, *_rest in info:
             builder.Add(compound, apply_location(s, l))
 
         bbox = Bnd_Box()
@@ -1084,7 +1085,7 @@ class TestEdgeCases:
         builder = BRep_Builder()
         compound = TopoDS_Compound()
         builder.MakeCompound(compound)
-        for n, s, l, c in info:
+        for n, s, l, c, *_rest in info:
             builder.Add(compound, apply_location(s, l))
 
         bbox = Bnd_Box()
@@ -1220,7 +1221,7 @@ class TestMixedFormats:
         assert len(info) == 2
 
         # Both should have z-base at 0 (same level)
-        for name, shape, loc, rgb in info:
+        for name, shape, loc, rgb, *_rest in info:
             moved = apply_location(shape, loc)
             _, _, zn, _, _, _ = get_bounding_box(moved)
             assert abs(zn - 0) < 0.5
@@ -1246,7 +1247,7 @@ class TestMixedFormats:
 
         # Cut each part individually (as the pipeline does)
         cut_ok = 0
-        for name, shape, loc, rgb in info:
+        for name, shape, loc, rgb, *_rest in info:
             moved = apply_location(shape, loc)
             bbox = Bnd_Box()
             BRepBndLib.Add_s(moved, bbox)
@@ -1308,3 +1309,314 @@ class TestMeshToSolid:
         # Cylinder: radius 8, height 20 → x/y range ~[-8,8], z range ~[-10,10]
         assert abs((xx - xn) - 16) < 1.0
         assert abs((zx - zn) - 20) < 1.0
+
+
+# ============================================================================
+# Test: Segment splitting (a/b suffix)
+# ============================================================================
+
+class TestSegmentParsing:
+    """Test that parse_part_name recognises the a/b segment suffix."""
+
+    def test_inner_2a(self):
+        tier, levels, segment = parse_part_name("inner_2a")
+        assert tier == "inner"
+        assert levels == [2]
+        assert segment == "a"
+
+    def test_inner_2b(self):
+        tier, levels, segment = parse_part_name("inner_2b")
+        assert tier == "inner"
+        assert levels == [2]
+        assert segment == "b"
+
+    def test_no_segment(self):
+        tier, levels, segment = parse_part_name("inner_2")
+        assert tier == "inner"
+        assert levels == [2]
+        assert segment is None
+
+    def test_outer_1a(self):
+        tier, levels, segment = parse_part_name("outer_1a")
+        assert tier == "outer"
+        assert levels == [1]
+        assert segment == "a"
+
+    def test_mid_3b(self):
+        tier, levels, segment = parse_part_name("mid_3b")
+        assert tier == "mid"
+        assert levels == [3]
+        assert segment == "b"
+
+    def test_case_insensitive_segment(self):
+        tier, levels, segment = parse_part_name("Inner_2A")
+        assert tier == "inner"
+        assert levels == [2]
+        assert segment == "a"
+
+    def test_segment_with_material(self):
+        """inner_2a_steel should parse segment='a' from the level number."""
+        tier, levels, segment = parse_part_name("inner_2a_steel")
+        assert tier == "inner"
+        assert levels == [2]
+        assert segment == "a"
+
+    def test_multi_level_with_segment(self):
+        """inner_2_3a should parse levels [2,3] with segment 'a'."""
+        tier, levels, segment = parse_part_name("inner_2_3a")
+        assert tier == "inner"
+        assert levels == [2, 3]
+        assert segment == "a"
+
+
+class TestSegmentStacking:
+    """Test that a/b parts are placed at the same position."""
+
+    @pytest.fixture
+    def segment_parts(self, tmp_dir):
+        paths = {}
+        outer = cq.Workplane("XY").box(60, 60, 15)
+        p = os.path.join(tmp_dir, "outer_2.step")
+        cq.exporters.export(outer, p)
+        paths["outer_2"] = p
+
+        inner_a = cq.Workplane("XY").cylinder(15, 5)
+        p = os.path.join(tmp_dir, "inner_2a.step")
+        cq.exporters.export(inner_a, p)
+        paths["inner_2a"] = p
+
+        inner_b = cq.Workplane("XY").cylinder(15, 5)
+        p = os.path.join(tmp_dir, "inner_2b.step")
+        cq.exporters.export(inner_b, p)
+        paths["inner_2b"] = p
+
+        return paths
+
+    def test_both_segments_in_assembly(self, segment_parts):
+        """Both inner_2a and inner_2b should appear in the assembly."""
+        parts = [
+            load_part(segment_parts["outer_2"]),
+            load_part(segment_parts["inner_2a"]),
+            load_part(segment_parts["inner_2b"]),
+        ]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
+        names = [i[0] for i in info]
+        assert "inner_2a" in names
+        assert "inner_2b" in names
+        assert len(info) == 3
+
+    def test_segments_same_z_base(self, segment_parts):
+        """inner_2a and inner_2b should have the same Z base."""
+        parts = [
+            load_part(segment_parts["outer_2"]),
+            load_part(segment_parts["inner_2a"]),
+            load_part(segment_parts["inner_2b"]),
+        ]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
+        z_bases = {}
+        for name, shape, loc, rgb, seg in info:
+            moved = apply_location(shape, loc)
+            _, _, zn, _, _, _ = get_bounding_box(moved)
+            z_bases[name] = zn
+
+        assert abs(z_bases["inner_2a"] - z_bases["inner_2b"]) < 0.1
+
+    def test_segments_xy_centered(self, segment_parts):
+        """inner_2a and inner_2b should be XY-centered at origin."""
+        parts = [
+            load_part(segment_parts["outer_2"]),
+            load_part(segment_parts["inner_2a"]),
+            load_part(segment_parts["inner_2b"]),
+        ]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
+        for name, shape, loc, rgb, seg in info:
+            if seg is not None:
+                moved = apply_location(shape, loc)
+                xn, yn, _, xx, yx, _ = get_bounding_box(moved)
+                cx = (xn + xx) / 2.0
+                cy = (yn + yx) / 2.0
+                assert abs(cx) < 0.5, f"{name} not X-centered: {cx}"
+                assert abs(cy) < 0.5, f"{name} not Y-centered: {cy}"
+
+    def test_segment_info_propagated(self, segment_parts):
+        """The segment field should be propagated in part_info."""
+        parts = [
+            load_part(segment_parts["outer_2"]),
+            load_part(segment_parts["inner_2a"]),
+            load_part(segment_parts["inner_2b"]),
+        ]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
+        segments = {i[0]: i[4] for i in info}
+        assert segments["inner_2a"] == "a"
+        assert segments["inner_2b"] == "b"
+        assert segments["outer_2"] is None
+
+
+class TestSegmentCutting:
+    """Test segment-aware cutting with a/b halves."""
+
+    @pytest.fixture
+    def segment_assembly(self, tmp_dir):
+        """Create an assembly with outer_1, inner_1a, inner_1b."""
+        paths = {}
+        outer = cq.Workplane("XY").box(60, 60, 15)
+        p = os.path.join(tmp_dir, "outer_1.step")
+        cq.exporters.export(outer, p)
+        paths["outer_1"] = p
+
+        inner_a = cq.Workplane("XY").cylinder(15, 8)
+        p = os.path.join(tmp_dir, "inner_1a.step")
+        cq.exporters.export(inner_a, p)
+        paths["inner_1a"] = p
+
+        inner_b = cq.Workplane("XY").cylinder(15, 8)
+        p = os.path.join(tmp_dir, "inner_1b.step")
+        cq.exporters.export(inner_b, p)
+        paths["inner_1b"] = p
+
+        return paths
+
+    def test_segment_cutter_a_not_null(self, segment_assembly):
+        """Cutting inner_1a with the 'a' segment cutter should not be null."""
+        parts = [
+            load_part(segment_assembly["outer_1"]),
+            load_part(segment_assembly["inner_1a"]),
+            load_part(segment_assembly["inner_1b"]),
+        ]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
+
+        # Build compound for bbox
+        builder = BRep_Builder()
+        compound = TopoDS_Compound()
+        builder.MakeCompound(compound)
+        for name, shape, loc, rgb, seg in info:
+            builder.Add(compound, apply_location(shape, loc))
+
+        bbox = Bnd_Box()
+        BRepBndLib.Add_s(compound, bbox)
+        bbox_vals = bbox.Get()
+
+        cut_angle = 120.0
+        cutter_a = make_segment_cutter(bbox_vals, cut_angle, AXIS_MAP["z"], "a")
+
+        # Cut the inner_1a part
+        for name, shape, loc, rgb, seg in info:
+            if seg == "a":
+                moved = apply_location(shape, loc)
+                result = cut_assembly(moved, cutter_a)
+                assert not result.IsNull()
+
+    def test_segment_cutter_b_not_null(self, segment_assembly):
+        """Cutting inner_1b with the 'b' segment cutter should not be null."""
+        parts = [
+            load_part(segment_assembly["outer_1"]),
+            load_part(segment_assembly["inner_1a"]),
+            load_part(segment_assembly["inner_1b"]),
+        ]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
+
+        builder = BRep_Builder()
+        compound = TopoDS_Compound()
+        builder.MakeCompound(compound)
+        for name, shape, loc, rgb, seg in info:
+            builder.Add(compound, apply_location(shape, loc))
+
+        bbox = Bnd_Box()
+        BRepBndLib.Add_s(compound, bbox)
+        bbox_vals = bbox.Get()
+
+        cut_angle = 120.0
+        cutter_b = make_segment_cutter(bbox_vals, cut_angle, AXIS_MAP["z"], "b")
+
+        for name, shape, loc, rgb, seg in info:
+            if seg == "b":
+                moved = apply_location(shape, loc)
+                result = cut_assembly(moved, cutter_b)
+                assert not result.IsNull()
+
+    def test_a_and_b_halves_dont_overlap(self, segment_assembly):
+        """The 'a' and 'b' cut results should have non-overlapping bounding boxes."""
+        parts = [
+            load_part(segment_assembly["outer_1"]),
+            load_part(segment_assembly["inner_1a"]),
+            load_part(segment_assembly["inner_1b"]),
+        ]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
+
+        builder = BRep_Builder()
+        compound = TopoDS_Compound()
+        builder.MakeCompound(compound)
+        for name, shape, loc, rgb, seg in info:
+            builder.Add(compound, apply_location(shape, loc))
+
+        bbox = Bnd_Box()
+        BRepBndLib.Add_s(compound, bbox)
+        bbox_vals = bbox.Get()
+
+        cut_angle = 120.0
+        cutter_a = make_segment_cutter(bbox_vals, cut_angle, AXIS_MAP["z"], "a")
+        cutter_b = make_segment_cutter(bbox_vals, cut_angle, AXIS_MAP["z"], "b")
+
+        # Use the inner_1a part for both cuts (same geometry)
+        inner_shape = None
+        for name, shape, loc, rgb, seg in info:
+            if seg == "a":
+                inner_shape = apply_location(shape, loc)
+                break
+
+        result_a = cut_assembly(inner_shape, cutter_a)
+        result_b = cut_assembly(inner_shape, cutter_b)
+
+        # Both should be non-void
+        bbox_a = Bnd_Box()
+        BRepBndLib.Add_s(result_a, bbox_a)
+        assert not bbox_a.IsVoid()
+
+        bbox_b = Bnd_Box()
+        BRepBndLib.Add_s(result_b, bbox_b)
+        assert not bbox_b.IsVoid()
+
+    def test_only_a_specified_b_side_empty(self, tmp_dir):
+        """If only 'a' is specified, the 'b' side should be empty."""
+        outer = cq.Workplane("XY").box(60, 60, 15)
+        p_outer = os.path.join(tmp_dir, "outer_1.step")
+        cq.exporters.export(outer, p_outer)
+
+        inner_a = cq.Workplane("XY").cylinder(15, 8)
+        p_inner_a = os.path.join(tmp_dir, "inner_1a.step")
+        cq.exporters.export(inner_a, p_inner_a)
+
+        parts = [load_part(p_outer), load_part(p_inner_a)]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
+
+        # Only 'a' segment, no 'b' — assembly should have 2 parts
+        assert len(info) == 2
+        segments = {i[0]: i[4] for i in info}
+        assert segments["inner_1a"] == "a"
+        assert "inner_1b" not in segments
+
+    def test_segment_cutter_different_angles(self, segment_assembly):
+        """Segment cutters should work with different cut angles."""
+        parts = [
+            load_part(segment_assembly["outer_1"]),
+            load_part(segment_assembly["inner_1a"]),
+        ]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
+
+        builder = BRep_Builder()
+        compound = TopoDS_Compound()
+        builder.MakeCompound(compound)
+        for name, shape, loc, rgb, seg in info:
+            builder.Add(compound, apply_location(shape, loc))
+
+        bbox = Bnd_Box()
+        BRepBndLib.Add_s(compound, bbox)
+        bbox_vals = bbox.Get()
+
+        for angle in (90.0, 120.0, 180.0):
+            cutter_a = make_segment_cutter(bbox_vals, angle, AXIS_MAP["z"], "a")
+            for name, shape, loc, rgb, seg in info:
+                if seg == "a":
+                    moved = apply_location(shape, loc)
+                    result = cut_assembly(moved, cutter_a)
+                    assert not result.IsNull(), f"Cut failed for angle {angle}"

@@ -38,6 +38,7 @@ import glob
 import argparse
 import math
 import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 
@@ -220,10 +221,21 @@ def apply_location(shape, loc):
 # ===================================================================
 
 def load_cad_file(filepath):
-    """Load a CAD file and return a CadQuery Workplane wrapper."""
+    """Load a CAD file and return a CadQuery Workplane wrapper.
+
+    For STEP files, uses the OCP reader directly for faster loading when
+    multiple files are loaded in parallel (avoids CadQuery overhead).
+    """
     ext = os.path.splitext(filepath)[1].lower()
     if ext in (".step", ".stp"):
-        return cq.importers.importStep(filepath)
+        from OCP.STEPControl import STEPControl_Reader
+        reader = STEPControl_Reader()
+        status = reader.ReadFile(filepath)
+        if status != IFSelect_RetDone:
+            raise RuntimeError(f"STEP read failed for {filepath}")
+        reader.TransferRoots()
+        shape = reader.OneShape()
+        return cq.Workplane("XY").newObject([cq.Shape(shape)])
     elif ext in (".iges", ".igs"):
         from OCP.IGESControl import IGESControl_Reader
         reader = IGESControl_Reader()
@@ -357,32 +369,41 @@ def pick_color(name, index):
 
 TIER_ORDER = {"outer": 0, "mid": 1, "inner": 2}
 TIER_PATTERN = re.compile(
-    r"(?P<tier>inner|mid|outer)[_\- ]?(?P<levels>\d+(?:[_\- ]\d+)*)", re.IGNORECASE
+    r"(?P<tier>inner|mid|outer)[_\- ]?(?P<levels>\d+(?:[_\- ]\d+)*)(?P<segment>[ab])?",
+    re.IGNORECASE,
 )
 
 
 def parse_part_name(name):
-    """Parse a part name into (tier, levels).
+    """Parse a part name into (tier, levels, segment).
 
     Supports multi-level spans: ``inner_2_3`` means inner spanning levels 2-3.
+    Supports segment splitting: ``inner_2a`` / ``inner_2b`` splits the inner
+    portion of level 2 into left (a) and right (b) halves.
 
     Returns:
-        (tier, levels): tier is "outer"/"mid"/"inner", levels is a list of ints.
-        If the name doesn't match, returns (None, None).
+        (tier, levels, segment): tier is "outer"/"mid"/"inner", levels is a
+        list of ints, segment is "a", "b", or None.
+        If the name doesn't match, returns (None, None, None).
 
     Examples:
-        "outer_1"          -> ("outer", [1])
-        "inner_2_3_steel"  -> ("inner", [2, 3])
-        "mid_1_2_3"        -> ("mid", [1, 2, 3])
-        "plate"            -> (None, None)
+        "outer_1"          -> ("outer", [1], None)
+        "inner_2_3_steel"  -> ("inner", [2, 3], None)
+        "mid_1_2_3"        -> ("mid", [1, 2, 3], None)
+        "inner_2a"         -> ("inner", [2], "a")
+        "inner_2b"         -> ("inner", [2], "b")
+        "plate"            -> (None, None, None)
     """
     m = TIER_PATTERN.search(name)
     if m:
         tier = m.group("tier").lower()
         levels_str = m.group("levels")
         levels = [int(x) for x in re.split(r"[_\- ]", levels_str)]
-        return tier, levels
-    return None, None
+        segment = m.group("segment")
+        if segment:
+            segment = segment.lower()
+        return tier, levels, segment
+    return None, None, None
 
 
 # ===================================================================
@@ -398,32 +419,40 @@ def stack_parts(parts, axis_vec, gap):
     Inner parts are XY-centered within the mid part (or outer) at the same level.
     Parts without a tier/level name are treated as sequential outer parts.
 
-    Returns a CadQuery Assembly and a list of (name, ocp_shape, location, rgb_tuple).
+    Segment splitting: parts named with an "a" or "b" suffix (e.g. inner_2a,
+    inner_2b) are placed at the same position.  The segment tag is carried
+    through so the cutting phase can split them into left/right halves.
+
+    Returns a CadQuery Assembly and a list of
+    (name, ocp_shape, location, rgb_tuple, segment) tuples.
     """
     # --- Classify parts by tier and levels ---
-    classified = []  # (tier, levels_list, wp, name, original_index)
+    classified = []  # (tier, levels_list, segment, wp, name, original_index)
     auto_level = 1
 
     for i, (wp, name) in enumerate(parts):
-        tier, levels = parse_part_name(name)
+        tier, levels, segment = parse_part_name(name)
         if tier is None:
             # Unrecognized naming — treat as sequential outer parts
             tier = "outer"
             levels = [auto_level]
+            segment = None
             auto_level += 1
-        classified.append((tier, levels, wp, name, i))
+        classified.append((tier, levels, segment, wp, name, i))
 
     # --- Build the set of levels and group by (level, tier) ---
-    # Single-level parts go into levels_map[level][tier].
+    # Single-level parts go into levels_map[level][tier] as a list.
     # Multi-level (spanning) parts are collected separately.
-    levels_map = {}  # level -> {tier -> (wp, name, original_index)}
-    spanning_parts = []  # (tier, levels_list, wp, name, original_index)
+    levels_map = {}  # level -> {tier -> [(wp, name, original_index, segment), ...]}
+    spanning_parts = []  # (tier, levels_list, segment, wp, name, original_index)
 
-    for tier, levels, wp, name, idx in classified:
+    for tier, levels, segment, wp, name, idx in classified:
         if len(levels) == 1:
-            levels_map.setdefault(levels[0], {})[tier] = (wp, name, idx)
+            levels_map.setdefault(levels[0], {}).setdefault(tier, []).append(
+                (wp, name, idx, segment)
+            )
         else:
-            spanning_parts.append((tier, levels, wp, name, idx))
+            spanning_parts.append((tier, levels, segment, wp, name, idx))
             # Ensure all spanned levels exist in levels_map
             for lv in levels:
                 levels_map.setdefault(lv, {})
@@ -447,17 +476,17 @@ def stack_parts(parts, axis_vec, gap):
             continue
 
         # Get the outer part for this level (required for positioning)
-        if "outer" in tier_group:
-            outer_wp, outer_name, outer_idx = tier_group["outer"]
-        elif "mid" in tier_group:
-            # No outer at this level — use mid as the stacking reference
-            outer_wp, outer_name, outer_idx = tier_group["mid"]
-        elif "inner" in tier_group:
-            outer_wp, outer_name, outer_idx = tier_group["inner"]
-        else:
+        # Use the first entry in the list for the reference part.
+        ref_entry = None
+        for t in ("outer", "mid", "inner"):
+            if t in tier_group:
+                ref_entry = tier_group[t][0]
+                break
+        if ref_entry is None:
             level_z_top[level] = z_cursor
             continue
 
+        outer_wp = ref_entry[0]
         outer_shape = outer_wp.val().wrapped
         oxn, oyn, ozn, oxx, oyx, ozx = get_bounding_box(outer_shape)
         outer_height = ozx - ozn
@@ -466,35 +495,28 @@ def stack_parts(parts, axis_vec, gap):
         for tier in ("outer", "mid", "inner"):
             if tier not in tier_group:
                 continue
-            wp, name, idx = tier_group[tier]
-            shape = wp.val().wrapped
-            pxn, pyn, pzn, pxx, pyx, pzx = get_bounding_box(shape)
-            part_cx = (pxn + pxx) / 2.0
-            part_cy = (pyn + pyx) / 2.0
+            for wp, name, idx, segment in tier_group[tier]:
+                shape = wp.val().wrapped
+                pxn, pyn, pzn, pxx, pyx, pzx = get_bounding_box(shape)
+                part_cx = (pxn + pxx) / 2.0
+                part_cy = (pyn + pyx) / 2.0
 
-            if tier == "outer":
-                # Outer: just shift Z so base sits at z_cursor
                 dx = -part_cx  # center XY at origin
                 dy = -part_cy
                 dz = z_cursor - pzn
-            else:
-                # Mid/inner: center XY within the container at this level
-                dx = -part_cx
-                dy = -part_cy
-                dz = z_cursor - pzn
 
-            loc = Location(Vector(dx, dy, dz))
-            cq_color, rgb = pick_color(name, idx)
+                loc = Location(Vector(dx, dy, dz))
+                cq_color, rgb = pick_color(name, idx)
 
-            assy.add(wp, name=name, loc=loc, color=cq_color)
-            part_info.append((name, shape, loc, rgb))
+                assy.add(wp, name=name, loc=loc, color=cq_color)
+                part_info.append((name, shape, loc, rgb, segment))
 
         # Advance the Z cursor past the outer part (+ gap)
         level_z_top[level] = z_cursor + outer_height
         z_cursor += outer_height + gap
 
     # --- Place spanning parts (parts that cover multiple levels) ---
-    for tier, levels, wp, name, idx in spanning_parts:
+    for tier, levels, segment, wp, name, idx in spanning_parts:
         first_level = min(levels)
         last_level = max(levels)
 
@@ -517,7 +539,7 @@ def stack_parts(parts, axis_vec, gap):
         cq_color, rgb = pick_color(name, idx)
 
         assy.add(wp, name=name, loc=loc, color=cq_color)
-        part_info.append((name, shape, loc, rgb))
+        part_info.append((name, shape, loc, rgb, segment))
 
     return assy, part_info
 
@@ -526,11 +548,8 @@ def stack_parts(parts, axis_vec, gap):
 # Cutting
 # ===================================================================
 
-def make_cutter(bbox_vals, angle, axis_vec):
-    """
-    Build a cylindrical-sector cutter from the global bounding box.
-    The cutter spans `angle` degrees as a wedge, oriented along the stacking axis.
-    """
+def _cutter_params(bbox_vals, axis_vec):
+    """Compute radius, height, origin, and direction for a cutter from bbox."""
     xn, yn, zn, xx, yx, zx = bbox_vals
 
     if axis_vec.y:
@@ -554,15 +573,90 @@ def make_cutter(bbox_vals, angle, axis_vec):
 
     radius = max(radius, 1.0)
     height = max(height, 1.0)
+    return radius, height, origin, direction
 
+
+def make_cutter(bbox_vals, angle, axis_vec):
+    """
+    Build a cylindrical-sector cutter from the global bounding box.
+    The cutter spans `angle` degrees as a wedge, oriented along the stacking axis.
+    """
+    radius, height, origin, direction = _cutter_params(bbox_vals, axis_vec)
     ax = gp_Ax2(origin, direction)
     return BRepPrimAPI_MakeCylinder(ax, radius, height, math.radians(angle)).Shape()
+
+
+def make_segment_cutter(bbox_vals, cut_angle, axis_vec, segment):
+    """Build a cutter that keeps only the 'a' or 'b' half of the remaining arc.
+
+    After removing ``cut_angle`` degrees (the main wedge), the remaining arc of
+    ``360 - cut_angle`` degrees is split at its midpoint:
+
+    * **segment "a"** (left half): keeps ``cut_angle .. midpoint``
+    * **segment "b"** (right half): keeps ``midpoint .. 360``
+
+    The function returns a compound of one or two cylindrical-sector cutters
+    whose union removes everything *except* the desired half.
+    """
+    from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
+
+    radius, height, origin, direction = _cutter_params(bbox_vals, axis_vec)
+    remaining = 360.0 - cut_angle
+    midpoint = cut_angle + remaining / 2.0  # angular midpoint of remaining arc
+
+    if segment == "b":
+        # Keep midpoint..360 → remove 0..midpoint
+        ax = gp_Ax2(origin, direction)
+        return BRepPrimAPI_MakeCylinder(
+            ax, radius, height, math.radians(midpoint)
+        ).Shape()
+    else:
+        # segment == "a"
+        # Keep cut_angle..midpoint → remove 0..cut_angle AND midpoint..360
+        # Cutter 1: the main wedge 0..cut_angle
+        ax1 = gp_Ax2(origin, direction)
+        c1 = BRepPrimAPI_MakeCylinder(
+            ax1, radius, height, math.radians(cut_angle)
+        ).Shape()
+        # Cutter 2: the "b" region midpoint..360
+        b_span = 360.0 - midpoint
+        if b_span < 0.01:
+            return c1
+        # Rotate the coordinate system by midpoint degrees around the axis
+        trsf = gp_Trsf()
+        trsf.SetRotation(
+            _axis_line(origin, direction), math.radians(midpoint)
+        )
+        ax2 = gp_Ax2(origin, direction)
+        ax2.Transform(trsf)
+        c2 = BRepPrimAPI_MakeCylinder(
+            ax2, radius, height, math.radians(b_span)
+        ).Shape()
+        # Fuse the two cutters into one compound
+        fuse = BRepAlgoAPI_Fuse(c1, c2)
+        fuse.Build()
+        if fuse.IsDone():
+            return fuse.Shape()
+        # Fallback: return them as a compound
+        builder = BRep_Builder()
+        comp = TopoDS_Compound()
+        builder.MakeCompound(comp)
+        builder.Add(comp, c1)
+        builder.Add(comp, c2)
+        return comp
+
+
+def _axis_line(origin, direction):
+    """Create a gp_Ax1 from origin point and direction for rotation."""
+    from OCP.gp import gp_Ax1
+    return gp_Ax1(origin, direction)
 
 
 def cut_assembly(assy_compound, cutter_shape):
     """Boolean-cut the assembly compound with the cutter.
 
     Uses fuzzy tolerance for robustness with mixed CAD/mesh geometry.
+    Enables parallel processing and non-destructive mode for speed.
     """
     from OCP.TopTools import TopTools_ListOfShape
 
@@ -576,6 +670,7 @@ def cut_assembly(assy_compound, cutter_shape):
     op.SetTools(tools_list)
     op.SetFuzzyValue(1e-5)
     op.SetRunParallel(True)
+    op.SetNonDestructive(True)
     op.Build()
     if not op.IsDone():
         # Fallback: try with larger tolerance
@@ -583,6 +678,7 @@ def cut_assembly(assy_compound, cutter_shape):
         op2.SetArguments(args_list)
         op2.SetTools(tools_list)
         op2.SetFuzzyValue(1e-3)
+        op2.SetRunParallel(True)
         op2.Build()
         if not op2.IsDone():
             raise RuntimeError("Boolean cut operation failed")
@@ -680,7 +776,9 @@ def render_assembly(parts_data, output_path, resolution=2048, cut_shape=None):
                 smooth_shading=True, split_sharp_edges=True,
             )
     else:
-        for i, (name, shape, loc, rgb) in enumerate(parts_data):
+        for i, entry in enumerate(parts_data):
+            # Support both 4-tuple and 5-tuple (with segment) formats
+            name, shape, loc, rgb = entry[0], entry[1], entry[2], entry[3]
             translated = apply_location(shape, loc)
             verts, faces = tessellate_shape(translated, tolerance=0.05)
             if len(verts) == 0:
@@ -797,18 +895,42 @@ def run_pipeline(args):
         print("No matching files found. Exiting.")
         return 1
 
-    print(f"Loading {len(filepaths)} part(s)...")
-    parts = []
+    # Filter out missing files before loading
+    valid_paths = []
     for filepath in filepaths:
         if not os.path.exists(filepath):
             print(f"  WARNING: '{filepath}' not found, skipping.")
-            continue
-        try:
-            wp, name = load_part(filepath)
-            parts.append((wp, name))
-            print(f"  Loaded: {name}")
-        except Exception as e:
-            print(f"  ERROR loading '{filepath}': {e}")
+        else:
+            valid_paths.append(filepath)
+
+    print(f"Loading {len(valid_paths)} part(s)...")
+    parts = []
+    if len(valid_paths) > 1:
+        # Parallel loading for multiple files
+        with ThreadPoolExecutor(max_workers=min(len(valid_paths), os.cpu_count() or 4)) as pool:
+            future_map = {pool.submit(load_part, fp): fp for fp in valid_paths}
+            # Collect results in original order
+            results = {}
+            for future in as_completed(future_map):
+                fp = future_map[future]
+                try:
+                    wp, name = future.result()
+                    results[fp] = (wp, name)
+                    print(f"  Loaded: {name}")
+                except Exception as e:
+                    print(f"  ERROR loading '{fp}': {e}")
+            # Preserve input order
+            for fp in valid_paths:
+                if fp in results:
+                    parts.append(results[fp])
+    else:
+        for filepath in valid_paths:
+            try:
+                wp, name = load_part(filepath)
+                parts.append((wp, name))
+                print(f"  Loaded: {name}")
+            except Exception as e:
+                print(f"  ERROR loading '{filepath}': {e}")
 
     if not parts:
         print("No valid parts loaded. Exiting.")
@@ -839,15 +961,24 @@ def run_pipeline(args):
         compound = TopoDS_Compound()
         builder.MakeCompound(compound)
         moved_parts = []
-        for name, shape, loc, color in part_info:
+        for name, shape, loc, color, segment in part_info:
             moved = apply_location(shape, loc)
             builder.Add(compound, moved)
-            moved_parts.append((name, moved))
+            moved_parts.append((name, moved, segment))
 
         bbox = Bnd_Box()
         BRepBndLib.Add_s(compound, bbox)
         bbox_vals = bbox.Get()
         cutter = make_cutter(bbox_vals, args.cut_angle, axis_vec)
+
+        # Pre-build segment cutters if any parts use a/b splitting
+        has_segments = any(seg is not None for _, _, seg in moved_parts)
+        seg_cutters = {}
+        if has_segments:
+            for seg in ("a", "b"):
+                seg_cutters[seg] = make_segment_cutter(
+                    bbox_vals, args.cut_angle, axis_vec, seg
+                )
 
         # Cut each part individually for robustness with mixed geometry
         cut_builder = BRep_Builder()
@@ -856,9 +987,12 @@ def run_pipeline(args):
         cut_ok = 0
         cut_skip = 0
 
-        for pname, moved_shape in moved_parts:
+        for pname, moved_shape, segment in moved_parts:
             try:
-                cut_part = cut_assembly(moved_shape, cutter)
+                if segment in seg_cutters:
+                    cut_part = cut_assembly(moved_shape, seg_cutters[segment])
+                else:
+                    cut_part = cut_assembly(moved_shape, cutter)
                 # Verify the result is not empty
                 part_bbox = Bnd_Box()
                 BRepBndLib.Add_s(cut_part, part_bbox)
@@ -887,7 +1021,7 @@ def run_pipeline(args):
             builder = BRep_Builder()
             compound = TopoDS_Compound()
             builder.MakeCompound(compound)
-            for name, shape, loc, color in part_info:
+            for name, shape, loc, color, _seg in part_info:
                 moved = apply_location(shape, loc)
                 builder.Add(compound, moved)
             export_shape_step(compound, output_step)
