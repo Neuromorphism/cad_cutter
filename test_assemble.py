@@ -2107,3 +2107,182 @@ class TestDirectGeometryCut:
             assert not result_bbox.IsVoid(), (
                 f"angle={angle}: result bbox is void"
             )
+
+
+# ============================================================================
+# Test: Outer stackup gap — outer_1.STEP and outer_2.STEP real files
+# ============================================================================
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_OUTER1_PATH = os.path.join(_HERE, "outer_1.STEP")
+_OUTER2_PATH = os.path.join(_HERE, "outer_2.STEP")
+_OUTER_FILES_PRESENT = os.path.exists(_OUTER1_PATH) and os.path.exists(_OUTER2_PATH)
+
+
+@pytest.mark.skipif(
+    not _OUTER_FILES_PRESENT,
+    reason="outer_1.STEP / outer_2.STEP not present in repo",
+)
+class TestOuterStackupGap:
+    """Regression tests for the large-gap bug with outer_1.STEP / outer_2.STEP.
+
+    These parts are cylindrical tubes oriented with their long axis along Y in
+    the original STEP files.  Without --cyl (orient_to_cylinder), stack_parts
+    uses the Z bounding-box extent (the tube *diameter*, ~511 mm and ~440 mm)
+    as the stacking height rather than the actual tube length (~917 mm and
+    ~499 mm).  This produces a large visual gap: outer_1 appears ~917 mm wide
+    in the Y direction while outer_2 is only ~498 mm wide — a ~209 mm overhang
+    gap at each end.
+
+    With orient_to_cylinder the parts are rotated so the long axis aligns with
+    Z, the correct heights are used, and the Y-direction overhang shrinks to
+    ~35 mm (just the radial difference between the two tube diameters).
+    """
+
+    def _load_and_stack(self, use_cyl=False, gap=0.0):
+        """Load outer_1/outer_2 STEP files, optionally orient, then stack."""
+        parts = [load_part(_OUTER1_PATH), load_part(_OUTER2_PATH)]
+        if use_cyl:
+            parts = orient_to_cylinder(parts, gap=gap)
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=gap)
+        return [
+            (name, apply_location(shape, loc))
+            for name, shape, loc, rgb, seg in info
+        ]
+
+    # ------------------------------------------------------------------
+    # Tests that expose the bug (no --cyl / orient_to_cylinder)
+    # ------------------------------------------------------------------
+
+    def test_without_cyl_outer1_height_is_diameter_not_length(self):
+        """Without --cyl, outer_1's stacked Z-height equals its tube diameter
+        (~511 mm), NOT its actual tube length (~917 mm).  This is the root
+        cause of the large stackup gap."""
+        moved = self._load_and_stack(use_cyl=False)
+        outer1 = next(s for n, s in moved if n == "outer_1")
+        _, _, zn, _, _, zx = get_bounding_box(outer1)
+        height = zx - zn
+        # Should be ~511 mm (diameter), not ~917 mm (length)
+        assert abs(height - 510.7) < 5.0, (
+            f"Expected ~510.7 mm (tube diameter), got {height:.1f} mm"
+        )
+
+    def test_without_cyl_large_y_direction_gap(self):
+        """Without --cyl, outer_1's Y extent (~917 mm) is nearly twice
+        outer_2's Y extent (~498 mm).  The ~209 mm overhang at each end
+        is the large visual gap the user observes in the stackup."""
+        moved = self._load_and_stack(use_cyl=False)
+        outer1 = next(s for n, s in moved if n == "outer_1")
+        outer2 = next(s for n, s in moved if n == "outer_2")
+
+        _, y1n, _, _, y1x, _ = get_bounding_box(outer1)
+        _, y2n, _, _, y2x, _ = get_bounding_box(outer2)
+        y_extent_1 = y1x - y1n  # ~917 mm (tube length of outer_1)
+        y_extent_2 = y2x - y2n  # ~498 mm (tube length of outer_2)
+
+        assert y_extent_1 > 850.0, (
+            f"outer_1 Y extent expected >850 mm, got {y_extent_1:.1f} mm"
+        )
+        assert y_extent_2 < 560.0, (
+            f"outer_2 Y extent expected <560 mm, got {y_extent_2:.1f} mm"
+        )
+
+        gap_each_end = (y_extent_1 - y_extent_2) / 2.0
+        assert gap_each_end > 150.0, (
+            f"Expected large Y-direction gap >150 mm per end, "
+            f"got {gap_each_end:.1f} mm"
+        )
+
+    def test_without_cyl_z_bboxes_touch(self):
+        """Without --cyl the Z bounding boxes still touch (gap=0 in Z).
+        The gap is purely visual / in the Y direction, not a Z gap."""
+        moved = self._load_and_stack(use_cyl=False)
+        outer1 = next(s for n, s in moved if n == "outer_1")
+        outer2 = next(s for n, s in moved if n == "outer_2")
+        _, _, _, _, _, z1x = get_bounding_box(outer1)
+        _, _, z2n, _, _, _  = get_bounding_box(outer2)
+        assert abs(z2n - z1x) < 1.0, (
+            f"Z gap without --cyl: {z2n - z1x:.3f} mm (expected 0)"
+        )
+
+    # ------------------------------------------------------------------
+    # Tests that verify the fix (with --cyl / orient_to_cylinder)
+    # ------------------------------------------------------------------
+
+    def test_with_cyl_outer1_height_is_tube_length(self):
+        """With --cyl, outer_1's stacked Z-height equals its actual tube
+        length (~917 mm), not its diameter."""
+        moved = self._load_and_stack(use_cyl=True)
+        outer1 = next(s for n, s in moved if n == "outer_1")
+        _, _, zn, _, _, zx = get_bounding_box(outer1)
+        height = zx - zn
+        assert abs(height - 916.9) < 5.0, (
+            f"Expected ~916.9 mm (tube length), got {height:.1f} mm"
+        )
+
+    def test_with_cyl_outer2_height_is_tube_length(self):
+        """With --cyl, outer_2's stacked Z-height equals its actual tube
+        length (~499 mm), not its diameter."""
+        moved = self._load_and_stack(use_cyl=True)
+        outer2 = next(s for n, s in moved if n == "outer_2")
+        _, _, zn, _, _, zx = get_bounding_box(outer2)
+        height = zx - zn
+        assert abs(height - 499.0) < 5.0, (
+            f"Expected ~499.0 mm (tube length), got {height:.1f} mm"
+        )
+
+    def test_with_cyl_no_z_gap(self):
+        """With --cyl, outer_2 starts exactly where outer_1 ends (no Z gap)."""
+        moved = self._load_and_stack(use_cyl=True)
+        outer1 = next(s for n, s in moved if n == "outer_1")
+        outer2 = next(s for n, s in moved if n == "outer_2")
+        _, _, _, _, _, z1x = get_bounding_box(outer1)
+        _, _, z2n, _, _, _  = get_bounding_box(outer2)
+        assert abs(z2n - z1x) < 1.0, (
+            f"Z gap with --cyl: {z2n - z1x:.3f} mm (expected 0)"
+        )
+
+    def test_with_cyl_outer1_base_at_z0(self):
+        """With --cyl, outer_1's base is placed at z=0."""
+        moved = self._load_and_stack(use_cyl=True)
+        outer1 = next(s for n, s in moved if n == "outer_1")
+        _, _, zn, _, _, _ = get_bounding_box(outer1)
+        assert abs(zn) < 1.0, f"outer_1 base at z={zn:.3f}, expected ~0"
+
+    def test_with_cyl_small_y_direction_gap(self):
+        """With --cyl, the Y extents are the tube diameters (~511 mm and
+        ~440 mm).  The Y-direction overhang gap shrinks to ~35 mm per end
+        (just the radial difference), confirming the large gap is fixed."""
+        moved = self._load_and_stack(use_cyl=True)
+        outer1 = next(s for n, s in moved if n == "outer_1")
+        outer2 = next(s for n, s in moved if n == "outer_2")
+
+        _, y1n, _, _, y1x, _ = get_bounding_box(outer1)
+        _, y2n, _, _, y2x, _ = get_bounding_box(outer2)
+        y_extent_1 = y1x - y1n  # ~511 mm (outer_1 diameter)
+        y_extent_2 = y2x - y2n  # ~440 mm (outer_2 diameter)
+
+        assert abs(y_extent_1 - 510.8) < 10.0, (
+            f"outer_1 Y extent expected ~510.8 mm (diameter), "
+            f"got {y_extent_1:.1f} mm"
+        )
+        assert abs(y_extent_2 - 439.9) < 10.0, (
+            f"outer_2 Y extent expected ~439.9 mm (diameter), "
+            f"got {y_extent_2:.1f} mm"
+        )
+
+        gap_each_end = (y_extent_1 - y_extent_2) / 2.0
+        assert gap_each_end < 50.0, (
+            f"Y-direction overhang gap with --cyl should be <50 mm, "
+            f"got {gap_each_end:.1f} mm"
+        )
+
+    def test_with_cyl_both_xy_centered(self):
+        """With --cyl, both parts are XY-centered at the origin."""
+        moved = self._load_and_stack(use_cyl=True)
+        for name, shape in moved:
+            xn, yn, _, xx, yx, _ = get_bounding_box(shape)
+            cx = (xn + xx) / 2.0
+            cy = (yn + yx) / 2.0
+            assert abs(cx) < 1.0, f"{name} not centered in X: cx={cx:.3f}"
+            assert abs(cy) < 1.0, f"{name} not centered in Y: cy={cy:.3f}"
