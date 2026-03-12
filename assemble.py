@@ -835,17 +835,75 @@ def _cut_half_planes(cut_angle, axis_vec, origin_pt):
 
 
 def _solid_in_sector(solid, start_angle, end_angle, axis_vec, origin_pt):
-    """Return True if the centre-of-mass of *solid* lies inside the angular
-    sector ``[start_angle, end_angle)`` (degrees) around *axis_vec*.
+    """Return True if *solid* lies primarily inside the angular sector
+    ``[start_angle, end_angle)`` (degrees) around *axis_vec*.
+
+    Uses surface point sampling for robustness.  A coarse tessellation of
+    the solid produces vertices distributed across its surface; each vertex
+    is projected onto the radial plane and its angle tested.  The solid is
+    classified by majority vote, making the result reliable even for
+    thin-wall annular geometry where the centre-of-mass may sit near the
+    axis or at a misleading angle.
     """
     from OCP.GProp import GProp_GProps
     from OCP.BRepGProp import BRepGProp
 
+    ox, oy, oz = origin_pt.X(), origin_pt.Y(), origin_pt.Z()
+    eps = 0.1  # tolerance in degrees
+
+    def _angle_in_sector(a):
+        if start_angle < end_angle:
+            return (start_angle + eps) < a < (end_angle - eps)
+        return a > (start_angle + eps) or a < (end_angle - eps)
+
+    # Tessellate and sample surface vertices
+    try:
+        verts, faces = tessellate_shape(solid, tolerance=0.5)
+    except Exception:
+        verts = np.zeros((0, 3))
+
+    if len(verts) >= 4:
+        # Project vertices onto radial plane and classify.
+        # Only count vertices that are clearly inside or outside
+        # the sector — skip those on or very near the boundary
+        # planes (at start_angle or end_angle) as they belong to
+        # both adjacent sectors after splitting.
+        if axis_vec.z:
+            px = verts[:, 0] - ox
+            py = verts[:, 1] - oy
+        elif axis_vec.y:
+            px = verts[:, 0] - ox
+            py = verts[:, 2] - oz
+        else:
+            px = verts[:, 1] - oy
+            py = verts[:, 2] - oz
+
+        angles = np.degrees(np.arctan2(py, px)) % 360.0
+        boundary_tol = 2.0  # degrees — skip vertices near the boundaries
+        votes_in = 0
+        votes_out = 0
+        for a in angles:
+            a = float(a)
+            # Skip vertices on or very near the sector boundaries
+            near_start = min(abs(a - start_angle), abs(a - start_angle - 360),
+                             abs(a - start_angle + 360)) < boundary_tol
+            near_end = min(abs(a - end_angle), abs(a - end_angle - 360),
+                           abs(a - end_angle + 360)) < boundary_tol
+            if near_start or near_end:
+                continue
+            if _angle_in_sector(a):
+                votes_in += 1
+            else:
+                votes_out += 1
+
+        if votes_in + votes_out > 0:
+            return votes_in > votes_out
+
+    # Fallback: use centre-of-mass
     props = GProp_GProps()
     BRepGProp.VolumeProperties_s(solid, props)
     com = props.CentreOfMass()
 
-    ox, oy, oz = origin_pt.X(), origin_pt.Y(), origin_pt.Z()
     if axis_vec.z:
         cx, cy = com.X() - ox, com.Y() - oy
     elif axis_vec.y:
@@ -854,12 +912,7 @@ def _solid_in_sector(solid, start_angle, end_angle, axis_vec, origin_pt):
         cx, cy = com.Y() - oy, com.Z() - oz
 
     angle = math.degrees(math.atan2(cy, cx)) % 360.0
-    eps = 0.1  # tolerance in degrees
-
-    if start_angle < end_angle:
-        return (start_angle + eps) < angle < (end_angle - eps)
-    # Wraps around 360
-    return angle > (start_angle + eps) or angle < (end_angle - eps)
+    return _angle_in_sector(angle)
 
 
 def cut_part_direct(shape, cut_angle, axis_vec, origin_pt):
@@ -875,19 +928,16 @@ def cut_part_direct(shape, cut_angle, axis_vec, origin_pt):
     3. Filters the resulting solids, keeping only those whose centre of
        mass lies outside the removed sector ``(0, cut_angle)``.
 
-    This approach is typically faster than boolean cutting because the
-    splitter only needs to intersect planar tools with the existing
-    geometry rather than subtracting a complex cylinder sector.  It
-    also produces cleaner topology since the new cap faces are exact
-    planar surfaces rather than boolean-operation artefacts.
+    For *cut_angle* near 180° the two cutting planes are geometrically
+    identical (parallel normals).  In this case only one plane is used and
+    solids are filtered by which side of the Y-axis (in the radial plane)
+    they fall on.
 
     Returns the kept compound (may contain one or more solids).
     Raises ``RuntimeError`` if the splitter operation fails.
     """
     from OCP.BRepAlgoAPI import BRepAlgoAPI_Splitter
     from OCP.TopTools import TopTools_ListOfShape
-    from OCP.GProp import GProp_GProps
-    from OCP.BRepGProp import BRepGProp
 
     face1, face2 = _cut_half_planes(cut_angle, axis_vec, origin_pt)
 
@@ -895,7 +945,12 @@ def cut_part_direct(shape, cut_angle, axis_vec, origin_pt):
     args.Append(shape)
     tools = TopTools_ListOfShape()
     tools.Append(face1)
-    tools.Append(face2)
+
+    # At exactly 180° the two cutting planes are geometrically identical
+    # (anti-parallel normals).  Use only one plane and filter by half-space.
+    near_180 = abs(cut_angle - 180.0) < 0.5
+    if not near_180:
+        tools.Append(face2)
 
     splitter = BRepAlgoAPI_Splitter()
     splitter.SetArguments(args)
@@ -914,15 +969,44 @@ def cut_part_direct(shape, cut_angle, axis_vec, origin_pt):
     builder.MakeCompound(compound)
     kept = 0
 
-    while exp.More():
-        solid = TopoDS.Solid_s(exp.Current())
-        if not _solid_in_sector(solid, 0.0, cut_angle, axis_vec, origin_pt):
-            builder.Add(compound, solid)
-            kept += 1
-        exp.Next()
+    if near_180:
+        # 180° special case: one plane divides the shape in half.
+        # The removed sector [0°, 180°] is the positive-perp2 side.
+        # Keep solids whose centre-of-mass is on the negative-perp2 side.
+        from OCP.GProp import GProp_GProps
+        from OCP.BRepGProp import BRepGProp
+
+        ox, oy, oz = origin_pt.X(), origin_pt.Y(), origin_pt.Z()
+
+        while exp.More():
+            solid = TopoDS.Solid_s(exp.Current())
+            props = GProp_GProps()
+            BRepGProp.VolumeProperties_s(solid, props)
+            com = props.CentreOfMass()
+
+            # The plane at 0° has normal = perp2.  Solids in the removed
+            # sector [0°, 180°] have positive perp2 coordinate.
+            if axis_vec.z:
+                coord = com.Y() - oy  # perp2 = Y
+            elif axis_vec.y:
+                coord = com.Z() - oz  # perp2 = Z
+            else:
+                coord = com.Z() - oz  # perp2 = Z
+
+            if coord < 0:
+                # Negative side — keep (outside the removed sector)
+                builder.Add(compound, solid)
+                kept += 1
+            exp.Next()
+    else:
+        while exp.More():
+            solid = TopoDS.Solid_s(exp.Current())
+            if not _solid_in_sector(solid, 0.0, cut_angle, axis_vec, origin_pt):
+                builder.Add(compound, solid)
+                kept += 1
+            exp.Next()
 
     if kept == 0:
-        # All solids were inside the cutter — shape fully removed.
         return None
 
     return compound
@@ -1044,6 +1128,9 @@ def cut_assembly(assy_compound, cutter_shape):
 
     # Collect valid (topology-ok) candidates: (tolerance, shape, volume)
     candidates = []
+    # Also track topology-failed candidates that might still be usable
+    # after ShapeFix (common with thin-wall geometry).
+    topo_failed = []
     last_result = None
 
     for i, tol in enumerate(tolerances):
@@ -1062,14 +1149,15 @@ def cut_assembly(assy_compound, cutter_shape):
         if result is None or result.IsNull():
             continue
 
-        if not BRepCheck_Analyzer(result).IsValid():
-            last_result = result
-            continue
-
-        # Compute volume for cross-check
+        # Compute volume regardless of topology validity
         props = GProp_GProps()
         BRepGProp.VolumeProperties_s(result, props)
         vol = props.Mass()
+
+        if not BRepCheck_Analyzer(result).IsValid():
+            last_result = result
+            topo_failed.append((tol, result, vol))
+            continue
 
         candidates.append((tol, result, vol))
 
@@ -1090,18 +1178,43 @@ def cut_assembly(assy_compound, cutter_shape):
     if candidates:
         return candidates[-1][1]
 
-    # If no tolerance produced a valid shape, try to heal the best result we
-    # got.
-    if last_result is not None:
+    # No topologically valid results — try to heal the best topology-failed
+    # candidate using ShapeFix.  Prefer candidates whose volumes agree
+    # (cross-check among topo_failed entries).
+    if topo_failed:
+        from OCP.ShapeFix import ShapeFix_Shape
+
+        # Try cross-checking topo-failed volumes
+        for j in range(len(topo_failed) - 1):
+            vol_a = topo_failed[j][2]
+            vol_b = topo_failed[j + 1][2]
+            denom = max(abs(vol_a), abs(vol_b), 1e-12)
+            if abs(vol_a - vol_b) / denom < 0.10:
+                # Volumes agree — fix the tighter-tolerance one
+                best = topo_failed[j][1]
+                try:
+                    fixer = ShapeFix_Shape(best)
+                    fixer.Perform()
+                    fixed = fixer.Shape()
+                    if fixed is not None and not fixed.IsNull():
+                        return fixed
+                except Exception:
+                    pass
+                return best
+
+        # Single topo-failed result — try to fix it
+        best = topo_failed[-1][1]
         try:
-            from OCP.ShapeFix import ShapeFix_Shape
-            fixer = ShapeFix_Shape(last_result)
+            fixer = ShapeFix_Shape(best)
             fixer.Perform()
             fixed = fixer.Shape()
             if fixed is not None and not fixed.IsNull():
                 return fixed
         except Exception:
             pass
+        return best
+
+    if last_result is not None:
         return last_result
 
     raise RuntimeError("Boolean cut operation failed after all tolerance attempts")
