@@ -3510,3 +3510,35 @@ class TestPipelineAdvancedScenarios:
         finally:
             os.chdir(old)
 
+    def test_parts_exports_preserve_name_to_geometry_after_cylinder_reorder(self, tmp_dir):
+        """Exported filenames should retain their own transformed geometry."""
+        old = os.getcwd()
+        os.chdir(tmp_dir)
+        try:
+            # Place parts at different Z offsets so orient_to_cylinder sorting
+            # reorders them relative to input order.
+            outer = cq.Workplane("XY").cylinder(40, 12).translate((0, 0, 30))
+            mid = cq.Workplane("XY").cylinder(12, 4).translate((0, 0, -30))
+            cq.exporters.export(outer, "outer_1.step")
+            cq.exporters.export(mid, "mid_1.step")
+
+            args = self._args(
+                inputs=["outer_*.step", "mid_*.step"],
+                output="name_geometry_map.step",
+                autoscale=False,
+                midscale=False,
+                mid_cut=False,
+            )
+            ret = run_pipeline(args)
+
+            assert ret == 0
+            outer_wp, _ = load_part(os.path.join("parts", "outer_1.step"))
+            mid_wp, _ = load_part(os.path.join("parts", "mid_1.step"))
+            outer_h = shape_extent(outer_wp.val().wrapped, AXIS_MAP["z"])[1] - shape_extent(outer_wp.val().wrapped, AXIS_MAP["z"])[0]
+            mid_h = shape_extent(mid_wp.val().wrapped, AXIS_MAP["z"])[1] - shape_extent(mid_wp.val().wrapped, AXIS_MAP["z"])[0]
+
+            assert outer_h > mid_h
+            assert outer_h == pytest.approx(40.0, rel=0.03)
+            assert mid_h == pytest.approx(12.0, rel=0.03)
+        finally:
+            os.chdir(old)
