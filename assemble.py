@@ -61,9 +61,11 @@ from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from OCP.TopLoc import TopLoc_Location
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Common
+from OCP.BRepAlgoAPI import BRepAlgoAPI_Section
 from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder
 from OCP.TopExp import TopExp_Explorer
 from OCP.TopAbs import TopAbs_FACE, TopAbs_SOLID
+from OCP.gp import gp_Pln
 
 # ---------------------------------------------------------------------------
 # Axis configuration
@@ -2432,6 +2434,21 @@ def _has_positive_common_volume(shape_a, shape_b, tol=1e-7):
     return _shape_volume(common.Shape()) > tol
 
 
+def _section_bbox(shape, origin, normal):
+    """Return bbox of shape/plane intersection or None when no section exists."""
+    section = BRepAlgoAPI_Section(shape, gp_Pln(origin, normal))
+    section.Build()
+    if not section.IsDone():
+        return None
+    section_shape = section.Shape()
+    if section_shape.IsNull():
+        return None
+    bbox = get_bounding_box(section_shape)
+    if any(math.isinf(v) for v in bbox):
+        return None
+    return bbox
+
+
 def midscale_parts(part_info, debug=False):
     """Expand mid-tier parts after stacking: XY to outer contact, then Z.
 
@@ -2462,35 +2479,50 @@ def midscale_parts(part_info, debug=False):
     for mid in mids:
         shape = mid["shape"]
 
-        # --- XY: uniform scale until non-trivial overlap with matching outer ---
+        # --- XY: rough-fit from bbox, then refine with a center Z section ---
         outer_targets = [
             o for o in outers
             if mid["levels"] and o["levels"] and (mid["levels"] & o["levels"])
         ]
         if outer_targets:
-            target_outer = outer_targets[0]["shape"]
-            if not _has_positive_common_volume(shape, target_outer):
-                low, high = 1.0, 1.05
-                found = False
-                for _ in range(20):
-                    trial = _scale_shape_anisotropic_about_center(shape, sx=high, sy=high, sz=1.0)
-                    if _has_positive_common_volume(trial, target_outer):
-                        found = True
-                        break
-                    low = high
-                    high *= 1.25
-                if found:
-                    for _ in range(24):
-                        midf = 0.5 * (low + high)
-                        trial = _scale_shape_anisotropic_about_center(shape, sx=midf, sy=midf, sz=1.0)
-                        if _has_positive_common_volume(trial, target_outer):
-                            high = midf
-                        else:
-                            low = midf
-                    if high > 1.0 + 1e-6:
-                        shape = _scale_shape_anisotropic_about_center(shape, sx=high, sy=high, sz=1.0)
-                        if debug:
-                            print(f"  [DEBUG] Midscale XY {mid['name']}: x{high:.5f}")
+            mnx, mny, mnz, mxx, myy, mxz = get_bounding_box(shape)
+            outer_mnx = min(get_bounding_box(o["shape"])[0] for o in outer_targets)
+            outer_mny = min(get_bounding_box(o["shape"])[1] for o in outer_targets)
+            outer_mxx = max(get_bounding_box(o["shape"])[3] for o in outer_targets)
+            outer_myy = max(get_bounding_box(o["shape"])[4] for o in outer_targets)
+
+            mid_x = max(1e-9, mxx - mnx)
+            mid_y = max(1e-9, myy - mny)
+            outer_x = max(1e-9, outer_mxx - outer_mnx)
+            outer_y = max(1e-9, outer_myy - outer_mny)
+
+            # Start with fast bbox fit (keep a small margin).
+            xy_factor = min(outer_x / mid_x, outer_y / mid_y) * 0.98
+            if xy_factor < 1.0:
+                xy_factor = 1.0
+            shape = _scale_shape_anisotropic_about_center(shape, sx=xy_factor, sy=xy_factor, sz=1.0)
+
+            # Refine from horizontal (Z-normal) slice spans at center Z.
+            mnx, mny, mnz, mxx, myy, mxz = get_bounding_box(shape)
+            cx, cy, cz = (mnx + mxx) / 2.0, (mny + myy) / 2.0, (mnz + mxz) / 2.0
+            mid_sec = _section_bbox(shape, gp_Pnt(cx, cy, cz), gp_Dir(0, 0, 1))
+            outer_secs = [
+                _section_bbox(o["shape"], gp_Pnt(cx, cy, cz), gp_Dir(0, 0, 1))
+                for o in outer_targets
+            ]
+            outer_secs = [s for s in outer_secs if s is not None]
+            if mid_sec and outer_secs:
+                mid_sec_x = max(1e-9, mid_sec[3] - mid_sec[0])
+                mid_sec_y = max(1e-9, mid_sec[4] - mid_sec[1])
+                out_sec_x = max(s[3] for s in outer_secs) - min(s[0] for s in outer_secs)
+                out_sec_y = max(s[4] for s in outer_secs) - min(s[1] for s in outer_secs)
+                if out_sec_x > 1e-9 and out_sec_y > 1e-9:
+                    refine = min(out_sec_x / mid_sec_x, out_sec_y / mid_sec_y) * 0.98
+                    if refine > 0.0 and abs(refine - 1.0) > 1e-3:
+                        shape = _scale_shape_anisotropic_about_center(shape, sx=refine, sy=refine, sz=1.0)
+                        xy_factor *= refine
+            if debug:
+                print(f"  [DEBUG] Midscale XY {mid['name']}: x{xy_factor:.5f}")
 
         # --- Z: scale until contacting nearest mid/outer above and below ---
         mnx, mny, mnz, mxx, myy, mxz = get_bounding_box(shape)
@@ -2513,9 +2545,10 @@ def midscale_parts(part_info, debug=False):
                     gap_below = g if gap_below is None else min(gap_below, g)
 
             if gap_above is not None and gap_below is not None:
-                delta = max(gap_above, gap_below)
-                if delta > 1e-9:
-                    zf = 1.0 + (2.0 * delta / height)
+                # Fill the available vertical clearance in one bounded step.
+                available_height = height + gap_above + gap_below
+                zf = available_height / max(height, 1e-9)
+                if zf > 1.0 + 1e-6:
                     shape = _scale_shape_anisotropic_about_center(shape, sx=1.0, sy=1.0, sz=zf)
                     if debug:
                         print(
