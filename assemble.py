@@ -2358,6 +2358,86 @@ def build_moved_compound(part_info):
     return compound
 
 
+def _scale_shape_about_center(shape, clearance):
+    """Return *shape* scaled outward about its bbox center by *clearance*."""
+    xn, yn, zn, xx, yx, zx = get_bounding_box(shape)
+    cx = (xn + xx) / 2.0
+    cy = (yn + yx) / 2.0
+    cz = (zn + zx) / 2.0
+    max_dim = max(xx - xn, yx - yn, zx - zn)
+    if max_dim <= 1e-9:
+        return shape
+
+    factor = (max_dim + 2.0 * clearance) / max_dim
+    trsf = gp_Trsf()
+    trsf.SetScale(gp_Pnt(cx, cy, cz), factor)
+    return BRepBuilderAPI_Transform(shape, trsf, True).Shape()
+
+
+def mid_cut_parts(part_info, output_dir="parts", clearance=0.02, debug=False):
+    """Cut mid-tier parts to clear inner-tier parts and export the cut mids.
+
+    This operation is applied in world coordinates.  Returned part_info entries
+    are emitted with identity locations because their geometry is already moved.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    world_entries = []
+    for entry in part_info:
+        name, shape, loc, rgb = entry[0], entry[1], entry[2], entry[3]
+        segment = entry[4] if len(entry) > 4 else None
+        is_mesh = entry[5] if len(entry) > 5 else False
+        tier, levels, _ = parse_part_name(name)
+        moved = apply_location(shape, loc)
+        world_entries.append({
+            "name": name,
+            "shape": moved,
+            "rgb": rgb,
+            "segment": segment,
+            "is_mesh": is_mesh,
+            "tier": tier,
+            "levels": set(levels or []),
+        })
+
+    inner_entries = [e for e in world_entries if e["tier"] == "inner"]
+    cut_count = 0
+
+    for entry in world_entries:
+        if entry["tier"] != "mid":
+            continue
+
+        matching_inners = [
+            inner for inner in inner_entries
+            if entry["levels"] and inner["levels"] and entry["levels"] & inner["levels"]
+        ]
+        if not matching_inners:
+            continue
+
+        cutter_builder = BRep_Builder()
+        cutter = TopoDS_Compound()
+        cutter_builder.MakeCompound(cutter)
+        for inner in matching_inners:
+            inflated = _scale_shape_about_center(inner["shape"], clearance)
+            cutter_builder.Add(cutter, inflated)
+
+        cut_mid = cut_assembly(entry["shape"], cutter)
+        if cut_mid is not None:
+            entry["shape"] = cut_mid
+            cut_count += 1
+            out_path = os.path.join(output_dir, f"{entry['name']}_mid_cut.step")
+            export_part_native(cut_mid, out_path, ".step", is_mesh=False)
+            if debug:
+                print(f"  [DEBUG] Mid cut exported: {out_path}")
+
+    updated = []
+    for e in world_entries:
+        updated.append((e["name"], e["shape"], Location(), e["rgb"], e["segment"], e["is_mesh"]))
+
+    print(f"  Mid-cut complete ({cut_count} mid part(s) cut, clearance={clearance:.4f} in).")
+    print(f"  Mid-cut parts saved in: {output_dir}")
+    return updated
+
+
 # ===================================================================
 # Tessellation
 # ===================================================================
@@ -2776,6 +2856,22 @@ def run_pipeline(args):
             assy.add(wp, name=name, loc=loc, color=cq_color)
         print("  Physics simulation complete.")
 
+    # 2c. Mid-cut (optional): hollow mid-tier parts using inner-tier clearance
+    if getattr(args, "mid_cut", False):
+        print("\nApplying mid-part clearance cuts (--mid_cut)...")
+        part_info = mid_cut_parts(
+            part_info,
+            output_dir=(args.parts if getattr(args, "parts", None) else "parts"),
+            clearance=0.02,
+            debug=getattr(args, "debug", False),
+        )
+        assy = Assembly()
+        for entry in part_info:
+            name, shape, loc, rgb = entry[0], entry[1], entry[2], entry[3]
+            wp = cq.Workplane("XY").newObject([cq.Shape(shape)])
+            cq_color = Color(*rgb) if len(rgb) == 3 else Color(*rgb[:3])
+            assy.add(wp, name=name, loc=loc, color=cq_color)
+
     # 3. Cut (optional) and export output file
     output_path = args.output
     cut_result_shape = None
@@ -3044,6 +3140,10 @@ def main():
     parser.add_argument(
         "--parts", nargs="?", const="parts", default=None,
         help="Export rotated/scaled pre-stack parts to a directory (default: ./parts).",
+    )
+    parser.add_argument(
+        "--mid_cut", action="store_true",
+        help="Cut mid-tier parts to create 0.02 in clearance for matching inner-tier parts and export cut mids to ./parts (or --parts dir).",
     )
     parser.add_argument(
         "--debug", action="store_true",
