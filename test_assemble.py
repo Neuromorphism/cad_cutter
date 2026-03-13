@@ -1440,7 +1440,7 @@ class TestSegmentStacking:
         ]
         assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
         z_bases = {}
-        for name, shape, loc, rgb, seg in info:
+        for name, shape, loc, rgb, seg, *_rest in info:
             moved = apply_location(shape, loc)
             _, _, zn, _, _, _ = get_bounding_box(moved)
             z_bases[name] = zn
@@ -1455,7 +1455,7 @@ class TestSegmentStacking:
             load_part(segment_parts["inner_2b"]),
         ]
         assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
-        for name, shape, loc, rgb, seg in info:
+        for name, shape, loc, rgb, seg, *_rest in info:
             if seg is not None:
                 moved = apply_location(shape, loc)
                 xn, yn, _, xx, yx, _ = get_bounding_box(moved)
@@ -1515,7 +1515,7 @@ class TestSegmentCutting:
         builder = BRep_Builder()
         compound = TopoDS_Compound()
         builder.MakeCompound(compound)
-        for name, shape, loc, rgb, seg in info:
+        for name, shape, loc, rgb, seg, *_rest in info:
             builder.Add(compound, apply_location(shape, loc))
 
         bbox = Bnd_Box()
@@ -1526,7 +1526,7 @@ class TestSegmentCutting:
         cutter_a = make_segment_cutter(bbox_vals, cut_angle, AXIS_MAP["z"], "a")
 
         # Cut the inner_1a part
-        for name, shape, loc, rgb, seg in info:
+        for name, shape, loc, rgb, seg, *_rest in info:
             if seg == "a":
                 moved = apply_location(shape, loc)
                 result = cut_assembly(moved, cutter_a)
@@ -1544,7 +1544,7 @@ class TestSegmentCutting:
         builder = BRep_Builder()
         compound = TopoDS_Compound()
         builder.MakeCompound(compound)
-        for name, shape, loc, rgb, seg in info:
+        for name, shape, loc, rgb, seg, *_rest in info:
             builder.Add(compound, apply_location(shape, loc))
 
         bbox = Bnd_Box()
@@ -1554,7 +1554,7 @@ class TestSegmentCutting:
         cut_angle = 120.0
         cutter_b = make_segment_cutter(bbox_vals, cut_angle, AXIS_MAP["z"], "b")
 
-        for name, shape, loc, rgb, seg in info:
+        for name, shape, loc, rgb, seg, *_rest in info:
             if seg == "b":
                 moved = apply_location(shape, loc)
                 result = cut_assembly(moved, cutter_b)
@@ -1572,7 +1572,7 @@ class TestSegmentCutting:
         builder = BRep_Builder()
         compound = TopoDS_Compound()
         builder.MakeCompound(compound)
-        for name, shape, loc, rgb, seg in info:
+        for name, shape, loc, rgb, seg, *_rest in info:
             builder.Add(compound, apply_location(shape, loc))
 
         bbox = Bnd_Box()
@@ -1585,7 +1585,7 @@ class TestSegmentCutting:
 
         # Use the inner_1a part for both cuts (same geometry)
         inner_shape = None
-        for name, shape, loc, rgb, seg in info:
+        for name, shape, loc, rgb, seg, *_rest in info:
             if seg == "a":
                 inner_shape = apply_location(shape, loc)
                 break
@@ -1632,7 +1632,7 @@ class TestSegmentCutting:
         builder = BRep_Builder()
         compound = TopoDS_Compound()
         builder.MakeCompound(compound)
-        for name, shape, loc, rgb, seg in info:
+        for name, shape, loc, rgb, seg, *_rest in info:
             builder.Add(compound, apply_location(shape, loc))
 
         bbox = Bnd_Box()
@@ -1641,7 +1641,7 @@ class TestSegmentCutting:
 
         for angle in (90.0, 120.0, 180.0):
             cutter_a = make_segment_cutter(bbox_vals, angle, AXIS_MAP["z"], "a")
-            for name, shape, loc, rgb, seg in info:
+            for name, shape, loc, rgb, seg, *_rest in info:
                 if seg == "a":
                     moved = apply_location(shape, loc)
                     result = cut_assembly(moved, cutter_a)
@@ -2167,7 +2167,7 @@ class TestOuterStackupGap:
         assy, info = stack_parts(parts, AXIS_MAP["z"], gap=gap)
         return [
             (name, apply_location(shape, loc))
-            for name, shape, loc, rgb, seg in info
+            for name, shape, loc, rgb, seg, *_rest in info
         ]
 
     # ------------------------------------------------------------------
