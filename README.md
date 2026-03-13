@@ -119,6 +119,7 @@ python assemble.py <inputs...> [options]
 | `--validate-resolution` | `512` | Resolution used for validation render masks |
 | `--validate-max-mismatch` | `0.01` | Allowed normalized pixel mismatch for validation |
 | `--parts [DIR]` | *(off)* | Export rotated/scaled pre-stack parts to a directory in native formats (`parts/` by default) |
+| `--midscale` | *(off)* | After orient/stack, scale each `mid_*`: uniform XY until its volume contacts matching `outer_*`, then independent Z until it contacts a `mid_*`/`outer_*` above and below. |
 | `--mid_cut` | *(off)* | Cut each `mid_*` part to clear matching `inner_*` geometry with 0.02 in clearance; exports cut mid parts to `parts/` (or `--parts` dir) |
 | `--debug` | *(off)* | Verbose logging; includes cutter shape in output |
 
