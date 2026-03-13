@@ -18,6 +18,8 @@ lxml>=4.9
 # Testing
 pytest>=7.0
 
+# Web UI
+flask>=3.0
 # GPU acceleration (optional — install for CUDA-accelerated PCA,
 # tessellation, physics simulation, and parallel cutting)
 # cupy-cuda12x>=13.0  # Uncomment for CUDA 12.x
