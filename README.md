@@ -118,6 +118,7 @@ python assemble.py <inputs...> [options]
 | `--validate` | *(off)* | Run validation pipeline (3D y=0 cut vs 2D masked top-down projection) |
 | `--validate-resolution` | `512` | Resolution used for validation render masks |
 | `--validate-max-mismatch` | `0.01` | Allowed normalized pixel mismatch for validation |
+| `--parts [DIR]` | *(off)* | Export rotated/scaled pre-stack parts to a directory in native formats (`parts/` by default) |
 | `--debug` | *(off)* | Verbose logging; includes cutter shape in output |
 
 ---
@@ -137,6 +138,14 @@ Use `--validate` to run a geometric/image-consistency check useful for tests:
 python assemble.py outer_1.step --validate --validate-resolution 512
 ```
 
+
+### Fast STL/Mesh Loading Notes
+
+Large mesh-heavy jobs can spend most time in mesh→solid sewing. Inspired by tools like **FSTL**
+(which stay triangle-native for interactive speed), `assemble.py` now loads mesh inputs
+as lightweight triangle shells by default and defers solid conversion unless explicitly needed.
+This significantly reduces startup/load time for many-part STL assemblies while preserving
+cutting/rendering behavior.
 
 ## Cutting Engines
 
