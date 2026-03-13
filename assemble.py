@@ -2443,7 +2443,15 @@ def _section_bbox(shape, origin, normal):
     section_shape = section.Shape()
     if section_shape.IsNull():
         return None
-    bbox = get_bounding_box(section_shape)
+
+    # Section results are often edge/wire-only. For tangential/degenerate
+    # intersections OCC can return a valid (non-null) shape whose Bnd_Box is
+    # void; calling Get() on that box raises Standard_ConstructionError.
+    bbox_obj = Bnd_Box()
+    BRepBndLib.Add_s(section_shape, bbox_obj)
+    if bbox_obj.IsVoid():
+        return None
+    bbox = bbox_obj.Get()
     if any(math.isinf(v) for v in bbox):
         return None
     return bbox
