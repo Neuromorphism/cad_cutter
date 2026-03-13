@@ -33,6 +33,17 @@ fi
 
 echo "Using $PYTHON ($PY_VER)"
 
+# --- Ensure OpenGL runtime for cadquery/OCP ---------------------------------
+if [ ! -e /usr/lib/x86_64-linux-gnu/libGL.so.1 ] && [ ! -e /lib/x86_64-linux-gnu/libGL.so.1 ]; then
+    if command -v apt-get &>/dev/null && [ "$(id -u)" -eq 0 ]; then
+        echo "Installing system dependency: libgl1 (provides libGL.so.1)..."
+        apt-get update
+        apt-get install -y libgl1
+    else
+        echo "WARNING: libGL.so.1 not found. Install system package 'libgl1' before running tests."
+    fi
+fi
+
 # --- Create venv -------------------------------------------------------------
 echo "Creating virtual environment at: $VENV_DIR"
 "$PYTHON" -m venv "$VENV_DIR"

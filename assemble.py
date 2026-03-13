@@ -3072,9 +3072,19 @@ def run_pipeline(args):
     if getattr(args, "cyl", False):
         print("\nOrient parts for cylinder (--cyl)...")
         parts = orient_to_cylinder(parts, gap=args.gap)
-        # orient_to_cylinder creates transformed copies; refresh export geometry.
-        for i, entry in enumerate(parts):
-            loaded_parts_for_export[i]["shape"] = entry[0].val().wrapped
+        # orient_to_cylinder may reorder parts (sorted by centroid Z), so we
+        # cannot refresh export geometry by positional index alone.
+        export_indices_by_name = {}
+        for i, item in enumerate(loaded_parts_for_export):
+            export_indices_by_name.setdefault(item["name"], []).append(i)
+
+        for entry in parts:
+            name = entry[1]
+            indices = export_indices_by_name.get(name)
+            if not indices:
+                continue
+            idx = indices.pop(0)
+            loaded_parts_for_export[idx]["shape"] = entry[0].val().wrapped
 
     if getattr(args, "parts", False):
         export_transformed_parts(loaded_parts_for_export, "parts")
