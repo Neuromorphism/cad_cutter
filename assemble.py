@@ -1918,6 +1918,35 @@ def export_shape_step(shape, filepath):
         raise RuntimeError(f"STEP write failed with status {status}")
 
 
+def _is_step_path(filepath):
+    return os.path.splitext(filepath)[1].lower() in {".step", ".stp"}
+
+
+def export_shape(shape, filepath):
+    """Export a raw OCP shape to STEP/STL based on output extension."""
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext in {".step", ".stp"}:
+        export_shape_step(shape, filepath)
+        return
+    if ext == ".stl":
+        cq.exporters.export(cq.Shape.cast(shape), filepath, exportType="STL")
+        return
+    raise ValueError(
+        f"Unsupported output format '{ext}'. Use .step/.stp or .stl for --output."
+    )
+
+
+def build_moved_compound(part_info):
+    """Build a compound from positioned parts in part_info."""
+    builder = BRep_Builder()
+    compound = TopoDS_Compound()
+    builder.MakeCompound(compound)
+    for name, shape, loc, color, _seg in part_info:
+        moved = apply_location(shape, loc)
+        builder.Add(compound, moved)
+    return compound
+
+
 # ===================================================================
 # Tessellation
 # ===================================================================
@@ -2181,13 +2210,13 @@ def run_pipeline(args):
             assy.add(wp, name=name, loc=loc, color=cq_color)
         print("  Physics simulation complete.")
 
-    # 3. Cut (optional) and export STEP
-    output_step = args.output
+    # 3. Cut (optional) and export output file
+    output_path = args.output
     cut_result_shape = None
 
     if args.cut_angle is not None:
         # Export pre-cut assembly
-        precut_path = os.path.splitext(output_step)[0] + "_precut.step"
+        precut_path = os.path.splitext(output_path)[0] + "_precut.step"
         print(f"\nExporting pre-cut assembly: {precut_path}")
         try:
             export_assembly_step(assy, precut_path)
@@ -2295,23 +2324,20 @@ def run_pipeline(args):
         cut_result_shape = cut_compound
         print(f"  Cut complete ({cut_ok} parts cut, {cut_skip} fully removed).")
 
-        print(f"Exporting cut assembly: {output_step}")
-        export_shape_step(cut_result_shape, output_step)
+        print(f"Exporting cut assembly: {output_path}")
+        export_shape(cut_result_shape, output_path)
     else:
-        print(f"\nExporting assembly: {output_step}")
-        try:
-            export_assembly_step(assy, output_step)
-        except Exception as e:
-            print(f"  Assembly export fallback: {e}")
-            builder = BRep_Builder()
-            compound = TopoDS_Compound()
-            builder.MakeCompound(compound)
-            for name, shape, loc, color, _seg in part_info:
-                moved = apply_location(shape, loc)
-                builder.Add(compound, moved)
-            export_shape_step(compound, output_step)
+        print(f"\nExporting assembly: {output_path}")
+        if _is_step_path(output_path):
+            try:
+                export_assembly_step(assy, output_path)
+            except Exception as e:
+                print(f"  Assembly export fallback: {e}")
+                export_shape(build_moved_compound(part_info), output_path)
+        else:
+            export_shape(build_moved_compound(part_info), output_path)
 
-    print(f"  STEP saved: {output_step}")
+    print(f"  Output saved: {output_path}")
 
     # 4. Render
     if args.render:
@@ -2332,7 +2358,7 @@ def run_pipeline(args):
     if args.cut_angle is not None:
         cut_method = "direct" if getattr(args, "cut_direct", False) else "boolean"
         print(f"  Cut angle:  {args.cut_angle} deg ({cut_method})")
-    print(f"  STEP out:   {output_step}")
+    print(f"  Output:     {output_path}")
     if args.render:
         print(f"  Render out: {args.render}")
 
