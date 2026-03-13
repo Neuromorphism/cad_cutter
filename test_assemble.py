@@ -2716,3 +2716,550 @@ class TestAutoscaleParts:
         d2_orig = _get_xy_diameter(inner2.val().wrapped)
         d2_result = _get_xy_diameter(result[3][0].val().wrapped)
         assert abs(d2_result - d2_orig) < 0.5
+
+
+# ============================================================================
+# Test: Complex mesh cutting
+# ============================================================================
+
+class TestComplexMeshCutting:
+    """Cut complex, real-world-like meshes and validate clean results.
+
+    Each test builds a non-trivial geometry (thin walls, internal cavities,
+    curved intersections, multi-body assemblies) and verifies that both
+    boolean and direct cutting produce valid, watertight results with the
+    correct volume ratio.
+    """
+
+    def _get_volume(self, shape):
+        from OCP.GProp import GProp_GProps
+        from OCP.BRepGProp import BRepGProp
+        props = GProp_GProps()
+        BRepGProp.VolumeProperties_s(shape, props)
+        return props.Mass()
+
+    def _get_bbox_vals(self, shape):
+        bbox = Bnd_Box()
+        BRepBndLib.Add_s(shape, bbox)
+        return bbox.Get()
+
+    def _origin_for(self, shape, axis_vec):
+        bbox_vals = self._get_bbox_vals(shape)
+        _, _, origin_pt, _ = _cutter_params(bbox_vals, axis_vec)
+        return origin_pt
+
+    def _assert_valid_cut(self, original, result, angle, tol=0.05, label=""):
+        """Assert the cut result is non-null, has correct volume, and valid topology."""
+        from OCP.BRepCheck import BRepCheck_Analyzer
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopAbs import TopAbs_FACE
+
+        assert result is not None, f"{label}: cut returned None"
+        assert not result.IsNull(), f"{label}: cut result is null"
+
+        result_bbox = Bnd_Box()
+        BRepBndLib.Add_s(result, result_bbox)
+        assert not result_bbox.IsVoid(), f"{label}: result bbox is void"
+
+        # Volume check
+        orig_vol = self._get_volume(original)
+        cut_vol = self._get_volume(result)
+        expected_ratio = (360.0 - angle) / 360.0
+        actual_ratio = cut_vol / orig_vol if orig_vol > 1e-9 else 0
+        assert abs(actual_ratio - expected_ratio) < tol, (
+            f"{label}: volume ratio {actual_ratio:.4f} vs expected "
+            f"{expected_ratio:.4f} (tol={tol})"
+        )
+
+        # Must have faces (tessellatable)
+        exp = TopExp_Explorer(result, TopAbs_FACE)
+        assert exp.More(), f"{label}: result has no faces"
+
+        # Tessellation check
+        verts, faces = tessellate_shape(result, tolerance=0.1)
+        assert len(verts) > 0 and len(faces) > 0, (
+            f"{label}: tessellation produced no geometry"
+        )
+
+    # ── Thin-wall hollow cylinder (pipe) ────────────────────────────
+
+    def test_boolean_cut_thin_wall_pipe(self):
+        """Boolean cut through a thin-walled pipe (2mm wall, 40mm OD)."""
+        pipe = (cq.Workplane("XY")
+                .cylinder(60, 20)
+                .faces(">Z").workplane()
+                .hole(36))  # 2mm wall
+        shape = pipe.val().wrapped
+        cutter = make_cutter(self._get_bbox_vals(shape), 90, AXIS_MAP["z"])
+        result = cut_assembly(shape, cutter)
+        self._assert_valid_cut(shape, result, 90, tol=0.08,
+                               label="thin-wall pipe boolean 90°")
+
+    def test_direct_cut_thin_wall_pipe(self):
+        """Direct cut through a thin-walled pipe."""
+        pipe = (cq.Workplane("XY")
+                .cylinder(60, 20)
+                .faces(">Z").workplane()
+                .hole(36))
+        shape = pipe.val().wrapped
+        origin = self._origin_for(shape, AXIS_MAP["z"])
+        result = cut_part_direct(shape, 90, AXIS_MAP["z"], origin)
+        self._assert_valid_cut(shape, result, 90, tol=0.08,
+                               label="thin-wall pipe direct 90°")
+
+    # ── Sphere with through-hole ────────────────────────────────────
+
+    def test_boolean_cut_drilled_sphere(self):
+        """Boolean cut on a sphere with a cylindrical bore through it."""
+        sphere = cq.Workplane("XY").sphere(25)
+        bore = cq.Workplane("XY").cylinder(60, 5)
+        drilled = sphere.cut(bore)
+        shape = drilled.val().wrapped
+        cutter = make_cutter(self._get_bbox_vals(shape), 90, AXIS_MAP["z"])
+        result = cut_assembly(shape, cutter)
+        self._assert_valid_cut(shape, result, 90, tol=0.10,
+                               label="drilled sphere boolean 90°")
+
+    def test_direct_cut_drilled_sphere(self):
+        """Direct cut on a sphere with a bore."""
+        sphere = cq.Workplane("XY").sphere(25)
+        bore = cq.Workplane("XY").cylinder(60, 5)
+        drilled = sphere.cut(bore)
+        shape = drilled.val().wrapped
+        origin = self._origin_for(shape, AXIS_MAP["z"])
+        result = cut_part_direct(shape, 120, AXIS_MAP["z"], origin)
+        self._assert_valid_cut(shape, result, 120, tol=0.10,
+                               label="drilled sphere direct 120°")
+
+    # ── Flanged cylinder with bolt holes ────────────────────────────
+
+    def test_boolean_cut_flanged_bolt_pattern(self):
+        """Flange with 6 bolt holes — boolean cut must handle the hole pattern."""
+        import math as _m
+        flange = (cq.Workplane("XY")
+                  .circle(30).extrude(5)
+                  .faces(">Z").workplane()
+                  .cylinder(40, 12))
+        # Drill 6 bolt holes in the flange ring
+        for i in range(6):
+            ang = _m.radians(60 * i)
+            flange = (flange.faces("<Z").workplane()
+                      .transformed(offset=(_m.cos(ang) * 22,
+                                           _m.sin(ang) * 22, 0))
+                      .hole(6))
+        shape = flange.val().wrapped
+        cutter = make_cutter(self._get_bbox_vals(shape), 90, AXIS_MAP["z"])
+        result = cut_assembly(shape, cutter)
+        self._assert_valid_cut(shape, result, 90, tol=0.10,
+                               label="flanged bolt pattern boolean 90°")
+
+    def test_direct_cut_flanged_bolt_pattern(self):
+        """Flange with 6 bolt holes — direct cut."""
+        import math as _m
+        flange = (cq.Workplane("XY")
+                  .circle(30).extrude(5)
+                  .faces(">Z").workplane()
+                  .cylinder(40, 12))
+        for i in range(6):
+            ang = _m.radians(60 * i)
+            flange = (flange.faces("<Z").workplane()
+                      .transformed(offset=(_m.cos(ang) * 22,
+                                           _m.sin(ang) * 22, 0))
+                      .hole(6))
+        shape = flange.val().wrapped
+        origin = self._origin_for(shape, AXIS_MAP["z"])
+        result = cut_part_direct(shape, 90, AXIS_MAP["z"], origin)
+        self._assert_valid_cut(shape, result, 90, tol=0.10,
+                               label="flanged bolt pattern direct 90°")
+
+    # ── Nested concentric tubes (3 layers) ──────────────────────────
+
+    def test_boolean_cut_nested_tubes(self):
+        """Three concentric tubes assembled and cut as a compound."""
+        outer = cq.Workplane("XY").cylinder(50, 25).faces(">Z").workplane().hole(44)
+        mid   = cq.Workplane("XY").cylinder(50, 18).faces(">Z").workplane().hole(30)
+        inner = cq.Workplane("XY").cylinder(50, 10).faces(">Z").workplane().hole(14)
+        parts = [(outer, "outer_1"), (mid, "mid_1"), (inner, "inner_1")]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
+        builder = BRep_Builder()
+        compound = TopoDS_Compound()
+        builder.MakeCompound(compound)
+        for name, shape, loc, rgb, *_rest in info:
+            builder.Add(compound, apply_location(shape, loc))
+        cutter = make_cutter(self._get_bbox_vals(compound), 90, AXIS_MAP["z"])
+        result = cut_assembly(compound, cutter)
+        assert result is not None and not result.IsNull()
+        # Volume must decrease
+        assert self._get_volume(result) < self._get_volume(compound) * 0.85
+
+    def test_direct_cut_nested_tubes(self):
+        """Three concentric tubes — direct cut each individually."""
+        shapes = []
+        for r_out, r_in in [(25, 22), (18, 15), (10, 7)]:
+            s = (cq.Workplane("XY").cylinder(50, r_out)
+                 .faces(">Z").workplane().hole(r_in * 2)).val().wrapped
+            shapes.append(s)
+        axis_vec = AXIS_MAP["z"]
+        for i, shape in enumerate(shapes):
+            origin = self._origin_for(shape, axis_vec)
+            result = cut_part_direct(shape, 90, axis_vec, origin)
+            self._assert_valid_cut(shape, result, 90, tol=0.10,
+                                   label=f"nested tube {i} direct 90°")
+
+    # ── Torus (donut) — curved surface cuts ─────────────────────────
+
+    def _make_torus(self):
+        """Build a solid torus (major=20, minor=8) via OCP directly."""
+        from OCP.BRepPrimAPI import BRepPrimAPI_MakeTorus
+        return BRepPrimAPI_MakeTorus(20, 8).Shape()
+
+    def test_boolean_cut_torus(self):
+        """Boolean cut through a torus (tangent intersection with cutter)."""
+        shape = self._make_torus()
+        cutter = make_cutter(self._get_bbox_vals(shape), 90, AXIS_MAP["z"])
+        result = cut_assembly(shape, cutter)
+        self._assert_valid_cut(shape, result, 90, tol=0.10,
+                               label="torus boolean 90°")
+
+    def test_direct_cut_torus_270(self):
+        """Direct 270° cut on a torus — large removal, curved geometry."""
+        shape = self._make_torus()
+        origin = self._origin_for(shape, AXIS_MAP["z"])
+        result = cut_part_direct(shape, 270, AXIS_MAP["z"], origin)
+        self._assert_valid_cut(shape, result, 270, tol=0.10,
+                               label="torus direct 270°")
+
+    # ── Stepped cylinder (multi-diameter) ───────────────────────────
+
+    def test_boolean_cut_stepped_cylinder(self):
+        """Stepped cylinder with 4 diameter changes."""
+        base = cq.Workplane("XY").cylinder(10, 25)
+        mid  = base.faces(">Z").workplane().cylinder(15, 18)
+        neck = mid.faces(">Z").workplane().cylinder(8, 12)
+        top  = neck.faces(">Z").workplane().cylinder(12, 20)
+        shape = top.val().wrapped
+        cutter = make_cutter(self._get_bbox_vals(shape), 90, AXIS_MAP["z"])
+        result = cut_assembly(shape, cutter)
+        self._assert_valid_cut(shape, result, 90, tol=0.10,
+                               label="stepped cylinder boolean 90°")
+
+    def test_direct_cut_stepped_cylinder_180(self):
+        """Direct 180° cut on a stepped cylinder."""
+        base = cq.Workplane("XY").cylinder(10, 25)
+        mid  = base.faces(">Z").workplane().cylinder(15, 18)
+        neck = mid.faces(">Z").workplane().cylinder(8, 12)
+        top  = neck.faces(">Z").workplane().cylinder(12, 20)
+        shape = top.val().wrapped
+        origin = self._origin_for(shape, AXIS_MAP["z"])
+        result = cut_part_direct(shape, 180, AXIS_MAP["z"], origin)
+        self._assert_valid_cut(shape, result, 180, tol=0.10,
+                               label="stepped cylinder direct 180°")
+
+    # ── Box with internal cavity (mold-like) ────────────────────────
+
+    def _make_box_with_cavity(self):
+        """Box with a spherical internal cavity (mold shape)."""
+        box = cq.Workplane("XY").box(50, 50, 50)
+        cavity = cq.Workplane("XY").sphere(15)
+        return box.cut(cavity).val().wrapped
+
+    def test_boolean_cut_box_with_cavity(self):
+        """Box with a spherical internal cavity — boolean cut."""
+        shape = self._make_box_with_cavity()
+        cutter = make_cutter(self._get_bbox_vals(shape), 90, AXIS_MAP["z"])
+        result = cut_assembly(shape, cutter)
+        self._assert_valid_cut(shape, result, 90, tol=0.10,
+                               label="box with cavity boolean 90°")
+
+    def test_direct_cut_box_with_cavity(self):
+        """Direct cut on box with spherical internal cavity."""
+        shape = self._make_box_with_cavity()
+        origin = self._origin_for(shape, AXIS_MAP["z"])
+        result = cut_part_direct(shape, 90, AXIS_MAP["z"], origin)
+        self._assert_valid_cut(shape, result, 90, tol=0.10,
+                               label="box with cavity direct 90°")
+
+    # ── Hex nut (polygon with central bore) ─────────────────────────
+
+    def test_boolean_cut_hex_nut(self):
+        """Hexagonal nut — polygon extrusion with central bore."""
+        nut = (cq.Workplane("XY")
+               .polygon(6, 30).extrude(12)
+               .faces(">Z").workplane().hole(14))
+        shape = nut.val().wrapped
+        for angle in [45, 90, 180]:
+            cutter = make_cutter(self._get_bbox_vals(shape), angle, AXIS_MAP["z"])
+            result = cut_assembly(shape, cutter)
+            self._assert_valid_cut(shape, result, angle, tol=0.10,
+                                   label=f"hex nut boolean {angle}°")
+
+    def test_direct_cut_hex_nut(self):
+        """Direct cut on a hex nut at multiple angles."""
+        nut = (cq.Workplane("XY")
+               .polygon(6, 30).extrude(12)
+               .faces(">Z").workplane().hole(14))
+        shape = nut.val().wrapped
+        origin = self._origin_for(shape, AXIS_MAP["z"])
+        for angle in [45, 90, 180]:
+            result = cut_part_direct(shape, angle, AXIS_MAP["z"], origin)
+            self._assert_valid_cut(shape, result, angle, tol=0.10,
+                                   label=f"hex nut direct {angle}°")
+
+    # ── Cone frustum ────────────────────────────────────────────────
+
+    def test_boolean_cut_cone_frustum(self):
+        """Truncated cone (frustum) — tapered surface boolean cut."""
+        frustum = cq.Solid.makeCone(30, 10, 50,
+                                    pnt=cq.Vector(0, 0, -25),
+                                    dir=cq.Vector(0, 0, 1))
+        shape = frustum.wrapped
+        cutter = make_cutter(self._get_bbox_vals(shape), 90, AXIS_MAP["z"])
+        result = cut_assembly(shape, cutter)
+        self._assert_valid_cut(shape, result, 90, tol=0.10,
+                               label="cone frustum boolean 90°")
+
+    def test_direct_cut_cone_frustum(self):
+        """Direct cut on a truncated cone."""
+        frustum = cq.Solid.makeCone(30, 10, 50,
+                                    pnt=cq.Vector(0, 0, -25),
+                                    dir=cq.Vector(0, 0, 1))
+        shape = frustum.wrapped
+        origin = self._origin_for(shape, AXIS_MAP["z"])
+        result = cut_part_direct(shape, 120, AXIS_MAP["z"], origin)
+        self._assert_valid_cut(shape, result, 120, tol=0.10,
+                               label="cone frustum direct 120°")
+
+    # ── Cylinder with helical groove (thread-like) ──────────────────
+
+    def test_boolean_cut_grooved_cylinder(self):
+        """Cylinder with 4 longitudinal grooves (keyway-like features)."""
+        import math as _m
+        cyl = cq.Workplane("XY").cylinder(60, 20)
+        # Cut 4 longitudinal slots
+        for i in range(4):
+            ang = _m.radians(90 * i)
+            cx = _m.cos(ang) * 18
+            cy = _m.sin(ang) * 18
+            slot = (cq.Workplane("XY")
+                    .transformed(offset=(cx, cy, 0))
+                    .box(4, 4, 60))
+            cyl = cyl.cut(slot)
+        shape = cyl.val().wrapped
+        cutter = make_cutter(self._get_bbox_vals(shape), 90, AXIS_MAP["z"])
+        result = cut_assembly(shape, cutter)
+        self._assert_valid_cut(shape, result, 90, tol=0.12,
+                               label="grooved cylinder boolean 90°")
+
+    def test_direct_cut_grooved_cylinder(self):
+        """Direct cut on a grooved cylinder."""
+        import math as _m
+        cyl = cq.Workplane("XY").cylinder(60, 20)
+        for i in range(4):
+            ang = _m.radians(90 * i)
+            cx = _m.cos(ang) * 18
+            cy = _m.sin(ang) * 18
+            slot = (cq.Workplane("XY")
+                    .transformed(offset=(cx, cy, 0))
+                    .box(4, 4, 60))
+            cyl = cyl.cut(slot)
+        shape = cyl.val().wrapped
+        origin = self._origin_for(shape, AXIS_MAP["z"])
+        result = cut_part_direct(shape, 90, AXIS_MAP["z"], origin)
+        self._assert_valid_cut(shape, result, 90, tol=0.12,
+                               label="grooved cylinder direct 90°")
+
+    # ── L-shaped bracket ────────────────────────────────────────────
+
+    def _make_l_bracket(self):
+        """Build an L-shaped bracket by unioning two boxes."""
+        arm1 = cq.Workplane("XY").box(40, 10, 50)
+        arm2 = cq.Workplane("XY").transformed(offset=(-15, 15, 0)).box(10, 20, 50)
+        return arm1.union(arm2).val().wrapped
+
+    def test_boolean_cut_l_bracket(self):
+        """L-shaped bracket — non-symmetric cross section."""
+        shape = self._make_l_bracket()
+        cutter = make_cutter(self._get_bbox_vals(shape), 90, AXIS_MAP["z"])
+        result = cut_assembly(shape, cutter)
+        assert result is not None and not result.IsNull()
+        verts, faces = tessellate_shape(result, tolerance=0.1)
+        assert len(verts) > 0 and len(faces) > 0
+
+    def test_direct_cut_l_bracket(self):
+        """Direct cut on an L-shaped bracket."""
+        shape = self._make_l_bracket()
+        origin = self._origin_for(shape, AXIS_MAP["z"])
+        result = cut_part_direct(shape, 90, AXIS_MAP["z"], origin)
+        assert result is not None and not result.IsNull()
+        verts, faces = tessellate_shape(result, tolerance=0.1)
+        assert len(verts) > 0 and len(faces) > 0
+
+    # ── Full assembly: concentric + cut + export round-trip ─────────
+
+    def test_full_pipeline_complex_assembly(self, tmp_dir):
+        """End-to-end: build complex concentric assembly, cut, export, reimport."""
+        # Outer: box with holes
+        outer = (cq.Workplane("XY").box(80, 80, 30)
+                 .faces(">Z").workplane()
+                 .pushPoints([(20, 20), (-20, 20), (20, -20), (-20, -20)])
+                 .hole(8))
+        # Mid: hollow cylinder
+        mid = (cq.Workplane("XY").cylinder(30, 25)
+               .faces(">Z").workplane().hole(40))
+        # Inner: hex nut
+        inner = (cq.Workplane("XY").polygon(6, 16).extrude(30)
+                 .faces(">Z").workplane().hole(8))
+
+        parts = [(outer, "outer_1"), (mid, "mid_1"), (inner, "inner_1")]
+        assy, info = stack_parts(parts, AXIS_MAP["z"], gap=0)
+
+        builder = BRep_Builder()
+        compound = TopoDS_Compound()
+        builder.MakeCompound(compound)
+        for name, shape, loc, rgb, *_rest in info:
+            builder.Add(compound, apply_location(shape, loc))
+
+        # Boolean cut
+        cutter = make_cutter(self._get_bbox_vals(compound), 90, AXIS_MAP["z"])
+        result = cut_assembly(compound, cutter)
+        assert result is not None and not result.IsNull()
+
+        # Export and reimport
+        out_path = os.path.join(tmp_dir, "complex_assembly_cut.step")
+        export_shape_step(result, out_path)
+        assert os.path.exists(out_path)
+        assert os.path.getsize(out_path) > 500
+
+        # Reimport should succeed
+        reimported = cq.importers.importStep(out_path)
+        assert reimported is not None
+
+    # ── Stress: many-hole plate ─────────────────────────────────────
+
+    def test_boolean_cut_perforated_plate(self):
+        """Plate with a 3x3 grid of holes — many boolean features."""
+        plate = cq.Workplane("XY").box(60, 60, 8)
+        for x in [-18, 0, 18]:
+            for y in [-18, 0, 18]:
+                plate = (plate.faces(">Z").workplane()
+                         .transformed(offset=(x, y, 0))
+                         .hole(8))
+        shape = plate.val().wrapped
+        cutter = make_cutter(self._get_bbox_vals(shape), 90, AXIS_MAP["z"])
+        result = cut_assembly(shape, cutter)
+        self._assert_valid_cut(shape, result, 90, tol=0.12,
+                               label="perforated plate boolean 90°")
+
+    def test_direct_cut_perforated_plate(self):
+        """Direct cut on a perforated plate."""
+        plate = cq.Workplane("XY").box(60, 60, 8)
+        for x in [-18, 0, 18]:
+            for y in [-18, 0, 18]:
+                plate = (plate.faces(">Z").workplane()
+                         .transformed(offset=(x, y, 0))
+                         .hole(8))
+        shape = plate.val().wrapped
+        origin = self._origin_for(shape, AXIS_MAP["z"])
+        result = cut_part_direct(shape, 90, AXIS_MAP["z"], origin)
+        self._assert_valid_cut(shape, result, 90, tol=0.12,
+                               label="perforated plate direct 90°")
+
+    # ── Off-axis cutting ────────────────────────────────────────────
+
+    def test_complex_shape_x_axis_cut(self):
+        """Cut a drilled sphere along the X axis instead of Z."""
+        sphere = cq.Workplane("XY").sphere(25)
+        bore = cq.Workplane("XY").cylinder(60, 5)
+        shape = sphere.cut(bore).val().wrapped
+        for method in ["boolean", "direct"]:
+            if method == "boolean":
+                cutter = make_cutter(self._get_bbox_vals(shape), 90, AXIS_MAP["x"])
+                result = cut_assembly(shape, cutter)
+            else:
+                origin = self._origin_for(shape, AXIS_MAP["x"])
+                result = cut_part_direct(shape, 90, AXIS_MAP["x"], origin)
+            assert result is not None and not result.IsNull(), (
+                f"X-axis {method} cut failed"
+            )
+            verts, faces = tessellate_shape(result, tolerance=0.1)
+            assert len(verts) > 0, f"X-axis {method} cut has no vertices"
+
+    def test_complex_shape_y_axis_cut(self):
+        """Cut a stepped cylinder along the Y axis."""
+        base = cq.Workplane("XY").cylinder(10, 25)
+        top  = base.faces(">Z").workplane().cylinder(20, 15)
+        shape = top.val().wrapped
+        for method in ["boolean", "direct"]:
+            if method == "boolean":
+                cutter = make_cutter(self._get_bbox_vals(shape), 90, AXIS_MAP["y"])
+                result = cut_assembly(shape, cutter)
+            else:
+                origin = self._origin_for(shape, AXIS_MAP["y"])
+                result = cut_part_direct(shape, 90, AXIS_MAP["y"], origin)
+            assert result is not None and not result.IsNull(), (
+                f"Y-axis {method} cut failed"
+            )
+            verts, faces = tessellate_shape(result, tolerance=0.1)
+            assert len(verts) > 0, f"Y-axis {method} cut has no vertices"
+
+    # ── Edge-case angles on complex geometry ────────────────────────
+
+    def test_thin_wedge_on_torus(self):
+        """Very thin 15° cut on a torus — near-degenerate wedge."""
+        shape = self._make_torus()
+        cutter = make_cutter(self._get_bbox_vals(shape), 15, AXIS_MAP["z"])
+        result = cut_assembly(shape, cutter)
+        self._assert_valid_cut(shape, result, 15, tol=0.10,
+                               label="torus thin wedge 15°")
+
+    def test_near_full_removal_on_drilled_sphere(self):
+        """330° cut on drilled sphere — nearly everything removed."""
+        sphere = cq.Workplane("XY").sphere(25)
+        bore = cq.Workplane("XY").cylinder(60, 5)
+        shape = sphere.cut(bore).val().wrapped
+        origin = self._origin_for(shape, AXIS_MAP["z"])
+        result = cut_part_direct(shape, 330, AXIS_MAP["z"], origin)
+        self._assert_valid_cut(shape, result, 330, tol=0.15,
+                               label="drilled sphere direct 330°")
+
+    # ── STL mesh cutting (mesh → solid → cut) ───────────────────────
+
+    def test_boolean_cut_stl_mesh_box(self, tmp_dir):
+        """Load an STL mesh, convert to solid, and boolean-cut it."""
+        # Create a moderately complex STL
+        obj = (cq.Workplane("XY").box(40, 40, 20)
+               .faces(">Z").workplane().hole(12))
+        stl_path = os.path.join(tmp_dir, "complex_mesh.stl")
+        obj.val().exportStl(stl_path)
+
+        wp, name = load_part(stl_path)
+        shape = wp.val().wrapped
+        cutter = make_cutter(self._get_bbox_vals(shape), 90, AXIS_MAP["z"])
+        result = cut_assembly(shape, cutter)
+        assert result is not None and not result.IsNull()
+        verts, faces = tessellate_shape(result, tolerance=0.2)
+        assert len(verts) > 0 and len(faces) > 0
+
+    # ── Segment cuts on complex shapes ──────────────────────────────
+
+    def test_segment_cut_on_hollow_cylinder(self):
+        """Direct segment (a/b) splitting on a hollow cylinder."""
+        tube = (cq.Workplane("XY").cylinder(50, 20)
+                .faces(">Z").workplane().hole(30))
+        shape = tube.val().wrapped
+        orig_vol = self._get_volume(shape)
+        origin = self._origin_for(shape, AXIS_MAP["z"])
+
+        seg_a = cut_part_direct_segment(shape, 90, AXIS_MAP["z"], origin, "a")
+        seg_b = cut_part_direct_segment(shape, 90, AXIS_MAP["z"], origin, "b")
+        assert seg_a is not None and seg_b is not None
+
+        vol_a = self._get_volume(seg_a)
+        vol_b = self._get_volume(seg_b)
+        # Combined should approximate 75% of original (90° removed)
+        combined = vol_a + vol_b
+        expected = orig_vol * (270.0 / 360.0)
+        assert abs(combined - expected) / expected < 0.10, (
+            f"Segment volumes {vol_a:.1f}+{vol_b:.1f}={combined:.1f} "
+            f"vs expected {expected:.1f}"
+        )
