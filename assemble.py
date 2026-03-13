@@ -50,6 +50,7 @@ from cadquery import Assembly, Location, Vector, Color
 from OCP.STEPControl import STEPControl_Writer, STEPControl_AsIs
 from OCP.TopoDS import TopoDS_Shape, TopoDS_Compound, TopoDS
 from OCP.BRep import BRep_Builder, BRep_Tool
+from OCP.BRepTools import BRepTools
 from OCP.BRepBndLib import BRepBndLib
 from OCP.Bnd import Bnd_Box
 from OCP.gp import gp_Trsf, gp_Vec, gp_Ax1, gp_Ax2, gp_Pnt, gp_Dir
@@ -483,7 +484,7 @@ def _mesh_shell_to_solid(shape):
     return shape
 
 
-def load_mesh_file(filepath):
+def load_mesh_file(filepath, require_solid=True):
     """Load a mesh file and convert to a CadQuery solid shape.
 
     Supports .stl, .obj, .ply, .3mf. Non-STL formats are converted to STL
@@ -513,14 +514,14 @@ def load_mesh_file(filepath):
         reader = StlAPI_Reader()
         shape = TopoDS_Shape()
         reader.Read(shape, stl_path)
-        solid = _mesh_shell_to_solid(shape)
-        return cq.Workplane("XY").newObject([cq.Shape(solid)])
+        out_shape = _mesh_shell_to_solid(shape) if require_solid else shape
+        return cq.Workplane("XY").newObject([cq.Shape(out_shape)])
     finally:
         if tmp_stl:
             os.unlink(tmp_stl.name)
 
 
-def load_part(filepath):
+def load_part(filepath, require_solid=True):
     """Load any supported CAD or mesh file, return (cq.Workplane, name)."""
     ext = os.path.splitext(filepath)[1].lower()
     name = os.path.splitext(os.path.basename(filepath))[0]
@@ -528,7 +529,7 @@ def load_part(filepath):
     if ext in CAD_EXTENSIONS:
         wp = load_cad_file(filepath)
     elif ext in MESH_EXTENSIONS:
-        wp = load_mesh_file(filepath)
+        wp = load_mesh_file(filepath, require_solid=require_solid)
     else:
         raise ValueError(
             f"Unsupported format '{ext}'. Supported: "
@@ -2270,6 +2271,81 @@ def export_shape(shape, filepath):
     )
 
 
+
+
+def _faces_to_triangles(faces):
+    """Convert tessellation face records to an (N, 3) triangle index array."""
+    tris = []
+    for face in faces:
+        row = list(face)
+        if not row:
+            continue
+        n = int(row[0])
+        if n < 3:
+            continue
+        for i in range(1, n - 1):
+            tris.append([int(row[1]), int(row[i + 1]), int(row[i + 2])])
+    return np.array(tris, dtype=np.int64) if tris else np.empty((0, 3), dtype=np.int64)
+
+
+def export_part_native(shape, output_path, source_ext, is_mesh):
+    """Export a transformed part using the original file format where possible."""
+    ext = source_ext.lower()
+
+    if not is_mesh:
+        if ext in {".step", ".stp"}:
+            export_shape_step(shape, output_path)
+            return
+        if ext == ".brep":
+            BRepTools.Write_s(shape, output_path)
+            return
+        if ext in {".iges", ".igs"}:
+            from OCP.IGESControl import IGESControl_Writer
+            writer = IGESControl_Writer()
+            writer.AddShape(shape)
+            if not writer.Write(output_path):
+                raise RuntimeError(f"IGES write failed: {output_path}")
+            return
+        # fallback for unsupported CAD writers
+        export_shape_step(shape, output_path)
+        return
+
+    # Mesh export path: tessellate once and write using trimesh to native mesh format
+    import trimesh
+
+    verts, faces = tessellate_shape(shape, tolerance=0.2, angular=0.5)
+    tri = _faces_to_triangles(faces)
+    if len(verts) == 0 or len(tri) == 0:
+        raise RuntimeError(f"Unable to tessellate mesh part for export: {output_path}")
+
+    mesh = trimesh.Trimesh(vertices=verts, faces=tri, process=False)
+    mesh.export(output_path)
+
+
+def export_transformed_parts(parts, output_dir):
+    """Write pre-stacking transformed parts to *output_dir* in native formats."""
+    os.makedirs(output_dir, exist_ok=True)
+    used_names = {}
+
+    print(f"\nExporting transformed parts (--parts): {output_dir}")
+    for part in parts:
+        name = part["name"]
+        shape = part["shape"]
+        src_ext = part["source_ext"]
+        is_mesh = part["is_mesh"]
+
+        suffix = used_names.get(name, 0)
+        used_names[name] = suffix + 1
+        out_name = f"{name}_{suffix}{src_ext}" if suffix else f"{name}{src_ext}"
+
+        out_ext = src_ext.lower()
+        if (not is_mesh) and out_ext not in {".step", ".stp", ".iges", ".igs", ".brep"}:
+            out_name = os.path.splitext(out_name)[0] + ".step"
+
+        out_path = os.path.join(output_dir, out_name)
+        export_part_native(shape, out_path, os.path.splitext(out_name)[1], is_mesh)
+        print(f"  Wrote: {out_path}")
+
 def build_moved_compound(part_info):
     """Build a compound from positioned parts in part_info."""
     builder = BRep_Builder()
@@ -2623,29 +2699,37 @@ def run_pipeline(args):
 
     print(f"Loading {len(valid_paths)} part(s)...")
     parts = []
+    loaded_parts_for_export = []
+    # FSTL-style fast path: keep mesh as triangle shells during load and avoid
+    # expensive mesh->solid sewing unless a downstream operation truly needs it.
+    require_mesh_solids = False
+    max_workers = min(len(valid_paths), max(1, min(8, (os.cpu_count() or 4))))
+
     if len(valid_paths) > 1:
         # Parallel loading for multiple files
-        with ThreadPoolExecutor(max_workers=min(len(valid_paths), os.cpu_count() or 4)) as pool:
-            future_map = {pool.submit(load_part, fp): fp for fp in valid_paths}
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_map = {pool.submit(load_part, fp, require_solid=require_mesh_solids): fp for fp in valid_paths}
             # Collect results in original order
             results = {}
             for future in as_completed(future_map):
                 fp = future_map[future]
                 try:
                     wp, name = future.result()
-                    results[fp] = (wp, name, is_mesh_file(fp))
+                    results[fp] = (wp, name, is_mesh_file(fp), os.path.splitext(fp)[1])
                     print(f"  Loaded: {name}")
                 except Exception as e:
                     print(f"  ERROR loading '{fp}': {e}")
             # Preserve input order
             for fp in valid_paths:
                 if fp in results:
-                    parts.append(results[fp])
+                    parts.append(results[fp][:3])
+                    loaded_parts_for_export.append({"name": results[fp][1], "shape": results[fp][0].val().wrapped, "is_mesh": results[fp][2], "source_ext": results[fp][3]})
     else:
         for filepath in valid_paths:
             try:
-                wp, name = load_part(filepath)
+                wp, name = load_part(filepath, require_solid=require_mesh_solids)
                 parts.append((wp, name, is_mesh_file(filepath)))
+                loaded_parts_for_export.append({"name": name, "shape": wp.val().wrapped, "is_mesh": is_mesh_file(filepath), "source_ext": os.path.splitext(filepath)[1]})
                 print(f"  Loaded: {name}")
             except Exception as e:
                 print(f"  ERROR loading '{filepath}': {e}")
@@ -2663,6 +2747,12 @@ def run_pipeline(args):
     if getattr(args, "cyl", False):
         print("\nOrient parts for cylinder (--cyl)...")
         parts = orient_to_cylinder(parts, gap=args.gap)
+        # orient_to_cylinder creates transformed copies; refresh export geometry.
+        for i, entry in enumerate(parts):
+            loaded_parts_for_export[i]["shape"] = entry[0].val().wrapped
+
+    if getattr(args, "parts", None):
+        export_transformed_parts(loaded_parts_for_export, args.parts)
 
     # 2. Stack parts
     axis_vec = AXIS_MAP[args.axis]
@@ -2950,6 +3040,10 @@ def main():
     parser.add_argument(
         "--validate-max-mismatch", type=float, default=0.01,
         help="Maximum normalized pixel mismatch tolerated by validation (default: 0.01)",
+    )
+    parser.add_argument(
+        "--parts", nargs="?", const="parts", default=None,
+        help="Export rotated/scaled pre-stack parts to a directory (default: ./parts).",
     )
     parser.add_argument(
         "--debug", action="store_true",
