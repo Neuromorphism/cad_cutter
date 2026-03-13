@@ -49,6 +49,9 @@ pip install -r requirements.txt
 | NetworkX ≥ 3.0 | Trimesh dependency |
 | lxml ≥ 4.9 | 3MF support |
 | pytest ≥ 7.0 | Test framework |
+| `libgl1` (system package) | Provides `libGL.so.1` needed by CadQuery/OCP at import time |
+
+> Linux: install once with `sudo apt-get install -y libgl1` (the included `setup_venv.sh` now attempts this automatically when run as root).
 
 ---
 
