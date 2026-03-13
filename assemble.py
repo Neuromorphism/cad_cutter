@@ -445,14 +445,30 @@ def _mesh_shell_to_solid(shape):
             elif sewn.ShapeType() == TopAbs_SOLID:
                 return sewn
             elif sewn.ShapeType() == TopAbs_COMPOUND:
-                # Try all shells inside the compound
+                # Try all shells inside the compound and pick the largest
+                from OCP.BRepBndLib import BRepBndLib as _BRepBndLib
+                from OCP.Bnd import Bnd_Box as _Bnd_Box
                 explorer = TopExp_Explorer(sewn, TopAbs_SHELL)
+                best_solid = None
+                best_diag = -1.0
                 while explorer.More():
                     shell = TopoDS.Shell_s(explorer.Current())
                     maker = BRepBuilderAPI_MakeSolid(shell)
                     if maker.IsDone():
-                        return maker.Solid()
+                        candidate = maker.Solid()
+                        bb = _Bnd_Box()
+                        _BRepBndLib.Add_s(candidate, bb)
+                        if not bb.IsVoid():
+                            vals = bb.Get()
+                            diag = ((vals[3]-vals[0])**2
+                                    + (vals[4]-vals[1])**2
+                                    + (vals[5]-vals[2])**2) ** 0.5
+                            if diag > best_diag:
+                                best_diag = diag
+                                best_solid = candidate
                     explorer.Next()
+                if best_solid is not None:
+                    return best_solid
         except Exception:
             continue
 
