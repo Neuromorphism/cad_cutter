@@ -50,6 +50,7 @@ from assemble import (
     _get_xy_diameter,
     validate_planar_cut_projection,
     run_validation_pipeline,
+    _render_topdown_mask,
     AXIS_MAP,
     MATERIAL_COLORS,
 )
@@ -3283,6 +3284,55 @@ class TestComplexMeshCutting:
 
 
 class TestValidationPipeline:
+    def test_ab_split_render_matches_composited_sides(self):
+        """Combined (mid + inner_a + inner_b) render should match composited side renders."""
+        from OCP.BRep import BRep_Builder
+        from OCP.TopoDS import TopoDS_Compound
+
+        def make_compound(shapes):
+            builder = BRep_Builder()
+            compound = TopoDS_Compound()
+            builder.MakeCompound(compound)
+            for s in shapes:
+                if s is not None and not s.IsNull():
+                    builder.Add(compound, s)
+            return compound
+
+        cut_angle = 90
+        axis_vec = AXIS_MAP["z"]
+
+        mid = cq.Workplane("XY").cylinder(40, 18).val().wrapped
+        inner_base = cq.Workplane("XY").cylinder(40, 8).val().wrapped
+
+        full = make_compound([mid, inner_base])
+        bbox_vals = get_bounding_box(full)
+        _, _, origin_pt, _ = _cutter_params(bbox_vals, axis_vec)
+
+        cut_mid = cut_part_direct(mid, cut_angle, axis_vec, origin_pt)
+        cut_inner_a = cut_part_direct_segment(inner_base, cut_angle, axis_vec, origin_pt, "a")
+        cut_inner_b = cut_part_direct_segment(inner_base, cut_angle, axis_vec, origin_pt, "b")
+
+        combined_shape = make_compound([cut_mid, cut_inner_a, cut_inner_b])
+        side_a_shape = make_compound([cut_mid, cut_inner_a])
+        side_b_shape = make_compound([cut_mid, cut_inner_b])
+
+        reference_bounds = get_bounding_box(combined_shape)
+        combined_mask = _render_topdown_mask(combined_shape, reference_bounds, resolution=512)
+        side_a_mask = _render_topdown_mask(side_a_shape, reference_bounds, resolution=512)
+        side_b_mask = _render_topdown_mask(side_b_shape, reference_bounds, resolution=512)
+
+        w = combined_mask.shape[1]
+        split = w // 2
+        pasted = np.zeros_like(combined_mask)
+        pasted[:, :split] = side_a_mask[:, :split]
+        pasted[:, split:] = side_b_mask[:, split:]
+
+        mismatch = np.logical_xor(combined_mask, pasted).sum()
+        mismatch_ratio = mismatch / max(1, pasted.sum())
+        assert mismatch_ratio < 0.02, (
+            f"A/B split compositing mismatch too high: {mismatch_ratio:.4f}"
+        )
+
     def test_validate_planar_cut_projection_y0(self):
         shape = cq.Workplane("XY").box(40, 40, 20).val().wrapped
         ok, mismatch_ratio, message = validate_planar_cut_projection(
