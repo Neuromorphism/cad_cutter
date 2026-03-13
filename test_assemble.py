@@ -40,6 +40,7 @@ from assemble import (
     _cutter_params,
     export_assembly_step,
     export_shape_step,
+    export_shape,
     tessellate_shape,
     expand_inputs,
     orient_to_cylinder,
@@ -960,6 +961,20 @@ class TestStepExport:
         reimported = cq.importers.importStep(out_path)
         shape = reimported.val().wrapped
         assert not shape.IsNull()
+
+    def test_shape_export_stl_is_reimportable(self, box_step, tmp_dir):
+        """Export STL from a shape and ensure it can be loaded back."""
+        wp, _name = load_part(box_step)
+        shape = wp.val().wrapped
+
+        out_path = os.path.join(tmp_dir, "shape_out.stl")
+        export_shape(shape, out_path)
+        assert os.path.exists(out_path)
+        assert os.path.getsize(out_path) > 100
+
+        reimported_wp, _ = load_part(out_path)
+        re_shape = reimported_wp.val().wrapped
+        assert not re_shape.IsNull()
 
     def test_concentric_export_reimport(self, concentric_parts, tmp_dir):
         """Export a concentric assembly and reimport."""
