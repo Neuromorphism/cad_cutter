@@ -17,3 +17,6 @@ lxml>=4.9
 
 # Testing
 pytest>=7.0
+
+# Web UI
+flask>=3.0

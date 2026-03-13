@@ -1,0 +1,16 @@
+body { margin: 0; font-family: Arial, sans-serif; background:#1a1d24; color:#edf0f7; }
+header { padding: 10px 14px; border-bottom:1px solid #323847; display:flex; justify-content:space-between; align-items:center; }
+.controls { display:flex; gap:10px; align-items:center; }
+main { display:grid; grid-template-columns:300px 1fr; height: calc(100vh - 68px); }
+aside { border-right:1px solid #323847; padding:12px; overflow:auto; }
+#file-list { max-height:300px; overflow:auto; border:1px solid #323847; padding:8px; }
+.file-row { display:flex; gap:8px; align-items:center; margin-bottom:6px; }
+.stages { display:grid; gap:8px; margin-top:8px; }
+.workspace { display:flex; flex-direction:column; gap:8px; padding:8px; }
+#main-canvas { flex: 1; min-height:340px; border:1px solid #323847; }
+#thumbnails { display:flex; overflow-x:auto; gap:8px; min-height:180px; border:1px solid #323847; padding:8px; }
+.thumb { min-width:220px; border:1px solid #3a4254; padding:6px; background:#11151c; }
+.thumb-canvas { height:110px; }
+.thumb-controls { display:grid; grid-template-columns:repeat(2,1fr); gap:4px; font-size:12px; }
+input, select, button { background:#242b38; color:#edf0f7; border:1px solid #41495a; border-radius:4px; }
+button { padding:6px 8px; cursor:pointer; }

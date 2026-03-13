@@ -96,6 +96,23 @@ Parts without a recognized name are treated as sequential outer parts.
 
 ---
 
+
+### Web UI
+
+Run the interactive browser UI (default port **12080**):
+
+```bash
+python web_ui.py
+# then open http://localhost:12080
+```
+
+The UI supports:
+- selecting parts from the working directory
+- side-scrolling 3D thumbnails (orbit mouse controls)
+- a main 3D workspace with combined view and tile view
+- per-part manual rotation (X/Y/Z) and manual scaling near each thumbnail
+- pipeline-stage buttons for auto-orient, auto-scale, cut inner from mid, export parts, render whole, and export whole
+
 ## Command-Line Reference
 
 ```

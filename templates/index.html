@@ -1,0 +1,51 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>CAD Cutter UI</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <h1>CAD Cutter Pipeline UI</h1>
+    <div class="controls">
+      <button id="refresh-files">Refresh Files</button>
+      <button id="load-selected">Load Selected</button>
+      <label>Axis
+        <select id="axis-select"><option value="x">X</option><option value="y">Y</option><option value="z" selected>Z</option></select>
+      </label>
+      <label>Gap <input id="gap-input" type="number" step="0.1" value="0"/></label>
+    </div>
+  </header>
+
+  <main>
+    <aside>
+      <h3>Available Parts</h3>
+      <div id="file-list"></div>
+      <h3>Pipeline Stages</h3>
+      <div class="stages">
+        <button data-stage="auto_orient">Auto-orient parts</button>
+        <button data-stage="auto_scale">Auto-scale parts</button>
+        <button data-stage="cut_inner_from_mid">Cut inner from mid</button>
+        <button data-stage="export_parts">Export parts</button>
+        <button data-stage="render_whole">Render whole</button>
+        <button data-stage="export_whole">Export whole</button>
+      </div>
+      <p id="status"></p>
+    </aside>
+
+    <section class="workspace">
+      <div class="view-toolbar">
+        <button id="combined-view">Combined View</button>
+        <button id="tile-view">Tile View</button>
+      </div>
+      <div id="main-canvas"></div>
+      <h3>Part Thumbnails (scroll)</h3>
+      <div id="thumbnails"></div>
+    </section>
+  </main>
+
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>
