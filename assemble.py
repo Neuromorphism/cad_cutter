@@ -2461,6 +2461,146 @@ def render_assembly(parts_data, output_path, resolution=2048, cut_shape=None):
     print(f"Render saved: {output_path}")
 
 
+def cut_shape_by_plane(shape, plane_axis="y", plane_value=0.0, keep_negative=True):
+    """Cut *shape* by an axis-aligned plane and keep one side.
+
+    keep_negative=True keeps the <= plane side.
+    """
+    xmin, ymin, zmin, xmax, ymax, zmax = get_bounding_box(shape)
+    x_span = max(1e-6, xmax - xmin)
+    y_span = max(1e-6, ymax - ymin)
+    z_span = max(1e-6, zmax - zmin)
+    pad = max(x_span, y_span, z_span) * 2.0
+
+    box_dx = x_span + 2 * pad
+    box_dy = y_span + 2 * pad
+    box_dz = z_span + 2 * pad
+
+    cx = (xmin + xmax) * 0.5
+    cy = (ymin + ymax) * 0.5
+    cz = (zmin + zmax) * 0.5
+
+    if plane_axis == "x":
+        cut_center_x = plane_value + (box_dx * 0.5 if keep_negative else -box_dx * 0.5)
+        cutter = cq.Workplane("XY").box(box_dx, box_dy, box_dz).translate((cut_center_x, cy, cz))
+    elif plane_axis == "y":
+        cut_center_y = plane_value + (box_dy * 0.5 if keep_negative else -box_dy * 0.5)
+        cutter = cq.Workplane("XY").box(box_dx, box_dy, box_dz).translate((cx, cut_center_y, cz))
+    elif plane_axis == "z":
+        cut_center_z = plane_value + (box_dz * 0.5 if keep_negative else -box_dz * 0.5)
+        cutter = cq.Workplane("XY").box(box_dx, box_dy, box_dz).translate((cx, cy, cut_center_z))
+    else:
+        raise ValueError(f"Unsupported plane_axis '{plane_axis}'. Use x/y/z.")
+
+    return cut_assembly(shape, cutter.val().wrapped)
+
+
+def _render_topdown_mask(shape, reference_bounds, resolution=512):
+    """Render a deterministic top-down binary mask for validation."""
+    import pyvista as pv
+
+    verts, faces = tessellate_shape(shape, tolerance=0.05)
+    if len(verts) == 0:
+        return np.zeros((resolution, resolution), dtype=bool)
+
+    pv.OFF_SCREEN = True
+    plotter = pv.Plotter(off_screen=True, window_size=[resolution, resolution])
+    mesh = pv.PolyData(verts, faces.ravel())
+    plotter.add_mesh(mesh, color=(1, 1, 1), lighting=False)
+    plotter.set_background("black")
+
+    xmin, ymin, zmin, xmax, ymax, zmax = reference_bounds
+    cx = (xmin + xmax) * 0.5
+    cy = (ymin + ymax) * 0.5
+    cz = (zmin + zmax) * 0.5
+    span_xy = max(xmax - xmin, ymax - ymin)
+    span_z = max(1e-6, zmax - zmin)
+
+    cam = plotter.camera
+    cam.parallel_projection = True
+    cam.parallel_scale = max(1e-6, span_xy * 0.52)
+    cam.position = (cx, cy, zmax + 4.0 * span_z + 1.0)
+    cam.focal_point = (cx, cy, cz)
+    cam.up = (0, 1, 0)
+
+    img = plotter.screenshot(return_img=True)
+    plotter.close()
+    return img[..., :3].max(axis=2) > 0
+
+
+def validate_planar_cut_projection(shape, plane_axis="y", plane_value=0.0,
+                                   keep_negative=True, resolution=512,
+                                   max_mismatch_ratio=0.01):
+    """Validate that a 3D half-space cut matches a 2D post-render half-image mask."""
+    bounds = get_bounding_box(shape)
+    cut_shape = cut_shape_by_plane(
+        shape, plane_axis=plane_axis, plane_value=plane_value, keep_negative=keep_negative,
+    )
+    if cut_shape is None:
+        return False, 1.0, "Cut removed entire shape."
+
+    cut_mask = _render_topdown_mask(cut_shape, bounds, resolution=resolution)
+    full_mask = _render_topdown_mask(shape, bounds, resolution=resolution)
+    expected_mask = full_mask.copy()
+
+    xmin, ymin, _zmin, xmax, ymax, _zmax = bounds
+    if plane_axis == "y":
+        denom = max(1e-6, ymax - ymin)
+        row_plane = int(round((ymax - plane_value) / denom * (resolution - 1)))
+        row_plane = max(0, min(resolution, row_plane))
+        if keep_negative:
+            expected_mask[:row_plane, :] = False
+        else:
+            expected_mask[row_plane:, :] = False
+    elif plane_axis == "x":
+        denom = max(1e-6, xmax - xmin)
+        col_plane = int(round((plane_value - xmin) / denom * (resolution - 1)))
+        col_plane = max(0, min(resolution, col_plane))
+        if keep_negative:
+            expected_mask[:, col_plane:] = False
+        else:
+            expected_mask[:, :col_plane] = False
+    else:
+        return False, 1.0, "Top-down projection validation supports x/y planes only."
+
+    mismatch = np.logical_xor(cut_mask, expected_mask).sum()
+    norm = max(1, expected_mask.sum())
+    mismatch_ratio = mismatch / norm
+    if mismatch_ratio <= max_mismatch_ratio:
+        return True, mismatch_ratio, "ok"
+
+    return False, mismatch_ratio, (
+        f"Mismatch ratio {mismatch_ratio:.4f} exceeds limit {max_mismatch_ratio:.4f}."
+    )
+
+
+def run_validation_pipeline(shape, resolution=512, mismatch_ratio=0.01, debug=False):
+    """Run validation checks intended for automated tests and CLI --validate."""
+    checks = []
+    ok, ratio, msg = validate_planar_cut_projection(
+        shape,
+        plane_axis="y",
+        plane_value=0.0,
+        keep_negative=True,
+        resolution=resolution,
+        max_mismatch_ratio=mismatch_ratio,
+    )
+    checks.append({
+        "name": "plane_cut_projection_y0_topdown",
+        "ok": ok,
+        "mismatch_ratio": ratio,
+        "message": msg,
+    })
+
+    all_ok = all(c["ok"] for c in checks)
+    if debug:
+        for c in checks:
+            state = "PASS" if c["ok"] else "FAIL"
+            print(f"  [VALIDATE] {state} {c['name']}: {c['message']} (mismatch={c['mismatch_ratio']:.6f})")
+
+    return all_ok, checks
+
+
 # ===================================================================
 # Main pipeline
 # ===================================================================
@@ -2549,6 +2689,7 @@ def run_pipeline(args):
     # 3. Cut (optional) and export output file
     output_path = args.output
     cut_result_shape = None
+    moved_compound = build_moved_compound(part_info)
 
     if args.cut_angle is not None:
         # Export pre-cut assembly
@@ -2686,13 +2827,32 @@ def run_pipeline(args):
                 export_assembly_step(assy, output_path)
             except Exception as e:
                 print(f"  Assembly export fallback: {e}")
-                export_shape(build_moved_compound(part_info), output_path)
+                export_shape(moved_compound, output_path)
         else:
-            export_shape(build_moved_compound(part_info), output_path)
+            export_shape(moved_compound, output_path)
 
     print(f"  Output saved: {output_path}")
 
-    # 4. Render
+    # 4. Validate (optional)
+    if getattr(args, "validate", False):
+        print("\nRunning validation checks (--validate)...")
+        validate_target = cut_result_shape if cut_result_shape is not None else moved_compound
+        valid_ok, valid_checks = run_validation_pipeline(
+            validate_target,
+            resolution=getattr(args, "validate_resolution", 512),
+            mismatch_ratio=getattr(args, "validate_max_mismatch", 0.01),
+            debug=getattr(args, "debug", False),
+        )
+        for check in valid_checks:
+            status = "PASS" if check["ok"] else "FAIL"
+            print(
+                f"  [{status}] {check['name']} | mismatch={check['mismatch_ratio']:.6f} | {check['message']}"
+            )
+        if not valid_ok:
+            print("Validation failed.")
+            return 1
+
+    # 5. Render
     if args.render:
         print(f"\nRendering to {args.render} ({args.resolution}x{args.resolution})...")
         render_assembly(
@@ -2701,7 +2861,7 @@ def run_pipeline(args):
             cut_shape=cut_result_shape,
         )
 
-    # 5. Summary
+    # 6. Summary
     print("\n=== Pipeline Complete ===")
     print(f"  Parts:      {len(parts)}")
     print(f"  Cyl orient: {getattr(args, 'cyl', False)}")
@@ -2714,6 +2874,8 @@ def run_pipeline(args):
     print(f"  Output:     {output_path}")
     if args.render:
         print(f"  Render out: {args.render}")
+    if getattr(args, "validate", False):
+        print("  Validate:   enabled")
 
     return 0
 
@@ -2776,6 +2938,18 @@ def main():
              "25.4 or cm->inch by 2.54).  Parts with a '_dN' tag in the "
              "name (e.g. inner_2_3_d8) are scaled to diameter N in the "
              "outer-part unit system.",
+    )
+    parser.add_argument(
+        "--validate", action="store_true",
+        help="Run validation pipeline comparing a 3D y=0 plane cut against a 2D masked top-down render.",
+    )
+    parser.add_argument(
+        "--validate-resolution", type=int, default=512,
+        help="Resolution used for validation renders (default: 512)",
+    )
+    parser.add_argument(
+        "--validate-max-mismatch", type=float, default=0.01,
+        help="Maximum normalized pixel mismatch tolerated by validation (default: 0.01)",
     )
     parser.add_argument(
         "--debug", action="store_true",
