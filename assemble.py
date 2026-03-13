@@ -2441,8 +2441,8 @@ def render_assembly(parts_data, output_path, resolution=2048, cut_shape=None):
         plotter.add_mesh(floor, color=(0.95, 0.95, 0.95),
                          ambient=0.5, diffuse=0.5, specular=0.0)
 
-    # Camera
-    plotter.camera.zoom(1.4)
+    # Camera (slightly zoomed out so tall parts are less likely to clip top/bottom)
+    plotter.camera.zoom(0.9)
 
     # Ambient occlusion
     try:
