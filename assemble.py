@@ -419,7 +419,14 @@ def load_cad_file(filepath):
         shape = reader.OneShape()
         return cq.Workplane("XY").newObject([cq.Shape(shape)])
     elif ext == ".brep":
-        return cq.importers.importBrep(filepath)
+        # Fast path: read BREP natively through OCP to avoid CadQuery importer
+        # overhead when loading many parts in parallel.
+        shape = TopoDS_Shape()
+        builder = BRep_Builder()
+        ok = BRepTools.Read_s(shape, filepath, builder)
+        if not ok:
+            raise RuntimeError(f"BREP read failed for {filepath}")
+        return cq.Workplane("XY").newObject([cq.Shape(shape)])
     else:
         raise ValueError(f"Unsupported CAD format: {ext}")
 
@@ -863,19 +870,20 @@ def stack_parts(parts, axis_vec, gap):
         # bbox here avoids that inflation and gives the correct XY center.
         # After this phase all shapes in this level are meshed, so subsequent
         # get_tight_bounding_box calls in Phase 2/3 are fast (no-op remesh).
-        tight_xy = {}  # name -> (cx, cy)
+        tight_bbox = {}  # original_index -> (xmin, ymin, zmin, xmax, ymax, zmax)
+        tight_xy = {}    # original_index -> (cx, cy)
         for t in ("outer", "mid", "inner"):
             if t not in tier_group:
                 continue
             for _wp, _nm, _idx, _seg, _ism in tier_group[t]:
                 _sh = _wp.val().wrapped
-                _xn, _yn, _, _xx, _yx, _ = get_tight_bounding_box(_sh)
-                tight_xy[_nm] = ((_xn + _xx) / 2.0, (_yn + _yx) / 2.0)
+                _bbox = get_tight_bounding_box(_sh)
+                _xn, _yn, _, _xx, _yx, _ = _bbox
+                tight_bbox[_idx] = _bbox
+                tight_xy[_idx] = ((_xn + _xx) / 2.0, (_yn + _yx) / 2.0)
 
         # Phase 2: compute level height from the reference part's tight bbox.
-        outer_wp = ref_entry[0]
-        outer_shape = outer_wp.val().wrapped
-        _, _, ozn_tight, _, _, ozx_tight = get_tight_bounding_box(outer_shape)
+        _, _, ozn_tight, _, _, ozx_tight = tight_bbox[ref_entry[2]]
         outer_height = ozx_tight - ozn_tight
 
         # Phase 3: position every part using pre-computed exact XY and tight Z.
@@ -884,8 +892,8 @@ def stack_parts(parts, axis_vec, gap):
                 continue
             for wp, name, idx, segment, is_mesh in tier_group[tier]:
                 shape = wp.val().wrapped
-                part_cx, part_cy = tight_xy[name]
-                _, _, pzn_tight, _, _, _ = get_tight_bounding_box(shape)
+                part_cx, part_cy = tight_xy[idx]
+                _, _, pzn_tight, _, _, _ = tight_bbox[idx]
 
                 dx = -part_cx  # center XY at origin
                 dy = -part_cy
@@ -2938,34 +2946,54 @@ def run_pipeline(args):
     require_mesh_solids = False
     max_workers = min(len(valid_paths), max(1, min(8, (os.cpu_count() or 4))))
 
-    if len(valid_paths) > 1:
-        # Parallel loading for multiple files
+    # Deduplicate loads by realpath to avoid re-reading identical CAD files.
+    # This commonly happens when users pass overlapping glob patterns.
+    unique_by_real = {}
+    for fp in valid_paths:
+        unique_by_real.setdefault(os.path.realpath(fp), fp)
+
+    if len(unique_by_real) > 1:
+        # Parallel loading for unique files only.
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            future_map = {pool.submit(load_part, fp, require_solid=require_mesh_solids): fp for fp in valid_paths}
-            # Collect results in original order
-            results = {}
+            future_map = {
+                pool.submit(load_part, fp, require_solid=require_mesh_solids): real
+                for real, fp in unique_by_real.items()
+            }
+            loaded_unique = {}
             for future in as_completed(future_map):
-                fp = future_map[future]
+                real = future_map[future]
+                src_fp = unique_by_real[real]
                 try:
-                    wp, name = future.result()
-                    results[fp] = (wp, name, is_mesh_file(fp), os.path.splitext(fp)[1])
-                    print(f"  Loaded: {name}")
+                    wp, _name = future.result()
+                    loaded_unique[real] = wp
+                    print(f"  Loaded: {os.path.splitext(os.path.basename(src_fp))[0]}")
                 except Exception as e:
-                    print(f"  ERROR loading '{fp}': {e}")
-            # Preserve input order
-            for fp in valid_paths:
-                if fp in results:
-                    parts.append(results[fp][:3])
-                    loaded_parts_for_export.append({"name": results[fp][1], "shape": results[fp][0].val().wrapped, "is_mesh": results[fp][2], "source_ext": results[fp][3]})
+                    print(f"  ERROR loading '{src_fp}': {e}")
     else:
-        for filepath in valid_paths:
+        loaded_unique = {}
+        for real, filepath in unique_by_real.items():
             try:
-                wp, name = load_part(filepath, require_solid=require_mesh_solids)
-                parts.append((wp, name, is_mesh_file(filepath)))
-                loaded_parts_for_export.append({"name": name, "shape": wp.val().wrapped, "is_mesh": is_mesh_file(filepath), "source_ext": os.path.splitext(filepath)[1]})
-                print(f"  Loaded: {name}")
+                wp, _name = load_part(filepath, require_solid=require_mesh_solids)
+                loaded_unique[real] = wp
+                print(f"  Loaded: {os.path.splitext(os.path.basename(filepath))[0]}")
             except Exception as e:
                 print(f"  ERROR loading '{filepath}': {e}")
+
+    # Preserve original input order, but reuse already loaded geometry.
+    for fp in valid_paths:
+        real = os.path.realpath(fp)
+        wp = loaded_unique.get(real)
+        if wp is None:
+            continue
+        name = os.path.splitext(os.path.basename(fp))[0]
+        mesh_flag = is_mesh_file(fp)
+        parts.append((wp, name, mesh_flag))
+        loaded_parts_for_export.append({
+            "name": name,
+            "shape": wp.val().wrapped,
+            "is_mesh": mesh_flag,
+            "source_ext": os.path.splitext(fp)[1],
+        })
 
     if not parts:
         print("No valid parts loaded. Exiting.")
