@@ -115,9 +115,28 @@ python assemble.py <inputs...> [options]
 | `--render` | *(none)* | Output PNG path for rendering |
 | `--resolution` | `2048` | Render resolution in pixels |
 | `--cyl` | *(off)* | Auto-orient cylinder axis to Z before stacking |
+| `--validate` | *(off)* | Run validation pipeline (3D y=0 cut vs 2D masked top-down projection) |
+| `--validate-resolution` | `512` | Resolution used for validation render masks |
+| `--validate-max-mismatch` | `0.01` | Allowed normalized pixel mismatch for validation |
 | `--debug` | *(off)* | Verbose logging; includes cutter shape in output |
 
 ---
+
+
+## Validation Pipeline
+
+Use `--validate` to run a geometric/image-consistency check useful for tests:
+
+1. Perform a 3D half-space cut at the plane `y=0`.
+2. Render the cut result from a top-down camera (`x,y=0,0` looking along +Z).
+3. Render the uncut part from the same view, then remove half of the image at `y=0`.
+4. Compare binary occupancy masks from both images and fail if mismatch exceeds
+   `--validate-max-mismatch`.
+
+```bash
+python assemble.py outer_1.step --validate --validate-resolution 512
+```
+
 
 ## Cutting Engines
 

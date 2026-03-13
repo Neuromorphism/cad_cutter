@@ -48,6 +48,8 @@ from assemble import (
     autoscale_parts,
     _parse_target_diameter,
     _get_xy_diameter,
+    validate_planar_cut_projection,
+    run_validation_pipeline,
     AXIS_MAP,
     MATERIAL_COLORS,
 )
@@ -3278,3 +3280,29 @@ class TestComplexMeshCutting:
             f"Segment volumes {vol_a:.1f}+{vol_b:.1f}={combined:.1f} "
             f"vs expected {expected:.1f}"
         )
+
+
+class TestValidationPipeline:
+    def test_validate_planar_cut_projection_y0(self):
+        shape = cq.Workplane("XY").box(40, 40, 20).val().wrapped
+        ok, mismatch_ratio, message = validate_planar_cut_projection(
+            shape,
+            plane_axis="y",
+            plane_value=0.0,
+            keep_negative=True,
+            resolution=256,
+            max_mismatch_ratio=0.03,
+        )
+        assert ok, f"Validation failed ({mismatch_ratio:.4f}): {message}"
+
+    def test_run_validation_pipeline_reports_pass(self):
+        shape = cq.Workplane("XY").cylinder(20, 10).val().wrapped
+        all_ok, checks = run_validation_pipeline(
+            shape,
+            resolution=256,
+            mismatch_ratio=0.03,
+            debug=False,
+        )
+        assert checks, "Expected at least one validation check"
+        assert all_ok, f"Validation checks failed: {checks}"
+        assert checks[0]["name"] == "plane_cut_projection_y0_topdown"
