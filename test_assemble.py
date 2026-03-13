@@ -53,6 +53,8 @@ from assemble import (
     _render_topdown_mask,
     AXIS_MAP,
     MATERIAL_COLORS,
+    build_parser,
+    run_pipeline,
 )
 
 from cadquery import Location, Vector, Color
@@ -3356,3 +3358,153 @@ class TestValidationPipeline:
         assert checks, "Expected at least one validation check"
         assert all_ok, f"Validation checks failed: {checks}"
         assert checks[0]["name"] == "plane_cut_projection_y0_topdown"
+
+
+class TestCliParsing:
+    def test_parts_flag_does_not_consume_following_input_glob(self):
+        parser = build_parser()
+        args = parser.parse_args([
+            "--cyl", "--autoscale", "--midscale",
+            "--parts",
+            "outer_*.STEP", "mid_*.stl", "inner_2_3_d8.STEP",
+            "-o", "test.step",
+            "--cut-angle", "120",
+            "--render", "assy.png",
+            "--resolution", "1024",
+        ])
+
+        assert args.parts is True
+        assert args.inputs == ["outer_*.STEP", "mid_*.stl", "inner_2_3_d8.STEP"]
+        assert args.output == "test.step"
+        assert args.cut_angle == 120
+
+
+
+class TestPipelineAdvancedScenarios:
+    """Higher-coverage integration scenarios for orient/autoscale/mid-cut flows."""
+
+    @staticmethod
+    def _write_tilted_cylinder(path, height, radius, tilt_deg=0, axis="x"):
+        wp = cq.Workplane("XY").cylinder(height, radius)
+        if tilt_deg:
+            if axis == "x":
+                wp = wp.rotate((0, 0, 0), (1, 0, 0), tilt_deg)
+            elif axis == "y":
+                wp = wp.rotate((0, 0, 0), (0, 1, 0), tilt_deg)
+            else:
+                raise ValueError("axis must be x or y")
+        cq.exporters.export(wp, path)
+
+    @staticmethod
+    def _args(**kwargs):
+        import types
+
+        defaults = dict(
+            axis="z",
+            gap=0.2,
+            cut_angle=None,
+            render=None,
+            resolution=256,
+            cyl=True,
+            cut_direct=False,
+            phys=False,
+            autoscale=True,
+            validate=False,
+            validate_resolution=256,
+            validate_max_mismatch=0.05,
+            parts=True,
+            midscale=True,
+            mid_cut=True,
+            debug=False,
+        )
+        defaults.update(kwargs)
+        return types.SimpleNamespace(**defaults)
+
+    def test_multi_level_orient_autoscale_midcut_pipeline(self, tmp_dir):
+        old = os.getcwd()
+        os.chdir(tmp_dir)
+        try:
+            self._write_tilted_cylinder("outer_1.step", height=28, radius=18, tilt_deg=45, axis="x")
+            self._write_tilted_cylinder("outer_2.step", height=24, radius=15, tilt_deg=45, axis="x")
+
+            # Mids intentionally tiny (mm-like) and mesh format to stress mesh+autoscale path.
+            mid1 = cq.Workplane("XY").cylinder(16, 0.8)
+            mid2 = cq.Workplane("XY").cylinder(14, 0.6)
+            cq.exporters.export(mid1, "mid_1.stl", exportType="STL")
+            cq.exporters.export(mid2, "mid_2.stl", exportType="STL")
+
+            # Inners use _dN tag to force target-diameter scaling before mid-cut.
+            self._write_tilted_cylinder("inner_1_d20.step", height=14, radius=0.4, tilt_deg=45, axis="x")
+            self._write_tilted_cylinder("inner_2_d14.step", height=12, radius=0.3, tilt_deg=45, axis="x")
+
+            args = self._args(
+                inputs=["outer_*.step", "mid_*.stl", "inner_*_d*.step"],
+                output="advanced_assy.step",
+            )
+            ret = run_pipeline(args)
+
+            assert ret == 0
+            assert os.path.exists("advanced_assy.step")
+            assert os.path.isdir("parts")
+            assert os.path.exists(os.path.join("parts", "mid_1_mid_cut.step"))
+            assert os.path.exists(os.path.join("parts", "mid_2_mid_cut.step"))
+        finally:
+            os.chdir(old)
+
+    def test_multi_level_midcut_with_direct_cut_enabled(self, tmp_dir):
+        old = os.getcwd()
+        os.chdir(tmp_dir)
+        try:
+            self._write_tilted_cylinder("outer_1.step", height=30, radius=20, tilt_deg=35, axis="y")
+            self._write_tilted_cylinder("outer_2.step", height=22, radius=16, tilt_deg=35, axis="y")
+
+            mid1 = cq.Workplane("XY").cylinder(18, 9)
+            mid2 = cq.Workplane("XY").cylinder(12, 7)
+            cq.exporters.export(mid1, "mid_1.step")
+            cq.exporters.export(mid2, "mid_2.step")
+
+            self._write_tilted_cylinder("inner_1_d16.step", height=16, radius=0.5, tilt_deg=35, axis="y")
+            self._write_tilted_cylinder("inner_2_d12.step", height=10, radius=0.4, tilt_deg=35, axis="y")
+
+            args = self._args(
+                inputs=["outer_*.step", "mid_*.step", "inner_*_d*.step"],
+                output="direct_cut_assy.step",
+                cut_angle=120.0,
+                cut_direct=True,
+                gap=0.0,
+            )
+            ret = run_pipeline(args)
+
+            assert ret == 0
+            assert os.path.exists("direct_cut_assy.step")
+            assert os.path.exists(os.path.join("parts", "mid_1_mid_cut.step"))
+            assert os.path.exists(os.path.join("parts", "mid_2_mid_cut.step"))
+        finally:
+            os.chdir(old)
+
+    def test_glob_inputs_with_parts_flag_and_exports(self, tmp_dir):
+        old = os.getcwd()
+        os.chdir(tmp_dir)
+        try:
+            self._write_tilted_cylinder("outer_1.step", height=20, radius=12, tilt_deg=25, axis="x")
+            cq.exporters.export(cq.Workplane("XY").cylinder(10, 5), "mid_1.step")
+            self._write_tilted_cylinder("inner_1_d9.step", height=10, radius=0.25, tilt_deg=25, axis="x")
+
+            args = self._args(
+                inputs=["outer_*.step", "mid_*.step", "inner_*_d*.step"],
+                output="glob_assy.step",
+                midscale=False,
+                cut_angle=None,
+            )
+            ret = run_pipeline(args)
+
+            assert ret == 0
+            assert os.path.exists("glob_assy.step")
+            exported = sorted(os.listdir("parts"))
+            # Expect transformed exports and a mid-cut artifact.
+            assert any(name.startswith("outer_1") for name in exported)
+            assert any(name.startswith("mid_1") for name in exported)
+            assert "mid_1_mid_cut.step" in exported
+        finally:
+            os.chdir(old)
+
