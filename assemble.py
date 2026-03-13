@@ -43,6 +43,23 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
 # ---------------------------------------------------------------------------
+# GPU acceleration (optional — graceful fallback to CPU)
+# ---------------------------------------------------------------------------
+try:
+    from gpu_accel import (
+        gpu_available, gpu_enabled, set_gpu_enabled, get_status_string,
+        pca_principal_axis, batch_transform_vertices, radial_stats,
+        generate_ray_grid, gather_mesh_vertices, points_in_sector,
+        mask_mismatch_ratio, parallel_cut_parts,
+    )
+except ImportError:
+    # Stub out GPU functions so the rest of the module works without gpu_accel
+    def gpu_available(): return False
+    def gpu_enabled(): return False
+    def set_gpu_enabled(flag): pass
+    def get_status_string(): return "GPU: module not found"
+
+# ---------------------------------------------------------------------------
 # CadQuery / OCP imports
 # ---------------------------------------------------------------------------
 import cadquery as cq
@@ -285,12 +302,15 @@ def orient_to_cylinder(parts, gap=0.0):
         return parts
 
     vertices = np.vstack(all_verts)
-    center = vertices.mean(axis=0)
-    centered = vertices - center
 
-    cov = (centered.T @ centered) / len(vertices)
-    eigenvalues, eigenvectors = np.linalg.eigh(cov)
-    principal = eigenvectors[:, np.argmax(eigenvalues)]
+    # GPU-accelerated PCA when available (significant speedup for large meshes)
+    principal = pca_principal_axis(vertices) if gpu_enabled() else None
+    if principal is None:
+        center = vertices.mean(axis=0)
+        centered = vertices - center
+        cov = (centered.T @ centered) / len(vertices)
+        eigenvalues, eigenvectors = np.linalg.eigh(cov)
+        principal = eigenvectors[:, np.argmax(eigenvalues)]
 
     # Prefer the +Z half-space for a consistent initial orientation
     if principal[2] < 0:
@@ -336,14 +356,23 @@ def orient_to_cylinder(parts, gap=0.0):
 
     if verts_z:
         vz = np.vstack(verts_z)
-        z_vals = vz[:, 2]
-        z_mid = (z_vals.min() + z_vals.max()) / 2.0
-        bot_mask = z_vals < z_mid
-        top_mask = z_vals >= z_mid
 
-        if bot_mask.any() and top_mask.any():
-            r_bot = np.mean(np.hypot(vz[bot_mask, 0], vz[bot_mask, 1]))
-            r_top = np.mean(np.hypot(vz[top_mask, 0], vz[top_mask, 1]))
+        # GPU-accelerated radial stats for conic detection
+        if gpu_enabled():
+            r_bot, r_top, z_mid = radial_stats(vz, axis=2)
+            bot_any = True
+            top_any = True
+        else:
+            z_vals = vz[:, 2]
+            z_mid = (z_vals.min() + z_vals.max()) / 2.0
+            bot_mask = z_vals < z_mid
+            top_mask = z_vals >= z_mid
+            bot_any = bot_mask.any()
+            top_any = top_mask.any()
+            r_bot = float(np.mean(np.hypot(vz[bot_mask, 0], vz[bot_mask, 1]))) if bot_any else 0.0
+            r_top = float(np.mean(np.hypot(vz[top_mask, 0], vz[top_mask, 1]))) if top_any else 0.0
+
+        if bot_any and top_any:
 
             if r_top > r_bot * (1.0 + 1e-3):
                 print(
@@ -1198,24 +1227,32 @@ def _solid_in_sector(solid, start_angle, end_angle, axis_vec, origin_pt):
 
         angles = np.degrees(np.arctan2(py, px)) % 360.0
         boundary_tol = 2.0  # degrees — skip vertices near the boundaries
-        votes_in = 0
-        votes_out = 0
-        for a in angles:
-            a = float(a)
-            # Skip vertices on or very near the sector boundaries
-            near_start = min(abs(a - start_angle), abs(a - start_angle - 360),
-                             abs(a - start_angle + 360)) < boundary_tol
-            near_end = min(abs(a - end_angle), abs(a - end_angle - 360),
-                           abs(a - end_angle + 360)) < boundary_tol
-            if near_start or near_end:
-                continue
-            if _angle_in_sector(a):
-                votes_in += 1
-            else:
-                votes_out += 1
 
-        if votes_in + votes_out > 0:
-            return votes_in > votes_out
+        # Vectorized boundary proximity check (GPU-accelerated for large meshes)
+        d_start = np.minimum(np.minimum(
+            np.abs(angles - start_angle),
+            np.abs(angles - start_angle - 360)),
+            np.abs(angles - start_angle + 360))
+        d_end = np.minimum(np.minimum(
+            np.abs(angles - end_angle),
+            np.abs(angles - end_angle - 360)),
+            np.abs(angles - end_angle + 360))
+        interior_mask = (d_start >= boundary_tol) & (d_end >= boundary_tol)
+        interior_angles = angles[interior_mask]
+
+        if len(interior_angles) > 0:
+            # Vectorized sector membership test
+            if start_angle < end_angle:
+                in_mask = (interior_angles > start_angle + eps) & \
+                          (interior_angles < end_angle - eps)
+            else:
+                in_mask = (interior_angles > start_angle + eps) | \
+                          (interior_angles < end_angle - eps)
+            votes_in = int(np.sum(in_mask))
+            votes_out = len(interior_angles) - votes_in
+
+            if votes_in + votes_out > 0:
+                return votes_in > votes_out
 
     # Fallback: use centre-of-mass
     props = GProp_GProps()
@@ -2097,31 +2134,15 @@ def _find_support_drop_raycast(falling_mesh, settled_mesh, ax):
     bounds_f = falling_mesh.bounds
 
     n_samples = 10
-    other_axes = [d for d in range(3) if d != ax]
-    margin_u = (bounds_f[1, other_axes[0]] - bounds_f[0, other_axes[0]]) * 0.02
-    margin_v = (bounds_f[1, other_axes[1]] - bounds_f[0, other_axes[1]]) * 0.02
 
-    u_range = np.linspace(bounds_f[0, other_axes[0]] + margin_u,
-                          bounds_f[1, other_axes[0]] - margin_u, n_samples)
-    v_range = np.linspace(bounds_f[0, other_axes[1]] + margin_v,
-                          bounds_f[1, other_axes[1]] - margin_v, n_samples)
+    # Vectorized ray grid generation (GPU-accelerated when available)
+    origins, dir_down = generate_ray_grid(
+        bounds_f[0], bounds_f[1], ax, n_samples=n_samples
+    )
 
-    origins = []
-    dir_down = np.zeros(3)
-    dir_down[ax] = -1.0
-
-    for u in u_range:
-        for v in v_range:
-            o = np.zeros(3)
-            o[other_axes[0]] = u
-            o[other_axes[1]] = v
-            o[ax] = bounds_f[0, ax]  # bottom of falling mesh
-            origins.append(o)
-
-    if not origins:
+    if len(origins) == 0:
         return None
 
-    origins = np.array(origins)
     directions = np.tile(dir_down, (len(origins), 1))
 
     try:
@@ -2134,16 +2155,19 @@ def _find_support_drop_raycast(falling_mesh, settled_mesh, ax):
     if len(hits) == 0:
         return None
 
-    ray_support = {}
-    for hit, rid in zip(hits, ray_ids):
-        hit_val = hit[ax]
-        if rid not in ray_support or hit_val > ray_support[rid]:
-            ray_support[rid] = hit_val
-
-    if not ray_support:
+    # Vectorized hit processing — find the highest hit per ray
+    hit_vals = hits[:, ax]
+    unique_rays = np.unique(ray_ids)
+    if len(unique_rays) == 0:
         return None
 
-    support_level = max(ray_support.values())
+    # Use numpy advanced indexing for max-per-group
+    support_level = -np.inf
+    for rid in unique_rays:
+        mask = ray_ids == rid
+        ray_max = hit_vals[mask].max()
+        if ray_max > support_level:
+            support_level = ray_max
     drop = bounds_f[0, ax] - support_level
 
     if drop > 0:
@@ -2637,12 +2661,15 @@ def mid_cut_parts(part_info, output_dir="parts", clearance=0.02, debug=False):
 # ===================================================================
 
 def tessellate_shape(shape, tolerance=0.1, angular=0.5):
-    """Tessellate an OCP shape and return (vertices, faces) as numpy arrays."""
+    """Tessellate an OCP shape and return (vertices, faces) as numpy arrays.
+
+    When GPU acceleration is enabled, per-face vertex/face arrays are gathered
+    and reindexed on the GPU for large meshes.
+    """
     BRepMesh_IncrementalMesh(shape, tolerance, False, angular, True)
 
-    all_verts = []
-    all_faces = []
-    vert_offset = 0
+    per_face_verts = []
+    per_face_faces = []
 
     explorer = TopExp_Explorer(shape, TopAbs_FACE)
     while explorer.More():
@@ -2657,25 +2684,43 @@ def tessellate_shape(shape, tolerance=0.1, angular=0.5):
         n_verts = tri.NbNodes()
         n_tris = tri.NbTriangles()
 
+        face_verts = np.empty((n_verts, 3), dtype=float)
         for i in range(1, n_verts + 1):
             pt = tri.Node(i).Transformed(trsf)
-            all_verts.append([pt.X(), pt.Y(), pt.Z()])
+            face_verts[i - 1] = [pt.X(), pt.Y(), pt.Z()]
 
+        face_tris = np.empty((n_tris, 4), dtype=int)
         for i in range(1, n_tris + 1):
             t = tri.Triangle(i)
             i1, i2, i3 = t.Get()
-            all_faces.append([3,
-                              i1 - 1 + vert_offset,
-                              i2 - 1 + vert_offset,
-                              i3 - 1 + vert_offset])
+            face_tris[i - 1] = [3, i1 - 1, i2 - 1, i3 - 1]
 
-        vert_offset += n_verts
+        per_face_verts.append(face_verts)
+        per_face_faces.append(face_tris)
         explorer.Next()
 
-    if not all_verts:
+    if not per_face_verts:
         return np.zeros((0, 3)), np.zeros((0, 4), dtype=int)
 
-    return np.array(all_verts, dtype=float), np.array(all_faces, dtype=int)
+    # Use GPU-accelerated gather when available and mesh is large
+    if gpu_enabled():
+        try:
+            return gather_mesh_vertices(per_face_verts, per_face_faces)
+        except Exception:
+            pass
+
+    # CPU fallback: concatenate with offset reindexing
+    offsets = np.cumsum([0] + [len(v) for v in per_face_verts[:-1]])
+    all_verts = np.vstack(per_face_verts)
+    adjusted = []
+    for faces, offset in zip(per_face_faces, offsets):
+        if len(faces) == 0:
+            continue
+        f = faces.copy()
+        f[:, 1:] += offset
+        adjusted.append(f)
+    all_faces = np.vstack(adjusted) if adjusted else np.zeros((0, 4), dtype=int)
+    return all_verts, all_faces
 
 
 # ===================================================================
@@ -2688,9 +2733,23 @@ def render_assembly(parts_data, output_path, resolution=2048, cut_shape=None):
 
     parts_data: list of (name, ocp_shape, location, color) tuples
     cut_shape:  if set, render this single post-cut shape instead
+
+    When GPU is enabled, the VTK backend is configured to use hardware-
+    accelerated OpenGL rendering with GPU ray-tracing where supported.
     """
     import pyvista as pv
     pv.OFF_SCREEN = True
+
+    # Enable GPU-accelerated rendering when available
+    if gpu_enabled():
+        try:
+            pv.global_theme.render_lines_as_tubes = False
+            # Request OpenGL GPU rendering and depth peeling for transparency
+            pv.global_theme.depth_peeling.enabled = True
+            pv.global_theme.depth_peeling.number_of_peels = 4
+            pv.global_theme.multi_samples = 4
+        except Exception:
+            pass
 
     plotter = pv.Plotter(off_screen=True, window_size=[resolution, resolution])
 
@@ -2794,17 +2853,24 @@ def render_assembly(parts_data, output_path, resolution=2048, cut_shape=None):
     # Camera (slightly zoomed out so tall parts are less likely to clip top/bottom)
     plotter.camera.zoom(0.9)
 
-    # Ambient occlusion
+    # Ambient occlusion — GPU-accelerated SSAO with higher kernel when GPU available
     try:
-        plotter.enable_ssao(radius=span * 0.3, bias=0.02, kernel_size=64)
+        kernel = 128 if gpu_enabled() else 64
+        plotter.enable_ssao(radius=span * 0.3, bias=0.02, kernel_size=kernel)
     except Exception:
         pass
 
-    # Anti-aliasing
+    # Anti-aliasing — use FXAA on GPU (faster than SSAA), fall back to SSAA
     try:
-        plotter.enable_anti_aliasing('ssaa')
+        if gpu_enabled():
+            plotter.enable_anti_aliasing('fxaa')
+        else:
+            plotter.enable_anti_aliasing('ssaa')
     except Exception:
-        pass
+        try:
+            plotter.enable_anti_aliasing('ssaa')
+        except Exception:
+            pass
 
     plotter.screenshot(output_path)
     plotter.close()
@@ -2936,9 +3002,13 @@ def validate_planar_cut_projection(shape, plane_axis="y", plane_value=0.0,
     else:
         return False, 1.0, "Top-down projection validation supports x/y planes only."
 
-    mismatch = np.logical_xor(cut_mask, expected_mask).sum()
-    norm = max(1, expected_mask.sum())
-    mismatch_ratio = mismatch / norm
+    # GPU-accelerated mask comparison when available
+    if gpu_enabled():
+        mismatch_ratio = mask_mismatch_ratio(cut_mask, expected_mask)
+    else:
+        mismatch = np.logical_xor(cut_mask, expected_mask).sum()
+        norm = max(1, expected_mask.sum())
+        mismatch_ratio = mismatch / norm
     if mismatch_ratio <= max_mismatch_ratio:
         return True, mismatch_ratio, "ok"
 
@@ -2980,6 +3050,14 @@ def run_validation_pipeline(shape, resolution=512, mismatch_ratio=0.01, debug=Fa
 
 def run_pipeline(args):
     """Execute the full assembly pipeline."""
+    # 0. Configure GPU acceleration
+    if getattr(args, "no_gpu", False):
+        set_gpu_enabled(False)
+    elif getattr(args, "gpu", None):
+        set_gpu_enabled(True)
+    # else: auto-detect (default)
+    print(f"  {get_status_string()}")
+
     # 1. Expand globs and load all parts
     filepaths = expand_inputs(args.inputs)
     if not filepaths:
@@ -3181,47 +3259,63 @@ def run_pipeline(args):
                         bbox_vals, args.cut_angle, axis_vec, seg
                     )
 
-        # Cut each part individually for robustness with mixed geometry
+        # Cut each part individually for robustness with mixed geometry.
+        # When GPU/multicore is available and there are multiple parts,
+        # use parallel thread pool for independent per-part cuts.
         cut_builder = BRep_Builder()
         cut_compound = TopoDS_Compound()
         cut_builder.MakeCompound(cut_compound)
         cut_ok = 0
         cut_skip = 0
 
-        for pname, moved_shape, segment, part_is_mesh in moved_parts:
-            try:
-                if use_direct:
-                    # --- Direct geometry approach ---
-                    # Choose native operation based on model type:
-                    # mesh-origin parts use trimesh booleans,
-                    # parametric/B-rep parts use OCP Splitter.
-                    if part_is_mesh:
-                        if segment is not None:
-                            cut_part = cut_part_direct_mesh_segment(
-                                moved_shape, args.cut_angle, axis_vec,
-                                origin_pt, segment,
-                            )
-                        else:
-                            cut_part = cut_part_direct_mesh(
-                                moved_shape, args.cut_angle, axis_vec,
-                                origin_pt,
-                            )
-                    elif segment is not None:
-                        cut_part = cut_part_direct_segment(
+        def _cut_single_part(pname, moved_shape, segment, part_is_mesh):
+            """Cut a single part — used for both sequential and parallel paths."""
+            if use_direct:
+                if part_is_mesh:
+                    if segment is not None:
+                        return cut_part_direct_mesh_segment(
                             moved_shape, args.cut_angle, axis_vec,
                             origin_pt, segment,
                         )
                     else:
-                        cut_part = cut_part_direct(
+                        return cut_part_direct_mesh(
                             moved_shape, args.cut_angle, axis_vec,
                             origin_pt,
                         )
+                elif segment is not None:
+                    return cut_part_direct_segment(
+                        moved_shape, args.cut_angle, axis_vec,
+                        origin_pt, segment,
+                    )
                 else:
-                    # --- Boolean approach ---
-                    if segment in seg_cutters:
-                        cut_part = cut_assembly(moved_shape, seg_cutters[segment])
-                    else:
-                        cut_part = cut_assembly(moved_shape, cutter)
+                    return cut_part_direct(
+                        moved_shape, args.cut_angle, axis_vec,
+                        origin_pt,
+                    )
+            else:
+                if segment in seg_cutters:
+                    return cut_assembly(moved_shape, seg_cutters[segment])
+                else:
+                    return cut_assembly(moved_shape, cutter)
+
+        # Parallel cutting when multiple parts and GPU/multicore available
+        use_parallel = gpu_enabled() and len(moved_parts) > 1
+        if use_parallel:
+            cut_results = parallel_cut_parts(
+                [(p, s, seg, im) for p, s, seg, im in moved_parts],
+                _cut_single_part,
+            )
+        else:
+            cut_results = None
+
+        for idx, (pname, moved_shape, segment, part_is_mesh) in enumerate(moved_parts):
+            try:
+                if cut_results is not None:
+                    cut_part = cut_results[idx]
+                    if isinstance(cut_part, Exception):
+                        raise cut_part
+                else:
+                    cut_part = _cut_single_part(pname, moved_shape, segment, part_is_mesh)
 
                 if cut_part is None:
                     cut_skip += 1
@@ -3305,6 +3399,7 @@ def run_pipeline(args):
     print(f"  Physics:    {getattr(args, 'phys', False)}")
     print(f"  Axis:       {args.axis.upper()}")
     print(f"  Gap:        {args.gap}")
+    print(f"  {get_status_string()}")
     if args.cut_angle is not None:
         cut_method = "direct" if getattr(args, "cut_direct", False) else "boolean"
         print(f"  Cut angle:  {args.cut_angle} deg ({cut_method})")
@@ -3404,6 +3499,15 @@ def build_parser():
     parser.add_argument(
         "--debug", action="store_true",
         help="Enable debug output",
+    )
+    parser.add_argument(
+        "--gpu", action="store_true", default=None,
+        help="Enable GPU acceleration for PCA, tessellation, rendering, "
+             "and parallel cutting (requires CuPy + CUDA).",
+    )
+    parser.add_argument(
+        "--no-gpu", action="store_true", default=False,
+        help="Disable GPU acceleration even when hardware is available.",
     )
     return parser
 

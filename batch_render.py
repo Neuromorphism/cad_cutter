@@ -265,12 +265,34 @@ def setup_scene(gltf_path, output_path, hdri_path=None):
         scene.view_settings.look = 'High Contrast'
         
     prefs = bpy.context.preferences.addons['cycles'].preferences
-    prefs.refresh_devices()
-    if prefs.devices:
-        scene.cycles.device = 'GPU'
-        for dev in prefs.devices: dev.use = True
-    else:
-        scene.cycles.device = 'CPU'
+
+    # Try GPU compute backends in order of preference: OptiX > CUDA > HIP > CPU
+    gpu_activated = False
+    for compute_type in ('OPTIX', 'CUDA', 'HIP', 'ONEAPI', 'METAL'):
+        try:
+            prefs.compute_device_type = compute_type
+            prefs.refresh_devices()
+            gpu_devs = [d for d in prefs.devices if d.type != 'CPU']
+            if gpu_devs:
+                scene.cycles.device = 'GPU'
+                for dev in prefs.devices:
+                    dev.use = True
+                gpu_activated = True
+                print(f"  GPU rendering via {compute_type}: "
+                      f"{', '.join(d.name for d in gpu_devs)}")
+                break
+        except Exception:
+            continue
+
+    if not gpu_activated:
+        prefs.refresh_devices()
+        if prefs.devices:
+            scene.cycles.device = 'GPU'
+            for dev in prefs.devices:
+                dev.use = True
+        else:
+            scene.cycles.device = 'CPU'
+            print("  Falling back to CPU rendering")
 
     scene.render.resolution_x = RENDER_RESOLUTION
     scene.render.resolution_y = RENDER_RESOLUTION
