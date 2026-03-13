@@ -2984,8 +2984,8 @@ def run_pipeline(args):
         for i, entry in enumerate(parts):
             loaded_parts_for_export[i]["shape"] = entry[0].val().wrapped
 
-    if getattr(args, "parts", None):
-        export_transformed_parts(loaded_parts_for_export, args.parts)
+    if getattr(args, "parts", False):
+        export_transformed_parts(loaded_parts_for_export, "parts")
 
     # 2. Stack parts
     axis_vec = AXIS_MAP[args.axis]
@@ -3028,7 +3028,7 @@ def run_pipeline(args):
         print("\nApplying mid-part clearance cuts (--mid_cut)...")
         part_info = mid_cut_parts(
             part_info,
-            output_dir=(args.parts if getattr(args, "parts", None) else "parts"),
+            output_dir="parts",
             clearance=0.02,
             debug=getattr(args, "debug", False),
         )
@@ -3305,8 +3305,8 @@ def main():
         help="Maximum normalized pixel mismatch tolerated by validation (default: 0.01)",
     )
     parser.add_argument(
-        "--parts", nargs="?", const="parts", default=None,
-        help="Export rotated/scaled pre-stack parts to a directory (default: ./parts).",
+        "--parts", action="store_true",
+        help="Export rotated/scaled pre-stack parts to ./parts.",
     )
     parser.add_argument(
         "--midscale", action="store_true",
@@ -3314,13 +3314,14 @@ def main():
     )
     parser.add_argument(
         "--mid_cut", action="store_true",
-        help="Cut mid-tier parts to create 0.02 in clearance for matching inner-tier parts and export cut mids to ./parts (or --parts dir).",
+        help="Cut mid-tier parts to create 0.02 in clearance for matching inner-tier parts and export cut mids to ./parts.",
     )
     parser.add_argument(
         "--debug", action="store_true",
         help="Enable debug output",
     )
     args = parser.parse_args()
+
     sys.exit(run_pipeline(args))
 
 
