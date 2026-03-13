@@ -269,7 +269,8 @@ def orient_to_cylinder(parts, gap=0.0):
     # Step 1 – PCA to find the cylinder height axis and rotate to Z
     # ------------------------------------------------------------------
     all_verts = []
-    for wp, name in parts:
+    for entry in parts:
+        wp, name = entry[0], entry[1]
         shape = wp.val().wrapped
         verts, _ = tessellate_shape(shape, tolerance=1.0)
         if len(verts) > 0:
@@ -309,9 +310,11 @@ def orient_to_cylinder(parts, gap=0.0):
             angle,
         )
         current_parts = []
-        for wp, name in parts:
+        for entry in parts:
+            wp, name = entry[0], entry[1]
+            extra = entry[2:] if len(entry) > 2 else ()
             shape = BRepBuilderAPI_Transform(wp.val().wrapped, trsf, True).Shape()
-            current_parts.append((cq.Workplane("XY").newObject([cq.Shape(shape)]), name))
+            current_parts.append((cq.Workplane("XY").newObject([cq.Shape(shape)]), name) + extra)
     else:
         print("  Parts already aligned with Z-axis.")
 
@@ -320,7 +323,8 @@ def orient_to_cylinder(parts, gap=0.0):
     #          Z-axis in the bottom and top halves of the combined vertex cloud.
     # ------------------------------------------------------------------
     verts_z = []
-    for wp, name in current_parts:
+    for entry in current_parts:
+        wp = entry[0]
         verts, _ = tessellate_shape(wp.val().wrapped, tolerance=1.0)
         if len(verts) > 0:
             verts_z.append(verts)
@@ -344,9 +348,11 @@ def orient_to_cylinder(parts, gap=0.0):
                 flip = gp_Trsf()
                 flip.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(1, 0, 0)), math.pi)
                 flipped = []
-                for wp, name in current_parts:
+                for entry in current_parts:
+                    wp, name = entry[0], entry[1]
+                    extra = entry[2:] if len(entry) > 2 else ()
                     s = BRepBuilderAPI_Transform(wp.val().wrapped, flip, True).Shape()
-                    flipped.append((cq.Workplane("XY").newObject([cq.Shape(s)]), name))
+                    flipped.append((cq.Workplane("XY").newObject([cq.Shape(s)]), name) + extra)
                 current_parts = flipped
 
     # ------------------------------------------------------------------
@@ -365,7 +371,9 @@ def orient_to_cylinder(parts, gap=0.0):
     # ------------------------------------------------------------------
     restacked = []
     z_cursor = 0.0
-    for wp, name in current_parts:
+    for entry in current_parts:
+        wp, name = entry[0], entry[1]
+        extra = entry[2:] if len(entry) > 2 else ()
         shape = wp.val().wrapped
         xn, yn, zn, xx, yx, zx = get_tight_bounding_box(shape)
         height = zx - zn
@@ -374,7 +382,7 @@ def orient_to_cylinder(parts, gap=0.0):
             t = gp_Trsf()
             t.SetTranslation(gp_Vec(0.0, 0.0, dz))
             shape = BRepBuilderAPI_Transform(shape, t, True).Shape()
-        restacked.append((cq.Workplane("XY").newObject([cq.Shape(shape)]), name))
+        restacked.append((cq.Workplane("XY").newObject([cq.Shape(shape)]), name) + extra)
         z_cursor += height + gap
 
     return restacked
@@ -529,6 +537,11 @@ def load_part(filepath):
     return wp, name
 
 
+def is_mesh_file(filepath):
+    """Return True if *filepath* has a mesh extension (.stl, .obj, .ply, .3mf)."""
+    return os.path.splitext(filepath)[1].lower() in MESH_EXTENSIONS
+
+
 # ===================================================================
 # Color assignment
 # ===================================================================
@@ -651,7 +664,8 @@ def autoscale_parts(parts):
     """
     # Classify parts by tier and level so we can compare within sections.
     by_level = {}  # level -> {tier -> [(index, wp, name)]}
-    for i, (wp, name) in enumerate(parts):
+    for i, entry in enumerate(parts):
+        wp, name = entry[0], entry[1]
         tier, levels, _seg = parse_part_name(name)
         if tier is None or levels is None:
             continue
@@ -697,7 +711,8 @@ def autoscale_parts(parts):
                             new_wp = cq.Workplane("XY").newObject(
                                 [cq.Shape(new_shape)]
                             )
-                            scaled[idx] = (new_wp, name)
+                            extra = parts[idx][2:] if len(parts[idx]) > 2 else ()
+                            scaled[idx] = (new_wp, name) + extra
                             print(
                                 f"  Autoscale {name}: diameter "
                                 f"{cur_diam:.2f} -> {target_diam:.2f} "
@@ -735,7 +750,8 @@ def autoscale_parts(parts):
                         new_wp = cq.Workplane("XY").newObject(
                             [cq.Shape(new_shape)]
                         )
-                        scaled[idx] = (new_wp, name)
+                        extra = parts[idx][2:] if len(parts[idx]) > 2 else ()
+                        scaled[idx] = (new_wp, name) + extra
                         print(
                             f"  Autoscale {name}: {best_label} "
                             f"(x{best_factor:.2f}), diameter "
@@ -763,14 +779,23 @@ def stack_parts(parts, axis_vec, gap):
     inner_2b) are placed at the same position.  The segment tag is carried
     through so the cutting phase can split them into left/right halves.
 
+    Each entry in *parts* is either ``(wp, name)`` or ``(wp, name, is_mesh)``.
+    The *is_mesh* flag (default ``False``) is carried through so downstream
+    cutting can choose native mesh or parametric operations.
+
     Returns a CadQuery Assembly and a list of
-    (name, ocp_shape, location, rgb_tuple, segment) tuples.
+    (name, ocp_shape, location, rgb_tuple, segment, is_mesh) tuples.
     """
     # --- Classify parts by tier and levels ---
-    classified = []  # (tier, levels_list, segment, wp, name, original_index)
+    classified = []  # (tier, levels_list, segment, wp, name, original_index, is_mesh)
     auto_level = 1
 
-    for i, (wp, name) in enumerate(parts):
+    for i, entry in enumerate(parts):
+        if len(entry) == 3:
+            wp, name, is_mesh = entry
+        else:
+            wp, name = entry
+            is_mesh = False
         tier, levels, segment = parse_part_name(name)
         if tier is None:
             # Unrecognized naming — treat as sequential outer parts
@@ -778,21 +803,21 @@ def stack_parts(parts, axis_vec, gap):
             levels = [auto_level]
             segment = None
             auto_level += 1
-        classified.append((tier, levels, segment, wp, name, i))
+        classified.append((tier, levels, segment, wp, name, i, is_mesh))
 
     # --- Build the set of levels and group by (level, tier) ---
     # Single-level parts go into levels_map[level][tier] as a list.
     # Multi-level (spanning) parts are collected separately.
-    levels_map = {}  # level -> {tier -> [(wp, name, original_index, segment), ...]}
-    spanning_parts = []  # (tier, levels_list, segment, wp, name, original_index)
+    levels_map = {}  # level -> {tier -> [(wp, name, original_index, segment, is_mesh), ...]}
+    spanning_parts = []  # (tier, levels_list, segment, wp, name, original_index, is_mesh)
 
-    for tier, levels, segment, wp, name, idx in classified:
+    for tier, levels, segment, wp, name, idx, is_mesh in classified:
         if len(levels) == 1:
             levels_map.setdefault(levels[0], {}).setdefault(tier, []).append(
-                (wp, name, idx, segment)
+                (wp, name, idx, segment, is_mesh)
             )
         else:
-            spanning_parts.append((tier, levels, segment, wp, name, idx))
+            spanning_parts.append((tier, levels, segment, wp, name, idx, is_mesh))
             # Ensure all spanned levels exist in levels_map
             for lv in levels:
                 levels_map.setdefault(lv, {})
@@ -839,7 +864,7 @@ def stack_parts(parts, axis_vec, gap):
         for t in ("outer", "mid", "inner"):
             if t not in tier_group:
                 continue
-            for _wp, _nm, _idx, _seg in tier_group[t]:
+            for _wp, _nm, _idx, _seg, _ism in tier_group[t]:
                 _sh = _wp.val().wrapped
                 _xn, _yn, _, _xx, _yx, _ = get_tight_bounding_box(_sh)
                 tight_xy[_nm] = ((_xn + _xx) / 2.0, (_yn + _yx) / 2.0)
@@ -854,7 +879,7 @@ def stack_parts(parts, axis_vec, gap):
         for tier in ("outer", "mid", "inner"):
             if tier not in tier_group:
                 continue
-            for wp, name, idx, segment in tier_group[tier]:
+            for wp, name, idx, segment, is_mesh in tier_group[tier]:
                 shape = wp.val().wrapped
                 part_cx, part_cy = tight_xy[name]
                 _, _, pzn_tight, _, _, _ = get_tight_bounding_box(shape)
@@ -867,14 +892,14 @@ def stack_parts(parts, axis_vec, gap):
                 cq_color, rgb = pick_color(name, idx)
 
                 assy.add(wp, name=name, loc=loc, color=cq_color)
-                part_info.append((name, shape, loc, rgb, segment))
+                part_info.append((name, shape, loc, rgb, segment, is_mesh))
 
         # Advance the Z cursor past the outer part (+ gap)
         level_z_top[level] = z_cursor + outer_height
         z_cursor += outer_height + gap
 
     # --- Place spanning parts (parts that cover multiple levels) ---
-    for tier, levels, segment, wp, name, idx in spanning_parts:
+    for tier, levels, segment, wp, name, idx, is_mesh in spanning_parts:
         first_level = min(levels)
         last_level = max(levels)
 
@@ -897,7 +922,7 @@ def stack_parts(parts, axis_vec, gap):
         cq_color, rgb = pick_color(name, idx)
 
         assy.add(wp, name=name, loc=loc, color=cq_color)
-        part_info.append((name, shape, loc, rgb, segment))
+        part_info.append((name, shape, loc, rgb, segment, is_mesh))
 
     return assy, part_info
 
@@ -1375,6 +1400,309 @@ def cut_part_direct_segment(shape, cut_angle, axis_vec, origin_pt, segment):
     return compound
 
 
+# -------------------------------------------------------------------
+# Native mesh direct-cut  (trimesh boolean, no OCP Splitter)
+# -------------------------------------------------------------------
+
+def _make_wedge_trimesh(cut_angle, axis_vec, origin_pt, radius, height):
+    """Build a triangulated wedge sector mesh for boolean subtraction.
+
+    The wedge covers the angular sector ``[0, cut_angle]`` around *axis_vec*
+    through *origin_pt*, with the given *radius* and *height*.
+
+    Returns a watertight ``trimesh.Trimesh`` representing the wedge solid.
+    """
+    import trimesh
+
+    ox, oy, oz = origin_pt.X(), origin_pt.Y(), origin_pt.Z()
+    cut_rad = math.radians(cut_angle)
+
+    # Generate sector vertices in the local perpendicular plane
+    n_steps = max(int(cut_angle / 3.0), 8)  # ~3° per step
+    angles = np.linspace(0, cut_rad, n_steps + 1)
+
+    # Perpendicular basis vectors
+    if axis_vec.z:
+        p1 = np.array([1.0, 0.0, 0.0])
+        p2 = np.array([0.0, 1.0, 0.0])
+        ax = np.array([0.0, 0.0, 1.0])
+    elif axis_vec.y:
+        p1 = np.array([1.0, 0.0, 0.0])
+        p2 = np.array([0.0, 0.0, 1.0])
+        ax = np.array([0.0, 1.0, 0.0])
+    else:
+        p1 = np.array([0.0, 1.0, 0.0])
+        p2 = np.array([0.0, 0.0, 1.0])
+        ax = np.array([1.0, 0.0, 0.0])
+
+    origin = np.array([ox, oy, oz])
+
+    # Build sector polygon (origin + arc points) on the bottom and top
+    half_h = height / 2.0
+    bottom_center = origin - ax * half_h
+    top_center = origin + ax * half_h
+
+    # Bottom ring: origin, then arc points at radius
+    n_arc = len(angles)  # n_steps + 1
+    # Vertices: bottom_center, bottom_arc[0..n_arc-1],
+    #           top_center,    top_arc[0..n_arc-1]
+    verts = []
+    # Bottom center (index 0)
+    verts.append(bottom_center)
+    # Bottom arc (indices 1..n_arc)
+    for a in angles:
+        pt = bottom_center + radius * (math.cos(a) * p1 + math.sin(a) * p2)
+        verts.append(pt)
+    # Top center (index n_arc + 1)
+    verts.append(top_center)
+    # Top arc (indices n_arc+2 .. 2*n_arc+1)
+    for a in angles:
+        pt = top_center + radius * (math.cos(a) * p1 + math.sin(a) * p2)
+        verts.append(pt)
+
+    verts = np.array(verts)
+    bc = 0               # bottom center index
+    ba = 1               # bottom arc start index
+    tc = n_arc + 1        # top center index
+    ta = n_arc + 2        # top arc start index
+
+    faces = []
+    for i in range(n_arc - 1):
+        # Bottom fan triangle
+        faces.append([bc, ba + i, ba + i + 1])
+        # Top fan triangle (reversed winding)
+        faces.append([tc, ta + i + 1, ta + i])
+        # Side quad (two triangles)
+        faces.append([ba + i, ta + i, ta + i + 1])
+        faces.append([ba + i, ta + i + 1, ba + i + 1])
+
+    # Two end-cap quads (at angle 0 and angle cut_angle)
+    # Side at angle 0: (bc, ba+0, ta+0, tc)
+    faces.append([bc, ta, ba])
+    faces.append([bc, tc, ta])
+    # Side at cut_angle: (bc, ba+n_arc-1, ta+n_arc-1, tc)
+    last = n_arc - 1
+    faces.append([bc, ba + last, ta + last])
+    faces.append([bc, ta + last, tc])
+
+    mesh = trimesh.Trimesh(vertices=verts, faces=np.array(faces), process=True)
+    mesh.fix_normals()
+    if not mesh.is_watertight:
+        trimesh.repair.fill_holes(mesh)
+        trimesh.repair.fix_normals(mesh)
+    return mesh
+
+
+def _trimesh_to_ocp_solid(mesh):
+    """Convert a trimesh.Trimesh to an OCP TopoDS_Shape (solid) via STL.
+
+    Writes to a temporary STL file, loads with OCP, and converts to solid.
+    Returns the OCP solid shape, or None on failure.
+    """
+    stl_path = None
+    try:
+        tmp = tempfile.NamedTemporaryFile(suffix=".stl", delete=False)
+        stl_path = tmp.name
+        tmp.close()
+        mesh.export(stl_path)
+
+        from OCP.StlAPI import StlAPI_Reader
+        reader = StlAPI_Reader()
+        shape = TopoDS_Shape()
+        reader.Read(shape, stl_path)
+        solid = _mesh_shell_to_solid(shape)
+        return solid
+    except Exception:
+        return None
+    finally:
+        if stl_path and os.path.exists(stl_path):
+            os.unlink(stl_path)
+
+
+def _ensure_mesh_volume(mesh):
+    """Ensure a trimesh mesh is a valid volume for boolean operations.
+
+    Applies progressive repair strategies:
+    1. Fill holes and fix normals on the whole mesh.
+    2. If still not a volume, split into bodies and pick the largest volume.
+    3. Returns the repaired mesh, or ``None`` if no valid body exists.
+    """
+    import trimesh as _tm
+
+    if mesh.is_volume:
+        return mesh
+
+    _tm.repair.fill_holes(mesh)
+    _tm.repair.fix_winding(mesh)
+    _tm.repair.fix_normals(mesh)
+    if mesh.is_volume:
+        return mesh
+
+    # Split into connected components and find the largest volume body
+    try:
+        bodies = mesh.split()
+    except Exception:
+        return None
+
+    best = None
+    best_vol = 0
+    for body in bodies:
+        if body.is_volume and abs(body.volume) > best_vol:
+            best = body
+            best_vol = abs(body.volume)
+
+    return best
+
+
+def cut_part_direct_mesh(shape, cut_angle, axis_vec, origin_pt):
+    """Native mesh direct-cut: boolean subtraction using trimesh.
+
+    Converts the OCP *shape* to a trimesh mesh, builds a wedge sector
+    covering ``[0, cut_angle]``, performs a boolean difference in trimesh,
+    and converts the result back to an OCP solid.
+
+    This is the mesh-native counterpart of ``cut_part_direct()`` which uses
+    the OCP ``BRepAlgoAPI_Splitter`` (best for parametric/B-rep geometry).
+
+    Returns the kept OCP compound, or ``None`` if the result is empty.
+    """
+    import trimesh
+
+    # Convert OCP shape to trimesh
+    model_mesh = _shape_to_clean_trimesh(shape, tolerance=0.1)
+    if model_mesh is None or len(model_mesh.faces) == 0:
+        return None
+
+    # Ensure the mesh is a volume for boolean operations.
+    model_mesh = _ensure_mesh_volume(model_mesh)
+    if model_mesh is None:
+        return None
+
+    # Compute bounding dimensions for the wedge cutter
+    bounds = model_mesh.bounds  # (2, 3) min/max
+    diag = np.linalg.norm(bounds[1] - bounds[0])
+    radius = diag * 1.5
+    height = diag * 3.0
+
+    # Build the wedge mesh
+    wedge = _make_wedge_trimesh(cut_angle, axis_vec, origin_pt, radius, height)
+
+    # Boolean difference: model - wedge
+    try:
+        result_mesh = trimesh.boolean.difference([model_mesh, wedge], engine="manifold")
+    except Exception:
+        try:
+            result_mesh = trimesh.boolean.difference([model_mesh, wedge], engine="blender")
+        except Exception:
+            return None
+
+    if result_mesh is None or len(result_mesh.faces) == 0:
+        return None
+
+    # Convert back to OCP solid
+    solid = _trimesh_to_ocp_solid(result_mesh)
+    if solid is None or solid.IsNull():
+        return None
+
+    # Wrap in compound for consistency with cut_part_direct()
+    builder = BRep_Builder()
+    compound = TopoDS_Compound()
+    builder.MakeCompound(compound)
+    builder.Add(compound, solid)
+    return compound
+
+
+def cut_part_direct_mesh_segment(shape, cut_angle, axis_vec, origin_pt, segment):
+    """Native mesh direct-cut with segment splitting (a/b halves).
+
+    After removing the main wedge ``[0, cut_angle]``, the remaining arc
+    ``[cut_angle, 360]`` is bisected:
+
+    * **segment "a"** keeps ``[cut_angle, midpoint]``
+    * **segment "b"** keeps ``[midpoint, 360]``
+
+    This is the mesh-native counterpart of ``cut_part_direct_segment()``.
+    """
+    import trimesh
+
+    model_mesh = _shape_to_clean_trimesh(shape, tolerance=0.1)
+    if model_mesh is None or len(model_mesh.faces) == 0:
+        return None
+
+    # Ensure the mesh is a volume for boolean operations.
+    model_mesh = _ensure_mesh_volume(model_mesh)
+    if model_mesh is None:
+        return None
+
+    bounds = model_mesh.bounds
+    diag = np.linalg.norm(bounds[1] - bounds[0])
+    radius = diag * 1.5
+    height = diag * 3.0
+
+    # Main wedge [0, cut_angle]
+    wedge_main = _make_wedge_trimesh(cut_angle, axis_vec, origin_pt, radius, height)
+
+    remaining = 360.0 - cut_angle
+    midpoint = cut_angle + remaining / 2.0
+
+    # Additional wedge to bisect the remaining arc
+    if segment == "a":
+        # Keep [cut_angle, midpoint] => also remove [midpoint, 360]
+        remove_angle = 360.0 - midpoint
+        wedge_extra = _make_wedge_trimesh(remove_angle, axis_vec, origin_pt, radius, height)
+        # Rotate wedge_extra to start at midpoint
+        _rotate_wedge = _make_wedge_trimesh(360.0 - midpoint, axis_vec, origin_pt, radius, height)
+        # Actually: remove [0, cut_angle] and [midpoint, 360]
+        # Simpler: remove [0, midpoint] entirely, then remove [0, cut_angle] from the complement
+        # Better approach: build a wedge for [midpoint, 360] and union with main wedge
+        wedge_seg = _make_wedge_trimesh(360.0 - midpoint, axis_vec, origin_pt, radius, height)
+        # Rotate by midpoint degrees
+        _rot_rad = math.radians(midpoint)
+        if axis_vec.z:
+            rot_axis = [0, 0, 1]
+        elif axis_vec.y:
+            rot_axis = [0, 1, 0]
+        else:
+            rot_axis = [1, 0, 0]
+        rot_matrix = trimesh.transformations.rotation_matrix(_rot_rad, rot_axis,
+                                                              [origin_pt.X(), origin_pt.Y(), origin_pt.Z()])
+        wedge_seg.apply_transform(rot_matrix)
+        # Union: remove both main wedge [0, cut_angle] and [midpoint, 360]
+        try:
+            combined_cutter = trimesh.boolean.union([wedge_main, wedge_seg], engine="manifold")
+        except Exception:
+            try:
+                combined_cutter = trimesh.boolean.union([wedge_main, wedge_seg], engine="blender")
+            except Exception:
+                return None
+    else:
+        # segment "b": keep [midpoint, 360] => also remove [cut_angle, midpoint]
+        # Remove [0, midpoint] entirely
+        wedge_combined = _make_wedge_trimesh(midpoint, axis_vec, origin_pt, radius, height)
+        combined_cutter = wedge_combined
+
+    try:
+        result_mesh = trimesh.boolean.difference([model_mesh, combined_cutter], engine="blender")
+    except Exception:
+        try:
+            result_mesh = trimesh.boolean.difference([model_mesh, combined_cutter], engine="manifold")
+        except Exception:
+            return None
+
+    if result_mesh is None or len(result_mesh.faces) == 0:
+        return None
+
+    solid = _trimesh_to_ocp_solid(result_mesh)
+    if solid is None or solid.IsNull():
+        return None
+
+    builder = BRep_Builder()
+    compound = TopoDS_Compound()
+    builder.MakeCompound(compound)
+    builder.Add(compound, solid)
+    return compound
+
+
 def cut_assembly(assy_compound, cutter_shape):
     """Boolean-cut the assembly compound with the cutter.
 
@@ -1590,15 +1918,20 @@ def simulate_physics(part_info, axis_vec, gap, max_iters=50,
         ax = 2
 
     # -- Build cleaned meshes and track offsets --
-    bodies = []  # (name, mesh, offset[3], ocp_shape, loc, rgb, segment)
-    for name, shape, loc, rgb, segment in part_info:
+    bodies = []  # (name, mesh, offset[3], ocp_shape, loc, rgb, segment, is_mesh)
+    for entry in part_info:
+        if len(entry) == 6:
+            name, shape, loc, rgb, segment, is_mesh = entry
+        else:
+            name, shape, loc, rgb, segment = entry
+            is_mesh = False
         moved = apply_location(shape, loc)
         mesh = _shape_to_clean_trimesh(moved)
         if mesh is None:
-            bodies.append((name, None, np.zeros(3), shape, loc, rgb, segment))
+            bodies.append((name, None, np.zeros(3), shape, loc, rgb, segment, is_mesh))
             continue
         hull = _mesh_convex_hull(mesh)
-        bodies.append((name, mesh, np.zeros(3), shape, loc, rgb, segment))
+        bodies.append((name, mesh, np.zeros(3), shape, loc, rgb, segment, is_mesh))
 
     if debug:
         print(f"  [PHYS] Settling {len(bodies)} bodies along axis={ax}")
@@ -1620,7 +1953,7 @@ def simulate_physics(part_info, axis_vec, gap, max_iters=50,
     settled_meshes = []  # list of meshes already in their final positions
 
     for idx in range(len(bodies)):
-        name, mesh, offset, shape, loc, rgb, segment = bodies[idx]
+        name, mesh, offset, shape, loc, rgb, segment, is_mesh = bodies[idx]
         if mesh is None:
             continue
 
@@ -1664,7 +1997,7 @@ def simulate_physics(part_info, axis_vec, gap, max_iters=50,
             current_mesh.apply_translation(translation)
             offset_new = offset.copy()
             offset_new[ax] -= best_drop
-            bodies[idx] = (name, mesh, offset_new, shape, loc, rgb, segment)
+            bodies[idx] = (name, mesh, offset_new, shape, loc, rgb, segment, is_mesh)
 
             if debug:
                 print(f"  [PHYS] '{name}': dropped {best_drop:.4f} along axis")
@@ -1681,17 +2014,17 @@ def simulate_physics(part_info, axis_vec, gap, max_iters=50,
     # -- Build updated part_info with new locations --
     updated = []
     for body in bodies:
-        name, mesh, offset, shape, loc, rgb, segment = body
+        name, mesh, offset, shape, loc, rgb, segment, is_mesh = body
         if mesh is None:
-            updated.append((name, shape, loc, rgb, segment))
+            updated.append((name, shape, loc, rgb, segment, is_mesh))
         else:
             dx, dy, dz = offset[0], offset[1], offset[2]
             if abs(dx) < 1e-8 and abs(dy) < 1e-8 and abs(dz) < 1e-8:
-                updated.append((name, shape, loc, rgb, segment))
+                updated.append((name, shape, loc, rgb, segment, is_mesh))
             else:
                 # Compose: apply original loc, then translate by sim offset
                 new_loc = Location(Vector(dx, dy, dz)) * loc
-                updated.append((name, shape, new_loc, rgb, segment))
+                updated.append((name, shape, new_loc, rgb, segment, is_mesh))
 
     # -- Report bbox gap changes --
     _report_nesting(updated, ax, gap, debug)
@@ -1875,7 +2208,8 @@ def _report_nesting(part_info, ax, original_gap, debug):
 
     # Compute bounding boxes of final positioned parts
     positioned = []
-    for name, shape, loc, rgb, segment in part_info:
+    for entry in part_info:
+        name, shape, loc, rgb, segment = entry[:5]
         moved = apply_location(shape, loc)
         bb = get_bounding_box(moved)
         # bb = (xmin, ymin, zmin, xmax, ymax, zmax)
@@ -1941,7 +2275,8 @@ def build_moved_compound(part_info):
     builder = BRep_Builder()
     compound = TopoDS_Compound()
     builder.MakeCompound(compound)
-    for name, shape, loc, color, _seg in part_info:
+    for entry in part_info:
+        name, shape, loc = entry[0], entry[1], entry[2]
         moved = apply_location(shape, loc)
         builder.Add(compound, moved)
     return compound
@@ -2158,7 +2493,7 @@ def run_pipeline(args):
                 fp = future_map[future]
                 try:
                     wp, name = future.result()
-                    results[fp] = (wp, name)
+                    results[fp] = (wp, name, is_mesh_file(fp))
                     print(f"  Loaded: {name}")
                 except Exception as e:
                     print(f"  ERROR loading '{fp}': {e}")
@@ -2170,7 +2505,7 @@ def run_pipeline(args):
         for filepath in valid_paths:
             try:
                 wp, name = load_part(filepath)
-                parts.append((wp, name))
+                parts.append((wp, name, is_mesh_file(filepath)))
                 print(f"  Loaded: {name}")
             except Exception as e:
                 print(f"  ERROR loading '{filepath}': {e}")
@@ -2204,7 +2539,8 @@ def run_pipeline(args):
         )
         # Rebuild assembly with updated locations
         assy = Assembly()
-        for name, shape, loc, rgb, segment in part_info:
+        for entry in part_info:
+            name, shape, loc, rgb = entry[0], entry[1], entry[2], entry[3]
             wp = cq.Workplane("XY").newObject([cq.Shape(shape)])
             cq_color = Color(*rgb) if len(rgb) == 3 else Color(*rgb[:3])
             assy.add(wp, name=name, loc=loc, color=cq_color)
@@ -2231,10 +2567,13 @@ def run_pipeline(args):
         compound = TopoDS_Compound()
         builder.MakeCompound(compound)
         moved_parts = []
-        for name, shape, loc, color, segment in part_info:
+        for entry in part_info:
+            name, shape, loc = entry[0], entry[1], entry[2]
+            segment = entry[4]
+            is_mesh = entry[5] if len(entry) > 5 else False
             moved = apply_location(shape, loc)
             builder.Add(compound, moved)
-            moved_parts.append((name, moved, segment))
+            moved_parts.append((name, moved, segment, is_mesh))
 
         bbox = Bnd_Box()
         BRepBndLib.Add_s(compound, bbox)
@@ -2253,7 +2592,7 @@ def run_pipeline(args):
         _r, _h, origin_pt, _d = _cutter_params(bbox_vals, axis_vec)
 
         # Pre-build segment cutters / check for segments
-        has_segments = any(seg is not None for _, _, seg in moved_parts)
+        has_segments = any(seg is not None for _, _, seg, _ in moved_parts)
 
         if not use_direct:
             cutter = make_cutter(bbox_vals, args.cut_angle, axis_vec)
@@ -2271,11 +2610,25 @@ def run_pipeline(args):
         cut_ok = 0
         cut_skip = 0
 
-        for pname, moved_shape, segment in moved_parts:
+        for pname, moved_shape, segment, part_is_mesh in moved_parts:
             try:
                 if use_direct:
                     # --- Direct geometry approach ---
-                    if segment is not None:
+                    # Choose native operation based on model type:
+                    # mesh-origin parts use trimesh booleans,
+                    # parametric/B-rep parts use OCP Splitter.
+                    if part_is_mesh:
+                        if segment is not None:
+                            cut_part = cut_part_direct_mesh_segment(
+                                moved_shape, args.cut_angle, axis_vec,
+                                origin_pt, segment,
+                            )
+                        else:
+                            cut_part = cut_part_direct_mesh(
+                                moved_shape, args.cut_angle, axis_vec,
+                                origin_pt,
+                            )
+                    elif segment is not None:
                         cut_part = cut_part_direct_segment(
                             moved_shape, args.cut_angle, axis_vec,
                             origin_pt, segment,

@@ -28,10 +28,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cadquery as cq
 from assemble import (
     load_part,
+    is_mesh_file,
     get_bounding_box,
     make_cutter,
     cut_assembly,
     cut_part_direct,
+    cut_part_direct_mesh,
+    cut_part_direct_mesh_segment,
     _cutter_params,
     tessellate_shape,
     _mesh_shell_to_solid,
@@ -568,6 +571,158 @@ class TestMonotonicVolume:
             f"Volumes should decrease: 90°={volumes[0]:.0f}, "
             f"180°={volumes[1]:.0f}, 270°={volumes[2]:.0f}"
         )
+
+
+# ============================================================================
+# Test: Native mesh direct-cut (trimesh boolean)
+# ============================================================================
+
+class TestNativeMeshDirectCut:
+    """Tests for cut_part_direct_mesh() — native trimesh boolean cutting."""
+
+    def test_mesh_cut_90_produces_result(self, beholder_shape):
+        """90-degree native mesh cut should produce a non-null result."""
+        origin = origin_for(beholder_shape, AXIS_MAP["z"])
+        result = cut_part_direct_mesh(beholder_shape, 90, AXIS_MAP["z"], origin)
+        assert result is not None
+        assert not result.IsNull()
+
+    def test_mesh_cut_90_reduces_volume(self, beholder_shape):
+        """90-degree native mesh cut should reduce volume."""
+        orig_vol = get_volume(beholder_shape)
+        origin = origin_for(beholder_shape, AXIS_MAP["z"])
+        result = cut_part_direct_mesh(beholder_shape, 90, AXIS_MAP["z"], origin)
+
+        cut_vol = get_volume(result)
+        assert cut_vol < orig_vol, "Volume should decrease after cutting"
+        assert cut_vol > 0, "Some volume should remain"
+        ratio = cut_vol / orig_vol
+        assert 0.5 < ratio < 0.95, f"90° cut should leave 50-95%, got {ratio*100:.1f}%"
+
+    def test_mesh_cut_180_volume(self, beholder_shape):
+        """180-degree native mesh cut should remove roughly half."""
+        orig_vol = get_volume(beholder_shape)
+        origin = origin_for(beholder_shape, AXIS_MAP["z"])
+        result = cut_part_direct_mesh(beholder_shape, 180, AXIS_MAP["z"], origin)
+
+        cut_vol = get_volume(result)
+        ratio = cut_vol / orig_vol
+        assert 0.2 < ratio < 0.8, f"180° cut should leave 20-80%, got {ratio*100:.1f}%"
+
+    def test_mesh_cut_exports_valid_stl(self, beholder_shape, tmp_dir):
+        """Native mesh cut result should export to a valid STL."""
+        origin = origin_for(beholder_shape, AXIS_MAP["z"])
+        result = cut_part_direct_mesh(beholder_shape, 90, AXIS_MAP["z"], origin)
+
+        stl_path = os.path.join(tmp_dir, "beholder_mesh_cut_90.stl")
+        export_stl(result, stl_path)
+
+        assert os.path.exists(stl_path)
+        assert os.path.getsize(stl_path) > 0
+
+        mesh = load_stl_trimesh(stl_path)
+        assert len(mesh.vertices) > 100
+        assert len(mesh.faces) > 100
+
+
+# ============================================================================
+# Test: Native mesh direct-cut agrees with parametric direct-cut
+# ============================================================================
+
+class TestNativeVsParametricDirectCut:
+    """Both native cut methods should produce similar volumes on mesh data."""
+
+    def test_90_degree_volumes_agree(self, beholder_shape):
+        """Native mesh and parametric direct-cut volumes at 90° should agree."""
+        orig_vol = get_volume(beholder_shape)
+        axis_vec = AXIS_MAP["z"]
+        origin = origin_for(beholder_shape, axis_vec)
+
+        # Parametric (OCP Splitter)
+        parametric_result = cut_part_direct(beholder_shape, 90, axis_vec, origin)
+        parametric_vol = get_volume(parametric_result)
+
+        # Native mesh (trimesh boolean)
+        mesh_result = cut_part_direct_mesh(beholder_shape, 90, axis_vec, origin)
+        mesh_vol = get_volume(mesh_result)
+
+        # Should be within 15% of each other (mesh boolean is approximate)
+        diff = abs(parametric_vol - mesh_vol) / max(parametric_vol, mesh_vol)
+        assert diff < 0.15, (
+            f"Parametric vol={parametric_vol:.1f} vs mesh vol={mesh_vol:.1f} "
+            f"differ by {diff*100:.1f}%"
+        )
+
+
+# ============================================================================
+# Test: Native parametric direct-cut on CAD geometry
+# ============================================================================
+
+class TestNativeParametricDirectCut:
+    """Verify that parametric (OCP Splitter) direct-cut works on CAD geometry."""
+
+    def _get_volume(self, shape):
+        props = GProp_GProps()
+        BRepGProp.VolumeProperties_s(shape, props)
+        return props.Mass()
+
+    def _origin_for(self, shape, axis_vec):
+        bbox_vals = get_bbox_vals(shape)
+        _, _, origin_pt, _ = _cutter_params(bbox_vals, axis_vec)
+        return origin_pt
+
+    def test_parametric_cut_90_cylinder(self):
+        """90° parametric cut of a CadQuery cylinder removes ~25%."""
+        cyl = cq.Workplane("XY").cylinder(30, 8).val().wrapped
+        orig_vol = self._get_volume(cyl)
+        origin = self._origin_for(cyl, AXIS_MAP["z"])
+
+        result = cut_part_direct(cyl, 90, AXIS_MAP["z"], origin)
+        assert result is not None
+        result_vol = self._get_volume(result)
+        assert abs(result_vol / orig_vol - 0.75) < 0.02
+
+    def test_parametric_cut_90_box(self):
+        """90° parametric cut of a CadQuery box removes ~25%."""
+        box = cq.Workplane("XY").box(20, 20, 10).val().wrapped
+        orig_vol = self._get_volume(box)
+        origin = self._origin_for(box, AXIS_MAP["z"])
+
+        result = cut_part_direct(box, 90, AXIS_MAP["z"], origin)
+        assert result is not None
+        result_vol = self._get_volume(result)
+        assert abs(result_vol / orig_vol - 0.75) < 0.02
+
+
+# ============================================================================
+# Test: is_mesh_file correctly detects mesh vs CAD files
+# ============================================================================
+
+class TestIsMeshFile:
+    """Verify that is_mesh_file correctly classifies file types."""
+
+    def test_stl_is_mesh(self):
+        assert is_mesh_file("model.stl") is True
+        assert is_mesh_file("model.STL") is True
+
+    def test_obj_is_mesh(self):
+        assert is_mesh_file("model.obj") is True
+
+    def test_ply_is_mesh(self):
+        assert is_mesh_file("model.ply") is True
+
+    def test_3mf_is_mesh(self):
+        assert is_mesh_file("model.3mf") is True
+
+    def test_step_is_not_mesh(self):
+        assert is_mesh_file("model.step") is False
+        assert is_mesh_file("model.STEP") is False
+
+    def test_iges_is_not_mesh(self):
+        assert is_mesh_file("model.iges") is False
+
+    def test_brep_is_not_mesh(self):
+        assert is_mesh_file("model.brep") is False
 
 
 if __name__ == "__main__":
