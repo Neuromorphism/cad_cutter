@@ -38,6 +38,7 @@ from assemble import (
     _cutter_params,
     tessellate_shape,
     _mesh_shell_to_solid,
+    midscale_parts,
     AXIS_MAP,
 )
 
@@ -109,6 +110,40 @@ def beholder_shape():
     """Load beholder.stl and return the OCP solid shape."""
     wp, name = load_part(BEHOLDER_STL)
     return wp.val().wrapped
+
+
+class TestMidscale:
+    def test_midscale_xy_and_z_contacts(self):
+        outer_shell = (
+            cq.Workplane("XY")
+            .box(10, 10, 2)
+            .cut(cq.Workplane("XY").box(8, 8, 2))
+            .translate((0, 0, 1))
+            .val()
+            .wrapped
+        )
+        outer_below = cq.Workplane("XY").box(10, 10, 2).translate((0, 0, -2)).val().wrapped
+        outer_above = cq.Workplane("XY").box(10, 10, 2).translate((0, 0, 4)).val().wrapped
+        mid_shape = cq.Workplane("XY").box(6, 6, 2).translate((0, 0, 1)).val().wrapped
+
+        part_info = [
+            ("outer_1", outer_shell, cq.Location(), (0.5, 0.5, 0.5), None, False),
+            ("outer_2", outer_above, cq.Location(), (0.5, 0.5, 0.5), None, False),
+            ("outer_0", outer_below, cq.Location(), (0.5, 0.5, 0.5), None, False),
+            ("mid_1", mid_shape, cq.Location(), (0.2, 0.2, 0.8), None, False),
+        ]
+
+        scaled = midscale_parts(part_info, debug=False)
+        scaled_mid = [e for e in scaled if e[0] == "mid_1"][0][1]
+
+        b0 = get_bbox_vals(mid_shape)
+        b1 = get_bbox_vals(scaled_mid)
+
+        assert (b1[3] - b1[0]) > (b0[3] - b0[0])
+        assert (b1[5] - b1[2]) > (b0[5] - b0[2])
+        assert b1[2] <= -1.0 + 1e-4
+        assert b1[5] >= 3.0 - 1e-4
+
 
 
 # ============================================================================

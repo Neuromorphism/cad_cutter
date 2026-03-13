@@ -54,11 +54,13 @@ from OCP.BRepTools import BRepTools
 from OCP.BRepBndLib import BRepBndLib
 from OCP.Bnd import Bnd_Box
 from OCP.gp import gp_Trsf, gp_Vec, gp_Ax1, gp_Ax2, gp_Pnt, gp_Dir
-from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
+from OCP.gp import gp_GTrsf
+from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform, BRepBuilderAPI_GTransform
 from OCP.IFSelect import IFSelect_RetDone
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from OCP.TopLoc import TopLoc_Location
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
+from OCP.BRepAlgoAPI import BRepAlgoAPI_Common
 from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder
 from OCP.TopExp import TopExp_Explorer
 from OCP.TopAbs import TopAbs_FACE, TopAbs_SOLID
@@ -2374,6 +2376,157 @@ def _scale_shape_about_center(shape, clearance):
     return BRepBuilderAPI_Transform(shape, trsf, True).Shape()
 
 
+def _scale_shape_anisotropic_about_center(shape, sx=1.0, sy=1.0, sz=1.0):
+    """Return *shape* scaled about bbox center with independent XYZ factors."""
+    xn, yn, zn, xx, yx, zx = get_bounding_box(shape)
+    cx = (xn + xx) / 2.0
+    cy = (yn + yx) / 2.0
+    cz = (zn + zx) / 2.0
+
+    gtrsf = gp_GTrsf()
+    gtrsf.SetValue(1, 1, sx)
+    gtrsf.SetValue(1, 2, 0.0)
+    gtrsf.SetValue(1, 3, 0.0)
+    gtrsf.SetValue(1, 4, cx * (1.0 - sx))
+
+    gtrsf.SetValue(2, 1, 0.0)
+    gtrsf.SetValue(2, 2, sy)
+    gtrsf.SetValue(2, 3, 0.0)
+    gtrsf.SetValue(2, 4, cy * (1.0 - sy))
+
+    gtrsf.SetValue(3, 1, 0.0)
+    gtrsf.SetValue(3, 2, 0.0)
+    gtrsf.SetValue(3, 3, sz)
+    gtrsf.SetValue(3, 4, cz * (1.0 - sz))
+
+    return BRepBuilderAPI_GTransform(shape, gtrsf, True).Shape()
+
+
+def _shape_volume(shape):
+    """Return shape volume (0 on failure)."""
+    from OCP.GProp import GProp_GProps
+    from OCP.BRepGProp import BRepGProp
+
+    try:
+        props = GProp_GProps()
+        BRepGProp.VolumeProperties_s(shape, props)
+        return max(0.0, props.Mass())
+    except Exception:
+        return 0.0
+
+
+def _has_positive_common_volume(shape_a, shape_b, tol=1e-7):
+    """Return True when shapes have a non-trivial volume overlap."""
+    common = BRepAlgoAPI_Common(shape_a, shape_b)
+    common.Build()
+    if not common.IsDone():
+        return False
+    return _shape_volume(common.Shape()) > tol
+
+
+def midscale_parts(part_info, debug=False):
+    """Expand mid-tier parts after stacking: XY to outer contact, then Z.
+
+    XY scaling is uniform (single factor for X and Y). Z scaling uses an
+    independent factor.
+    """
+    world_entries = []
+    for entry in part_info:
+        name, shape, loc, rgb = entry[0], entry[1], entry[2], entry[3]
+        segment = entry[4] if len(entry) > 4 else None
+        is_mesh = entry[5] if len(entry) > 5 else False
+        tier, levels, _ = parse_part_name(name)
+        world_entries.append({
+            "name": name,
+            "shape": apply_location(shape, loc),
+            "rgb": rgb,
+            "segment": segment,
+            "is_mesh": is_mesh,
+            "tier": tier,
+            "levels": set(levels or []),
+        })
+
+    mids = [e for e in world_entries if e["tier"] == "mid"]
+    outers = [e for e in world_entries if e["tier"] == "outer"]
+    z_neighbors = [e for e in world_entries if e["tier"] in {"mid", "outer"}]
+    changed = 0
+
+    for mid in mids:
+        shape = mid["shape"]
+
+        # --- XY: uniform scale until non-trivial overlap with matching outer ---
+        outer_targets = [
+            o for o in outers
+            if mid["levels"] and o["levels"] and (mid["levels"] & o["levels"])
+        ]
+        if outer_targets:
+            target_outer = outer_targets[0]["shape"]
+            if not _has_positive_common_volume(shape, target_outer):
+                low, high = 1.0, 1.05
+                found = False
+                for _ in range(20):
+                    trial = _scale_shape_anisotropic_about_center(shape, sx=high, sy=high, sz=1.0)
+                    if _has_positive_common_volume(trial, target_outer):
+                        found = True
+                        break
+                    low = high
+                    high *= 1.25
+                if found:
+                    for _ in range(24):
+                        midf = 0.5 * (low + high)
+                        trial = _scale_shape_anisotropic_about_center(shape, sx=midf, sy=midf, sz=1.0)
+                        if _has_positive_common_volume(trial, target_outer):
+                            high = midf
+                        else:
+                            low = midf
+                    if high > 1.0 + 1e-6:
+                        shape = _scale_shape_anisotropic_about_center(shape, sx=high, sy=high, sz=1.0)
+                        if debug:
+                            print(f"  [DEBUG] Midscale XY {mid['name']}: x{high:.5f}")
+
+        # --- Z: scale until contacting nearest mid/outer above and below ---
+        mnx, mny, mnz, mxx, myy, mxz = get_bounding_box(shape)
+        height = mxz - mnz
+        if height > 1e-9:
+            gap_above = None
+            gap_below = None
+            for other in z_neighbors:
+                if other is mid:
+                    continue
+                onx, ony, onz, oxx, oyy, oxz = get_bounding_box(other["shape"])
+                overlap_xy = not (oxx <= mnx or onx >= mxx or oyy <= mny or ony >= myy)
+                if not overlap_xy:
+                    continue
+                if onz >= mxz:
+                    g = onz - mxz
+                    gap_above = g if gap_above is None else min(gap_above, g)
+                elif oxz <= mnz:
+                    g = mnz - oxz
+                    gap_below = g if gap_below is None else min(gap_below, g)
+
+            if gap_above is not None and gap_below is not None:
+                delta = max(gap_above, gap_below)
+                if delta > 1e-9:
+                    zf = 1.0 + (2.0 * delta / height)
+                    shape = _scale_shape_anisotropic_about_center(shape, sx=1.0, sy=1.0, sz=zf)
+                    if debug:
+                        print(
+                            f"  [DEBUG] Midscale Z {mid['name']}: x{zf:.5f} "
+                            f"(gaps up={gap_above:.5f}, down={gap_below:.5f})"
+                        )
+
+        if shape is not mid["shape"]:
+            changed += 1
+            mid["shape"] = shape
+
+    updated = []
+    for e in world_entries:
+        updated.append((e["name"], e["shape"], Location(), e["rgb"], e["segment"], e["is_mesh"]))
+
+    print(f"  Midscale complete ({changed} mid part(s) adjusted).")
+    return updated
+
+
 def mid_cut_parts(part_info, output_dir="parts", clearance=0.02, debug=False):
     """Cut mid-tier parts to clear inner-tier parts and export the cut mids.
 
@@ -2856,7 +3009,21 @@ def run_pipeline(args):
             assy.add(wp, name=name, loc=loc, color=cq_color)
         print("  Physics simulation complete.")
 
-    # 2c. Mid-cut (optional): hollow mid-tier parts using inner-tier clearance
+    # 2c. Mid-scale (optional): expand mid-tier parts to contact neighbors
+    if getattr(args, "midscale", False):
+        print("\nApplying mid scaling (--midscale)...")
+        part_info = midscale_parts(
+            part_info,
+            debug=getattr(args, "debug", False),
+        )
+        assy = Assembly()
+        for entry in part_info:
+            name, shape, loc, rgb = entry[0], entry[1], entry[2], entry[3]
+            wp = cq.Workplane("XY").newObject([cq.Shape(shape)])
+            cq_color = Color(*rgb) if len(rgb) == 3 else Color(*rgb[:3])
+            assy.add(wp, name=name, loc=loc, color=cq_color)
+
+    # 2d. Mid-cut (optional): hollow mid-tier parts using inner-tier clearance
     if getattr(args, "mid_cut", False):
         print("\nApplying mid-part clearance cuts (--mid_cut)...")
         part_info = mid_cut_parts(
@@ -3140,6 +3307,10 @@ def main():
     parser.add_argument(
         "--parts", nargs="?", const="parts", default=None,
         help="Export rotated/scaled pre-stack parts to a directory (default: ./parts).",
+    )
+    parser.add_argument(
+        "--midscale", action="store_true",
+        help="Scale mid-tier parts after stacking: uniform XY until contacting outer, then Z until contacting mid/outer above and below.",
     )
     parser.add_argument(
         "--mid_cut", action="store_true",
