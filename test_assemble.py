@@ -1717,7 +1717,8 @@ class TestOrientToCylinder:
     def _make_frustum_wide_at_top(self):
         """Return a frustum (truncated cone) along Z with the wide end at the top."""
         # Build wide-base-down first, then flip it
-        pts = [(5, 0), (15, 0), (15, 30), (5, 30)]
+        # Solid frustum: r=15 at z=0 (wide), r=5 at z=30 (narrow)
+        pts = [(0, 0), (15, 0), (5, 30), (0, 30)]
         frustum = (
             cq.Workplane("XZ")
             .polyline(pts)
@@ -1755,7 +1756,8 @@ class TestOrientToCylinder:
 
     def test_cone_already_wide_end_down_not_flipped(self):
         """A cone already wide-side-down should not be flipped."""
-        pts = [(5, 0), (15, 0), (15, 30), (5, 30)]
+        # Solid frustum: r=15 at z=0 (wide), r=5 at z=30 (narrow)
+        pts = [(0, 0), (15, 0), (5, 30), (0, 30)]
         frustum = (
             cq.Workplane("XZ")
             .polyline(pts)
