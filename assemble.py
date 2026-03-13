@@ -3261,7 +3261,8 @@ def run_pipeline(args):
     return 0
 
 
-def main():
+def build_parser():
+    """Create and return the CLI argument parser."""
     parser = argparse.ArgumentParser(
         description="CAD Assembly Pipeline: Stack, Cut, and Render",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -3348,6 +3349,11 @@ def main():
         "--debug", action="store_true",
         help="Enable debug output",
     )
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
     sys.exit(run_pipeline(args))
