@@ -2812,6 +2812,28 @@ def cut_shape_by_plane(shape, plane_axis="y", plane_value=0.0, keep_negative=Tru
     return cut_assembly(shape, cutter.val().wrapped)
 
 
+def _ensure_display():
+    """Start a virtual framebuffer if no DISPLAY is set (headless CI)."""
+    import os
+    if os.environ.get("DISPLAY"):
+        return
+    import subprocess, shutil
+    if shutil.which("Xvfb") is None:
+        return
+    # Pick a display number unlikely to conflict
+    display = ":99"
+    try:
+        proc = subprocess.Popen(
+            ["Xvfb", display, "-screen", "0", "1024x768x24"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        os.environ["DISPLAY"] = display
+        import atexit
+        atexit.register(proc.terminate)
+    except Exception:
+        pass
+
+
 def _render_topdown_mask(shape, reference_bounds, resolution=512):
     """Render a deterministic top-down binary mask for validation."""
     import pyvista as pv
@@ -2820,6 +2842,7 @@ def _render_topdown_mask(shape, reference_bounds, resolution=512):
     if len(verts) == 0:
         return np.zeros((resolution, resolution), dtype=bool)
 
+    _ensure_display()
     pv.OFF_SCREEN = True
     plotter = pv.Plotter(off_screen=True, window_size=[resolution, resolution])
     mesh = pv.PolyData(verts, faces.ravel())

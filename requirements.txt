@@ -9,6 +9,9 @@ pyvista>=0.43
 
 # Mesh format support (.stl, .obj, .ply, .3mf)
 trimesh>=4.0
+scipy>=1.10
+rtree>=1.0
+manifold3d>=3.0
 networkx>=3.0
 lxml>=4.9
 
