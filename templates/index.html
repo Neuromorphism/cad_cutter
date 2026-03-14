@@ -1,51 +1,198 @@
 <!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>CAD Cutter UI</title>
+  <title>CAD Cutter</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
+
+  <!-- ── Header ── -->
   <header>
-    <h1>CAD Cutter Pipeline UI</h1>
+    <h1>
+      <span class="logo-icon">&#x2B21;</span>
+      CAD Cutter
+    </h1>
     <div class="controls">
-      <button id="refresh-files">Refresh Files</button>
-      <button id="load-selected">Load Selected</button>
-      <label>Axis
-        <select id="axis-select"><option value="x">X</option><option value="y">Y</option><option value="z" selected>Z</option></select>
-      </label>
-      <label>Gap <input id="gap-input" type="number" step="0.1" value="0"/></label>
+      <button id="refresh-files" class="btn-sm" data-tooltip="Scan directory for CAD files">&#x21BB; Refresh</button>
+      <button id="load-selected" class="btn-primary btn-sm" data-tooltip="Load checked files into workspace">&#x25B6; Load Selected</button>
+      <span class="divider"></span>
+      <div class="control-group">
+        <label>Axis
+          <select id="axis-select">
+            <option value="x">X</option>
+            <option value="y">Y</option>
+            <option value="z" selected>Z</option>
+          </select>
+        </label>
+        <label>Gap
+          <input id="gap-input" type="number" step="0.1" value="0" />
+        </label>
+        <label>Section
+          <input id="section-input" type="number" min="1" step="1" placeholder="all" />
+        </label>
+      </div>
     </div>
   </header>
 
+  <!-- ── Main layout ── -->
   <main>
+
+    <!-- Sidebar -->
     <aside>
-      <h3>Available Parts</h3>
-      <div id="file-list"></div>
-      <h3>Pipeline Stages</h3>
-      <div class="stages">
-        <button data-stage="auto_orient">Auto-orient parts</button>
-        <button data-stage="auto_scale">Auto-scale parts</button>
-        <button data-stage="cut_inner_from_mid">Cut inner from mid</button>
-        <button data-stage="export_parts">Export parts</button>
-        <button data-stage="render_whole">Render whole</button>
-        <button data-stage="export_whole">Export whole</button>
+
+      <!-- File browser -->
+      <div class="sidebar-section">
+        <div class="section-header">
+          <span class="icon">&#x1F4C2;</span> Available Parts
+        </div>
+        <div id="file-list">
+          <div class="empty-state">
+            <span class="empty-icon">&#x1F4E5;</span>
+            <p>Click <strong>Refresh</strong> to scan for CAD files</p>
+          </div>
+        </div>
       </div>
-      <p id="status"></p>
+      <h3>WRL Color Gradient Capability</h3>
+      <div class="stages">
+        <button id="refresh-gradient-files">Refresh Gradient Files</button>
+        <select id="gradient-input"></select>
+        <label>Mode
+          <select id="gradient-mode">
+            <option value="top-bottom" selected>top-bottom</option>
+            <option value="side-side">side-side</option>
+            <option value="front-back">front-back</option>
+            <option value="radial">radial</option>
+          </select>
+        </label>
+        <label>Palette
+          <select id="gradient-palette">
+            <option value="">manual colors</option>
+            <option value="red-blue">red-blue</option>
+            <option value="fire-ice">fire-ice</option>
+            <option value="sunset">sunset</option>
+            <option value="viridis-ish">viridis-ish</option>
+            <option value="grayscale">grayscale</option>
+          </select>
+        </label>
+        <label><input id="gradient-reverse-palette" type="checkbox" /> Reverse palette</label>
+        <label>Source Color <input id="gradient-source-color" type="text" value="#FF0000" /></label>
+        <label>Sink Color <input id="gradient-sink-color" type="text" value="#0000FF" /></label>
+        <label>Source Temp <input id="gradient-source-temp" type="number" value="500" step="1" /></label>
+        <label>Sink Temp <input id="gradient-sink-temp" type="number" value="300" step="1" /></label>
+        <label>Ambient Temp <input id="gradient-ambient-temp" type="number" value="300" step="1" /></label>
+        <label>dt <input id="gradient-dt" type="number" value="0.1" step="0.01" min="0" /></label>
+        <label>Timesteps <input id="gradient-max-steps" type="number" value="4000" step="1" min="1" /></label>
+        <label>Diffusion Rate <input id="gradient-diffusion-rate" type="number" value="1.0" step="0.1" min="0" /></label>
+        <label>Source Band <input id="gradient-source-band" type="number" value="0.03" step="0.01" min="0" max="0.49" /></label>
+        <label>Sink Band <input id="gradient-sink-band" type="number" value="0.03" step="0.01" min="0" max="0.49" /></label>
+        <label>Radial Inner <input id="gradient-radial-inner" type="number" value="0.1" step="0.01" min="0" max="0.99" /></label>
+        <label>Radial Outer <input id="gradient-radial-outer" type="number" value="0.95" step="0.01" min="0.01" max="1" /></label>
+        <input id="gradient-output" type="text" value="web_colored_output.ply" placeholder="Output .ply" />
+        <input id="gradient-render" type="text" value="web_colored_output.svg" placeholder="Optional render .svg" />
+        <button id="run-gradient-capability">Run WRL Gradient</button>
+
+      <!-- Pipeline stages -->
+      <div class="sidebar-section">
+        <div class="section-header">
+          <span class="icon">&#x2699;</span> Pipeline Stages
+        </div>
+        <div class="stages">
+          <button data-stage="auto_orient"><span class="stage-num">1</span> Auto-orient parts</button>
+          <button data-stage="auto_scale"><span class="stage-num">2</span> Auto-scale parts</button>
+          <button data-stage="cut_inner_from_mid"><span class="stage-num">3</span> Cut inner from mid</button>
+          <button data-stage="export_parts"><span class="stage-num">4</span> Export parts</button>
+          <button data-stage="render_whole"><span class="stage-num">5</span> Render assembly</button>
+          <button data-stage="export_whole"><span class="stage-num">6</span> Export assembly</button>
+        </div>
+      </div>
+
+      <!-- Gradient capability -->
+      <div class="sidebar-section">
+        <div class="section-header">
+          <span class="icon">&#x1F308;</span> Thermal Gradient
+        </div>
+        <div class="gradient-controls">
+          <div class="field">
+            <label>Input File</label>
+            <div style="display:flex;gap:6px">
+              <select id="gradient-input" style="flex:1"></select>
+              <button id="refresh-gradient-files" class="btn-sm btn-icon" data-tooltip="Refresh gradient file list">&#x21BB;</button>
+            </div>
+          </div>
+          <div class="row">
+            <div class="field">
+              <label>Mode</label>
+              <select id="gradient-mode">
+                <option value="top-bottom" selected>Top-Bottom</option>
+                <option value="radial">Radial</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>Output (.ply)</label>
+              <input id="gradient-output" type="text" value="web_colored_output.ply" />
+            </div>
+          </div>
+          <div class="field">
+            <label>Render (.svg, optional)</label>
+            <input id="gradient-render" type="text" value="web_colored_output.svg" />
+          </div>
+          <button id="run-gradient-capability" class="btn-primary" style="margin-top:4px">
+            &#x25B6; Run Thermal Gradient
+          </button>
+        </div>
+      </div>
+
     </aside>
 
+    <!-- Workspace -->
     <section class="workspace">
+
+      <!-- View toolbar -->
       <div class="view-toolbar">
         <button id="combined-view">Combined View</button>
         <button id="tile-view">Tile View</button>
         <button id="start-sim">Start Physics Sim</button>
+        <span class="view-label">View</span>
+        <button id="combined-view" class="active" data-tooltip="Show assembled model">Combined</button>
+        <button id="tile-view" data-tooltip="Show parts side by side">Tile</button>
+        <span class="spacer"></span>
       </div>
-      <div id="main-canvas"></div>
-      <h3>Part Thumbnails (scroll)</h3>
+
+      <!-- 3D viewport -->
+      <div id="main-canvas">
+        <div class="viewport-hint" id="viewport-hint">
+          <div class="hint-icon">&#x2B21;</div>
+          <p>Load parts to begin</p>
+        </div>
+      </div>
+
+      <!-- Thumbnail strip -->
+      <div class="thumb-strip-header">
+        <h3>Part Thumbnails</h3>
+        <span class="part-count" id="part-count">0 parts</span>
+      </div>
       <div id="thumbnails"></div>
+
     </section>
+
   </main>
+
+  <!-- Status bar -->
+  <div id="status-bar">
+    <span class="status-dot idle" id="status-dot"></span>
+    <span id="status">Ready</span>
+    <div id="progress-container" class="progress-container" style="display:none">
+      <div class="progress-bar">
+        <div class="progress-fill" id="progress-fill"></div>
+      </div>
+      <span class="progress-text" id="progress-text"></span>
+    </div>
+  </div>
+
+  <!-- Toast container -->
+  <div id="toast-container"></div>
 
 <script type="module" src="/static/app.js"></script>
 </body>

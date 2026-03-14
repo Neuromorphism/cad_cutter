@@ -29,6 +29,9 @@ STEP files with optional photorealistic PNG renders.
   rig, SSAO, anti-aliasing, and gradient background.  An alternative
   Blender-based renderer (`batch_render.py`) is included for production-quality
   Cycles renders.
+- **WRL thermal gradient capability** — includes vendored
+  `wrl-color-gradient-app` for thermal diffusion coloring on
+  `.wrl/.vrml/.stl/.3mf` meshes to colored `.ply` with optional `.svg` preview.
 
 ---
 
@@ -115,11 +118,21 @@ The UI supports:
 - a main 3D workspace with combined view and tile view
 - per-part manual rotation (X/Y/Z) and manual scaling near each thumbnail
 - pipeline-stage buttons for auto-orient, auto-scale, cut inner from mid, export parts, render whole, and export whole
+- a WRL gradient capability panel for thermal-coloring `.wrl/.vrml/.stl/.3mf` files
 
 ## Command-Line Reference
 
 ```
 python assemble.py <inputs...> [options]
+```
+
+### Gradient capability (CLI)
+
+```bash
+python assemble.py input.stl --gradient-only \
+  --gradient-mode top-bottom \
+  --gradient-output colored_output.ply \
+  --gradient-render colored_output.svg
 ```
 
 ### Arguments
@@ -142,6 +155,10 @@ python assemble.py <inputs...> [options]
 | `--midscale` | *(off)* | After orient/stack, scale each `mid_*`: uniform XY until its volume contacts matching `outer_*`, then independent Z until it contacts a `mid_*`/`outer_*` above and below. |
 | `--mid_cut` | *(off)* | Cut each `mid_*` part to clear matching `inner_*` geometry with 0.02 in clearance; exports cut mid parts to `parts/` (or `--parts` dir) |
 | `--debug` | *(off)* | Verbose logging; includes cutter shape in output |
+| `--gradient-only` | *(off)* | Run only WRL/STL/3MF thermal gradient capability and skip CAD assembly pipeline |
+| `--gradient-output` | `colored_output.ply` | Output PLY path for gradient capability |
+| `--gradient-render` | *(none)* | Optional SVG render output for gradient capability |
+| `--gradient-mode` | `top-bottom` | Thermal source/sink placement mode (`top-bottom` or `radial`) |
 
 ---
 
