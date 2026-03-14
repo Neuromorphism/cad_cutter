@@ -3,6 +3,10 @@ import { OrbitControls } from 'https://unpkg.com/three@0.161.0/examples/jsm/cont
 
 const fileList = document.getElementById('file-list');
 const statusEl = document.getElementById('status');
+const gradientInput = document.getElementById('gradient-input');
+const gradientMode = document.getElementById('gradient-mode');
+const gradientOutput = document.getElementById('gradient-output');
+const gradientRender = document.getElementById('gradient-render');
 const mainCanvas = document.getElementById('main-canvas');
 const thumbs = document.getElementById('thumbnails');
 const axisSelect = document.getElementById('axis-select');
@@ -154,6 +158,17 @@ async function refreshFiles(){
   });
 }
 
+async function refreshGradientFiles(){
+  const data = await api('/api/gradient/files');
+  gradientInput.innerHTML='';
+  data.files.forEach((f)=>{
+    const opt = document.createElement('option');
+    opt.value = f;
+    opt.textContent = f;
+    gradientInput.appendChild(opt);
+  });
+}
+
 document.getElementById('refresh-files').addEventListener('click', refreshFiles);
 document.getElementById('load-selected').addEventListener('click', async ()=>{
   const files=[...fileList.querySelectorAll('input:checked')].map((x)=>x.value);
@@ -176,7 +191,28 @@ document.querySelectorAll('[data-stage]').forEach((btn)=>btn.addEventListener('c
   await refreshScene();
 }));
 
+document.getElementById('refresh-gradient-files').addEventListener('click', refreshGradientFiles);
+document.getElementById('run-gradient-capability').addEventListener('click', async ()=>{
+  if (!gradientInput.value){
+    setStatus('No WRL/STL/3MF file available for gradient capability.');
+    return;
+  }
+  const out = await api('/api/capability/wrl_gradient', {
+    method:'POST',
+    body: JSON.stringify({
+      input: gradientInput.value,
+      mode: gradientMode.value,
+      output: gradientOutput.value || 'web_colored_output.ply',
+      render: gradientRender.value || null,
+    }),
+  });
+  setStatus(out.message || 'Gradient capability complete');
+  await refreshFiles();
+  await refreshGradientFiles();
+});
+
 document.getElementById('combined-view').addEventListener('click', ()=>{tileView=false; renderMain();});
 document.getElementById('tile-view').addEventListener('click', ()=>{tileView=true; renderMain();});
 
 refreshFiles();
+refreshGradientFiles();

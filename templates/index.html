@@ -33,6 +33,20 @@
         <button data-stage="render_whole">Render whole</button>
         <button data-stage="export_whole">Export whole</button>
       </div>
+      <h3>WRL Color Gradient Capability</h3>
+      <div class="stages">
+        <button id="refresh-gradient-files">Refresh Gradient Files</button>
+        <select id="gradient-input"></select>
+        <label>Mode
+          <select id="gradient-mode">
+            <option value="top-bottom" selected>top-bottom</option>
+            <option value="radial">radial</option>
+          </select>
+        </label>
+        <input id="gradient-output" type="text" value="web_colored_output.ply" placeholder="Output .ply" />
+        <input id="gradient-render" type="text" value="web_colored_output.svg" placeholder="Optional render .svg" />
+        <button id="run-gradient-capability">Run WRL Gradient</button>
+      </div>
       <p id="status"></p>
     </aside>
 

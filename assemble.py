@@ -38,6 +38,8 @@ import glob
 import argparse
 import math
 import tempfile
+import importlib.util
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -144,6 +146,57 @@ DEFAULT_PALETTE = [
 CAD_EXTENSIONS = {".step", ".stp", ".iges", ".igs", ".brep"}
 MESH_EXTENSIONS = {".stl", ".obj", ".ply", ".3mf"}
 ALL_EXTENSIONS = CAD_EXTENSIONS | MESH_EXTENSIONS
+
+
+def _load_gradient_module():
+    """Load the vendored WRL/STL/3MF thermal colorizer module."""
+    mod_path = Path(__file__).resolve().parent / "wrl-color-gradient-app" / "wrl_color_gradient.py"
+    if not mod_path.exists():
+        raise FileNotFoundError(
+            f"Gradient capability module not found at '{mod_path}'. "
+            "Ensure wrl-color-gradient-app is present in the repository."
+        )
+    spec = importlib.util.spec_from_file_location("wrl_color_gradient", mod_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load gradient module from '{mod_path}'.")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def run_gradient_capability(args):
+    """Run thermal colorization on a mesh input and write colored output files."""
+    filepaths = expand_inputs(args.inputs)
+    if not filepaths:
+        print("No matching files found for gradient capability. Exiting.")
+        return 1
+
+    input_path = filepaths[0]
+    if not os.path.exists(input_path):
+        print(f"Input '{input_path}' not found.")
+        return 1
+
+    module = _load_gradient_module()
+    colorizer = module.MeshThermalColorizer(
+        source_color=module.MeshThermalColorizer.hex_color(args.gradient_source_color),
+        sink_color=module.MeshThermalColorizer.hex_color(args.gradient_sink_color),
+        mode=args.gradient_mode,
+        source_temp=args.gradient_source_temp,
+        sink_temp=args.gradient_sink_temp,
+        ambient_temp=args.gradient_ambient_temp,
+        material=args.gradient_material,
+        dt=args.gradient_dt,
+        max_steps=args.gradient_max_steps,
+    )
+    colorizer.process(input_path, args.gradient_output, args.gradient_render)
+    print("\n=== Gradient Capability Complete ===")
+    print(f"  Input:      {input_path}")
+    print(f"  Mode:       {args.gradient_mode}")
+    print(f"  Output PLY: {args.gradient_output}")
+    if args.gradient_render:
+        print(f"  Output SVG: {args.gradient_render}")
+    return 0
 
 
 def expand_inputs(raw_inputs):
@@ -3094,6 +3147,9 @@ def run_validation_pipeline(shape, resolution=512, mismatch_ratio=0.01, debug=Fa
 
 def run_pipeline(args):
     """Execute the full assembly pipeline."""
+    if getattr(args, "gradient_only", False):
+        return run_gradient_capability(args)
+
     # 0. Configure GPU acceleration
     if getattr(args, "no_gpu", False):
         set_gpu_enabled(False)
@@ -3562,6 +3618,54 @@ def build_parser():
     parser.add_argument(
         "--no-gpu", action="store_true", default=False,
         help="Disable GPU acceleration even when hardware is available.",
+    )
+    parser.add_argument(
+        "--gradient-only", action="store_true",
+        help="Run the vendored WRL/STL/3MF thermal gradient colorizer capability and skip CAD assembly.",
+    )
+    parser.add_argument(
+        "--gradient-output", default="colored_output.ply",
+        help="Gradient capability output PLY path (default: colored_output.ply).",
+    )
+    parser.add_argument(
+        "--gradient-render", default=None,
+        help="Optional SVG preview path for gradient capability.",
+    )
+    parser.add_argument(
+        "--gradient-mode", choices=["top-bottom", "radial"], default="top-bottom",
+        help="Gradient coloring mode.",
+    )
+    parser.add_argument(
+        "--gradient-source-color", default="#FF0000",
+        help="Hot/source color as hex RGB (default: #FF0000).",
+    )
+    parser.add_argument(
+        "--gradient-sink-color", default="#0000FF",
+        help="Cold/sink color as hex RGB (default: #0000FF).",
+    )
+    parser.add_argument(
+        "--gradient-source-temp", type=float, default=500.0,
+        help="Source temperature for gradient simulation.",
+    )
+    parser.add_argument(
+        "--gradient-sink-temp", type=float, default=300.0,
+        help="Sink temperature for gradient simulation.",
+    )
+    parser.add_argument(
+        "--gradient-ambient-temp", type=float, default=300.0,
+        help="Ambient temperature for gradient simulation.",
+    )
+    parser.add_argument(
+        "--gradient-material", choices=["stainless_steel", "aluminum"], default="stainless_steel",
+        help="Material preset used for thermal diffusivity.",
+    )
+    parser.add_argument(
+        "--gradient-dt", type=float, default=0.1,
+        help="Simulation timestep for gradient capability.",
+    )
+    parser.add_argument(
+        "--gradient-max-steps", type=int, default=4000,
+        help="Maximum simulation steps for gradient capability.",
     )
     return parser
 
