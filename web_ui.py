@@ -21,7 +21,7 @@ from typing import Any
 
 import cadquery as cq
 import trimesh
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request, send_file
 from werkzeug.exceptions import HTTPException
 from OCP.BRepBuilderAPI import BRepBuilderAPI_GTransform
 from OCP.TopAbs import TopAbs_FACE
@@ -53,6 +53,13 @@ def _relative_to_cwd(path: Path) -> str:
     rel = path.resolve().relative_to(cwd)
     rel_str = rel.as_posix()
     return rel_str or "."
+
+
+def _mesh_file_url(path: str | None) -> str | None:
+    if not path:
+        return None
+    rel = _relative_to_cwd(Path(path))
+    return f"/api/mesh-file?path={rel}"
 
 
 @dataclass
@@ -321,11 +328,16 @@ def _build_fast_mesh_scene() -> dict[str, Any]:
     offsets: list[list[float]] = []
     cursor = 0.0
     for idx, part in enumerate(state.parts, start=1):
+        mesh_ext = Path(part.mesh_source_path or "").suffix.lower()
+        use_mesh_url = mesh_ext == ".stl"
+        payload = None
         with _SlowProgressDetail(
             f"Preparing preview {idx} of {len(state.parts)}: {part.name}",
             lambda elapsed, i=idx, name=part.name:
                 f"Reading mesh preview {i} of {len(state.parts)}: {name} ({elapsed:.0f}s)",
         ):
+            payload = None if use_mesh_url else _load_mesh_payload_from_cache_file(part.mesh_source_path, part.shape)
+        if payload is None:
             payload = _load_mesh_payload_from_cache_file(part.mesh_source_path, part.shape)
         mins, maxs = _mesh_bbox(payload)
         offset = [0.0, 0.0, 0.0]
@@ -348,7 +360,9 @@ def _build_fast_mesh_scene() -> dict[str, Any]:
             "rot": list(part.rot_xyz),
             "scale": part.manual_scale,
             "material": part.material,
-            "mesh": payload,
+            "mesh": None if use_mesh_url else payload,
+            "meshUrl": _mesh_file_url(part.mesh_source_path) if use_mesh_url else None,
+            "meshFormat": "stl" if use_mesh_url else None,
         })
         progress.advance(1, f"Prepared preview {idx} of {len(state.parts)}: {part.name}")
 
@@ -575,6 +589,22 @@ def debug_log():
         )
         accepted += 1
     return jsonify({"ok": True, "accepted": accepted})
+
+
+@app.route("/api/mesh-file")
+def mesh_file():
+    raw_path = request.args.get("path", "")
+    if not raw_path:
+        return jsonify({"error": "missing path"}), 400
+    try:
+        path = _safe_resolve(raw_path)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 403
+    if not path.exists() or not path.is_file():
+        return jsonify({"error": f"file not found: {raw_path}"}), 404
+    if path.suffix.lower() not in assemble.MESH_EXTENSIONS:
+        return jsonify({"error": f"unsupported mesh extension: {path.suffix}"}), 400
+    return send_file(path, conditional=True)
 
 
 @app.route("/api/progress/stream")

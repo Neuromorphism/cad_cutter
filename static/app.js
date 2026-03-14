@@ -1,5 +1,6 @@
 import * as THREE from '/static/vendor/three.module.js';
 import { OrbitControls } from '/static/vendor/OrbitControls.js';
+import { STLLoader } from '/static/vendor/STLLoader.js';
 
 /* ── DOM refs ── */
 const fileList       = document.getElementById('file-list');
@@ -60,7 +61,9 @@ let pendingDebugFlush = [];
 let debugFlushTimer = null;
 let debugFlushInFlight = false;
 let geometryCache = new WeakMap();
+let remoteGeometryCache = new Map();
 let thumbRenderGeneration = 0;
+const stlLoader = new STLLoader();
 
 const MATERIAL_OPTIONS = [
   '', 'steel', 'aluminum', 'copper', 'brass', 'bronze', 'gold', 'titanium',
@@ -439,13 +442,18 @@ function geometryFromPayload(payload) {
 
 function meshFromPayload(payload, color = [0.6, 0.7, 0.8]) {
   const geo = geometryFromPayload(payload);
+  const mat = materialForColor(color);
+  return new THREE.Mesh(geo, mat);
+}
+
+function materialForColor(color = [0.6, 0.7, 0.8]) {
   const mat = new THREE.MeshStandardMaterial({
     color: new THREE.Color(...color),
     metalness: 0.35,
     roughness: 0.45,
     envMapIntensity: 0.5,
   });
-  return new THREE.Mesh(geo, mat);
+  return mat;
 }
 
 function isLargeThumbPayload(payload) {
@@ -453,10 +461,37 @@ function isLargeThumbPayload(payload) {
   return vertexCount > 250000;
 }
 
+async function loadRemoteGeometry(part) {
+  if (!part?.meshUrl || part.meshFormat !== 'stl') return null;
+  const cached = remoteGeometryCache.get(part.meshUrl);
+  if (cached) return cached;
+  const geometry = await stlLoader.loadAsync(part.meshUrl);
+  geometry.computeVertexNormals();
+  remoteGeometryCache.set(part.meshUrl, geometry);
+  return geometry;
+}
+
+async function ensureSceneMeshes(scene, context = 'scene') {
+  const pending = (scene?.parts || []).filter((part) => !part.mesh && part.meshUrl);
+  if (!pending.length) return;
+
+  for (let idx = 0; idx < pending.length; idx += 1) {
+    const part = pending[idx];
+    addDebugLog('mesh-fetch', `Fetching ${part.meshFormat?.toUpperCase() || 'mesh'} ${idx + 1} of ${pending.length}: ${part.name}`);
+    const geometry = await loadRemoteGeometry(part);
+    part.meshGeometry = geometry;
+    addDebugLog('mesh-fetch', `Fetched ${part.meshFormat?.toUpperCase() || 'mesh'} ${idx + 1} of ${pending.length}: ${part.name}`);
+  }
+}
+
 function meshFromSceneEntry(entry, fallbackColor = [0.6, 0.7, 0.8]) {
   let mesh;
   if (entry.mesh) {
     mesh = meshFromPayload(entry.mesh, entry.color || fallbackColor);
+  } else if (typeof entry.partIndex === 'number' && sceneData?.parts?.[entry.partIndex]?.meshGeometry) {
+    mesh = new THREE.Mesh(sceneData.parts[entry.partIndex].meshGeometry, materialForColor(entry.color || fallbackColor));
+    const [x, y, z] = entry.offset || [0, 0, 0];
+    mesh.position.set(x, y, z);
   } else if (typeof entry.partIndex === 'number' && sceneData?.parts?.[entry.partIndex]?.mesh) {
     mesh = meshFromPayload(sceneData.parts[entry.partIndex].mesh, entry.color || fallbackColor);
     const [x, y, z] = entry.offset || [0, 0, 0];
@@ -531,7 +566,9 @@ function renderMain() {
     });
   } else {
     sceneData.parts.forEach((p, i) => {
-      const mesh = meshFromPayload(p.mesh);
+      const mesh = p.meshGeometry
+        ? new THREE.Mesh(p.meshGeometry, materialForColor())
+        : meshFromPayload(p.mesh);
       mesh.position.x = i * 120;
       group.add(mesh);
     });
@@ -636,11 +673,30 @@ function buildThumb(part, idx, deferPreview = false) {
     }
     const ctx = buildRenderer(canvas);
     if (ctx.grid) ctx.scene.remove(ctx.grid);
-    const mesh = meshFromPayload(part.mesh);
-    ctx.scene.add(mesh);
-    fitCamera(ctx.camera, ctx.controls, mesh);
-    const stopThumbAnimation = animate(ctx);
-    thumbAnimations.push(stopThumbAnimation);
+    const showMesh = (mesh) => {
+      ctx.scene.add(mesh);
+      fitCamera(ctx.camera, ctx.controls, mesh);
+      const stopThumbAnimation = animate(ctx);
+      thumbAnimations.push(stopThumbAnimation);
+    };
+    if (part.meshGeometry) {
+      showMesh(new THREE.Mesh(part.meshGeometry, materialForColor()));
+    } else if (part.mesh) {
+      showMesh(meshFromPayload(part.mesh));
+    } else if (part.meshUrl && part.meshFormat === 'stl') {
+      loadRemoteGeometry(part)
+        .then((geometry) => {
+          part.meshGeometry = geometry;
+          showMesh(new THREE.Mesh(geometry, materialForColor()));
+        })
+        .catch((error) => {
+          canvas.innerHTML = `
+            <div class="thumb-placeholder">
+              <span class="thumb-placeholder-title">Preview failed</span>
+              <span class="thumb-placeholder-copy">${error.message}</span>
+            </div>`;
+        });
+    }
   };
 
   if (deferPreview) {
@@ -722,6 +778,7 @@ async function refreshScene() {
     }
     addDebugLog('scene-refresh', 'Requesting scene payload');
     sceneData = await api('/api/scene', { timeoutMs: 15000 });
+    await ensureSceneMeshes(sceneData, 'scene-fetch');
     addDebugLog('scene-refresh', 'Scene payload received', {
       parts: sceneData.parts?.length || 0,
       combined: sceneData.combined?.length || 0,
@@ -1055,6 +1112,7 @@ document.getElementById('load-selected').addEventListener('click', withLoading(
           combined: loadResult.scene.combined?.length || 0,
         });
         sceneData = loadResult.scene;
+        await ensureSceneMeshes(sceneData, 'load-inline');
         renderMain();
         renderThumbs();
       } else {
