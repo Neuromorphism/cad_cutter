@@ -291,17 +291,50 @@ def orient_to_cylinder(parts, gap=0.0):
     # Step 1 – PCA to find the cylinder height axis and rotate to Z
     # ------------------------------------------------------------------
     all_verts = []
+    used_smoothed = False
+
+    def _smoothed_orientation_vertices(shape):
+        """Return heavily smoothed vertices for robust orientation PCA.
+
+        Irregular cylindrical parts can have local protrusions or damage that
+        bias a direct PCA.  This helper tessellates the original shape,
+        performs strong Taubin smoothing on the mesh copy, and returns the
+        smoothed vertex cloud so orientation follows the global cylinder trend.
+
+        If smoothing cannot be performed, it falls back to the raw tessellation.
+        """
+        verts, faces = tessellate_shape(shape, tolerance=1.0)
+        if len(verts) == 0:
+            return verts, False
+
+        tri_faces = np.asarray(faces[:, 1:4], dtype=np.int64) if len(faces) else np.zeros((0, 3), dtype=np.int64)
+        if len(tri_faces) == 0:
+            return verts, False
+
+        try:
+            import trimesh
+
+            mesh = trimesh.Trimesh(vertices=np.asarray(verts, dtype=float), faces=tri_faces, process=False)
+            trimesh.smoothing.filter_taubin(mesh, lamb=0.5, nu=-0.53, iterations=80)
+            return np.asarray(mesh.vertices), True
+        except Exception:
+            return verts, False
+
     for entry in parts:
         wp, name = entry[0], entry[1]
         shape = wp.val().wrapped
-        verts, _ = tessellate_shape(shape, tolerance=1.0)
+        verts, smoothed = _smoothed_orientation_vertices(shape)
         if len(verts) > 0:
             all_verts.append(verts)
+            used_smoothed = used_smoothed or smoothed
 
     if not all_verts:
         return parts
 
     vertices = np.vstack(all_verts)
+
+    if used_smoothed:
+        print("  Using heavily smoothed mesh proxy for orientation solve.")
 
     # GPU-accelerated PCA when available (significant speedup for large meshes)
     principal = pca_principal_axis(vertices) if gpu_enabled() else None
