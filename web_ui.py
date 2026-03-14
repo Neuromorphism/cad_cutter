@@ -64,8 +64,15 @@ def _relative_to_cwd(path: Path) -> str:
 def _mesh_file_url(path: str | None) -> str | None:
     if not path:
         return None
-    rel = _relative_to_cwd(Path(path))
+    try:
+        rel = _relative_to_cwd(Path(path))
+    except Exception:
+        return None
     return f"/api/mesh-file?path={rel}"
+
+
+def _preview_source_path_for_part(part: "PartState") -> str | None:
+    return part.preview_path or part.mesh_source_path or part.file_path
 
 
 @dataclass
@@ -474,6 +481,37 @@ def _parts_for_export() -> list[dict[str, Any]]:
     return out
 
 
+def _export_parts_fast(output_dir: str) -> None:
+    import os
+    import trimesh
+
+    os.makedirs(output_dir, exist_ok=True)
+    used_names: dict[str, int] = {}
+    for part in state.parts:
+        name = _part_display_name(part)
+        suffix = used_names.get(name, 0)
+        used_names[name] = suffix + 1
+        out_name = f"{name}_{suffix}{part.source_ext}" if suffix else f"{name}{part.source_ext}"
+        out_path = Path(output_dir) / out_name
+
+        if assemble.is_mesh_file(part.file_path):
+            payload = _load_mesh_payload_from_cache_file(part.file_path, part.shape)
+            vertices, faces = _payload_arrays(payload)
+            mesh = trimesh.Trimesh(
+                vertices=np.asarray(vertices, dtype=float),
+                faces=np.asarray(faces, dtype=np.int64),
+                process=False,
+            )
+            mesh.apply_transform(_part_transform_matrix_4x4(part))
+            mesh.export(out_path)
+            continue
+
+        _ensure_real_geometry(part)
+        if out_path.suffix.lower() not in {".step", ".stp", ".iges", ".igs", ".brep"}:
+            out_path = out_path.with_suffix(".step")
+        assemble.export_part_native(_apply_manual_transforms(part), str(out_path), out_path.suffix, False)
+
+
 def _mesh_bbox(payload: dict[str, Any]) -> tuple[list[float], list[float]]:
     verts = payload.get("vertices", [])
     if not verts:
@@ -484,6 +522,83 @@ def _mesh_bbox(payload: dict[str, Any]) -> tuple[list[float], list[float]]:
     mins = [min(xs), min(ys), min(zs)]
     maxs = [max(xs), max(ys), max(zs)]
     return mins, maxs
+
+
+def _axis_angle_matrix(axis: tuple[float, float, float], angle_rad: float) -> np.ndarray:
+    ax = np.asarray(axis, dtype=float)
+    norm = float(np.linalg.norm(ax))
+    if norm < 1e-9 or abs(angle_rad) < 1e-9:
+        return np.eye(3, dtype=float)
+    ax = ax / norm
+    x, y, z = ax.tolist()
+    c = math.cos(angle_rad)
+    s = math.sin(angle_rad)
+    t = 1.0 - c
+    return np.array([
+        [t*x*x + c,     t*x*y - s*z, t*x*z + s*y],
+        [t*x*y + s*z,   t*y*y + c,   t*y*z - s*x],
+        [t*x*z - s*y,   t*y*z + s*x, t*z*z + c],
+    ], dtype=float)
+
+
+def _euler_rotation_matrix_deg(rx: float, ry: float, rz: float) -> np.ndarray:
+    rx_rad = math.radians(rx)
+    ry_rad = math.radians(ry)
+    rz_rad = math.radians(rz)
+    cx, sx = math.cos(rx_rad), math.sin(rx_rad)
+    cy, sy = math.cos(ry_rad), math.sin(ry_rad)
+    cz, sz = math.cos(rz_rad), math.sin(rz_rad)
+    mx = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]], dtype=float)
+    my = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], dtype=float)
+    mz = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]], dtype=float)
+    return mz @ my @ mx
+
+
+def _part_linear_transform_matrix(part: PartState) -> np.ndarray:
+    matrix = np.eye(3, dtype=float)
+    for axis, angle_rad in part.orientation_steps:
+        matrix = _axis_angle_matrix(axis, angle_rad) @ matrix
+    matrix = _euler_rotation_matrix_deg(*part.rot_xyz) @ matrix
+    matrix = matrix * float(part.manual_scale)
+    return matrix
+
+
+def _transformed_bbox(mins: list[float], maxs: list[float], part: PartState) -> tuple[np.ndarray, np.ndarray]:
+    corners = np.array([
+        [x, y, z]
+        for x in (mins[0], maxs[0])
+        for y in (mins[1], maxs[1])
+        for z in (mins[2], maxs[2])
+    ], dtype=float)
+    transformed = corners @ _part_linear_transform_matrix(part).T
+    return transformed.min(axis=0), transformed.max(axis=0)
+
+
+def _part_transform_matrix_4x4(part: PartState) -> np.ndarray:
+    matrix = np.eye(4, dtype=float)
+    matrix[:3, :3] = _part_linear_transform_matrix(part)
+    return matrix
+
+
+def _preview_payload_for_part(part: PartState) -> dict[str, Any]:
+    source_path = _preview_source_path_for_part(part)
+    return _load_mesh_payload_from_cache_file(source_path, part.shape)
+
+
+def _preview_thumb_payload_for_part(part: PartState, target_triangles: int = _THUMB_TRIANGLE_TARGET) -> dict[str, Any]:
+    source_path = _preview_source_path_for_part(part)
+    return _load_decimated_mesh_payload(
+        source_path,
+        part.shape,
+        tolerance=0.8,
+        target_triangles=target_triangles,
+    )
+
+
+def _preview_bounds_for_part(part: PartState) -> tuple[np.ndarray, np.ndarray]:
+    payload = _preview_payload_for_part(part)
+    mins, maxs = _mesh_bbox(payload)
+    return _transformed_bbox(mins, maxs, part)
 
 
 def _axis_vector(axis_name: str) -> np.ndarray:
@@ -558,9 +673,10 @@ def _sample_vertices(payload: dict[str, Any], limit: int = _ORIENT_VERTEX_LIMIT)
 
 
 def _orientation_payload_for_part(part: PartState, target_triangles: int = _ORIENT_TRIANGLE_TARGET) -> dict[str, Any]:
-    if not _part_has_runtime_transform(part) and part.mesh_source_path:
+    source_path = _preview_source_path_for_part(part)
+    if not _part_has_runtime_transform(part) and source_path:
         return _load_decimated_mesh_payload(
-            part.mesh_source_path,
+            source_path,
             part.shape,
             tolerance=0.8,
             target_triangles=target_triangles,
@@ -579,100 +695,267 @@ def _autodrop_mesh_payloads(part_info) -> list[dict[str, Any] | None]:
         name, shape, _loc = entry[:3]
         queue = part_lookup.get(name)
         part = queue.pop(0) if queue else None
-        if part is None or not part.mesh_source_path or _part_has_runtime_transform(part):
+        source_path = _preview_source_path_for_part(part) if part is not None else None
+        if part is None or not source_path:
             payloads.append(None)
             continue
         try:
-            payloads.append(_load_mesh_payload_from_cache_file(part.mesh_source_path, shape))
+            payloads.append(_load_mesh_payload_from_cache_file(source_path, shape))
         except Exception:
             payloads.append(None)
     return payloads
 
 
 def _can_use_fast_mesh_scene(part_states: list[PartState]) -> bool:
-    if not part_states:
-        return False
-    for part in part_states:
-        if not part.mesh_source_path:
-            return False
-        if Path(part.mesh_source_path).suffix.lower() not in assemble.MESH_EXTENSIONS:
-            return False
-        if _part_has_runtime_transform(part):
-            return False
-        tier, _levels, _segment = assemble.parse_part_name(part.name)
-        if tier is not None:
-            return False
-    return True
+    return bool(part_states) and all(_preview_source_path_for_part(part) for part in part_states)
 
 
-def _build_fast_mesh_scene() -> dict[str, Any]:
+def _preview_stack_offsets(records: list[dict[str, Any]]) -> list[list[float]]:
     axis_index = {"x": 0, "y": 1, "z": 2}.get(state.axis, 2)
     center_axes = [idx for idx in range(3) if idx != axis_index]
-    progress.begin("Scene", len(state.parts) * 2, "Stacking mesh previews for scene...")
+    offsets: list[list[float]] = [[0.0, 0.0, 0.0] for _ in records]
+    auto_level = 1
+    classified = []
+    levels_map: dict[int, dict[str, list[dict[str, Any]]]] = {}
+    spanning: list[dict[str, Any]] = []
 
-    part_meshes = []
-    offsets: list[list[float]] = []
+    for record in records:
+        tier, levels, segment = assemble.parse_part_name(record["part"].name)
+        if tier is None or not levels:
+            tier = "outer"
+            levels = [auto_level]
+            segment = None
+            auto_level += 1
+        entry = {"tier": tier, "levels": levels, "segment": segment, "record": record}
+        classified.append(entry)
+        if len(levels) == 1:
+            levels_map.setdefault(levels[0], {}).setdefault(tier, []).append(entry)
+        else:
+            spanning.append(entry)
+            for level in levels:
+                levels_map.setdefault(level, {})
+
     cursor = 0.0
-    for idx, part in enumerate(state.parts, start=1):
-        mesh_ext = Path(part.mesh_source_path or "").suffix.lower()
-        use_mesh_url = mesh_ext == ".stl"
-        payload = None
-        with _SlowProgressDetail(
-            f"Preparing preview {idx} of {len(state.parts)}: {part.name}",
-            lambda elapsed, i=idx, name=part.name:
-                f"Reading mesh preview {i} of {len(state.parts)}: {name} ({elapsed:.0f}s)",
-        ):
-            payload = None if use_mesh_url else _load_mesh_payload_from_cache_file(part.mesh_source_path, part.shape)
-        if payload is None:
-            payload = _load_mesh_payload_from_cache_file(part.mesh_source_path, part.shape)
-        thumb_payload = None if use_mesh_url else _load_decimated_mesh_payload(
-            part.mesh_source_path,
-            part.shape,
-            tolerance=0.8,
-            target_triangles=_THUMB_TRIANGLE_TARGET,
-        )
-        mins, maxs = _mesh_bbox(payload)
+    level_z_base: dict[int, float] = {}
+    level_z_top: dict[int, float] = {}
+    for level in sorted(levels_map):
+        group = levels_map[level]
+        level_z_base[level] = cursor
+        if not group:
+            level_z_top[level] = cursor
+            continue
+
+        ref_entry = None
+        for tier_name in ("outer", "mid", "inner"):
+            entries = group.get(tier_name)
+            if entries:
+                ref_entry = entries[0]
+                break
+        if ref_entry is None:
+            level_z_top[level] = cursor
+            continue
+
+        ref_record = ref_entry["record"]
+        ref_height = float(ref_record["maxs"][axis_index] - ref_record["mins"][axis_index])
+
+        for tier_name in ("outer", "mid", "inner"):
+            for entry in group.get(tier_name, []):
+                record = entry["record"]
+                mins = record["mins"]
+                maxs = record["maxs"]
+                offset = [0.0, 0.0, 0.0]
+                for center_axis in center_axes:
+                    offset[center_axis] = -((mins[center_axis] + maxs[center_axis]) / 2.0)
+                offset[axis_index] = cursor - mins[axis_index]
+                offsets[record["index"]] = offset
+
+        level_z_top[level] = cursor + ref_height
+        cursor += ref_height + state.gap
+
+    for entry in spanning:
+        levels = entry["levels"]
+        first_level = min(levels)
+        if first_level not in level_z_base:
+            continue
+        record = entry["record"]
+        mins = record["mins"]
+        maxs = record["maxs"]
         offset = [0.0, 0.0, 0.0]
         for center_axis in center_axes:
             offset[center_axis] = -((mins[center_axis] + maxs[center_axis]) / 2.0)
-        offset[axis_index] = cursor - mins[axis_index]
-        cursor += (maxs[axis_index] - mins[axis_index]) + state.gap
-        offsets.append(offset)
+        offset[axis_index] = level_z_base[first_level] - mins[axis_index]
+        offsets[record["index"]] = offset
+
+    return offsets
+
+
+def _preview_records() -> list[dict[str, Any]]:
+    return [_preview_record_for_part(idx, part) for idx, part in enumerate(state.parts)]
+
+
+def _preview_record_for_part(index: int, part: PartState) -> dict[str, Any]:
+    payload = _preview_payload_for_part(part)
+    raw_mins, raw_maxs = _mesh_bbox(payload)
+    mins, maxs = _transformed_bbox(raw_mins, raw_maxs, part)
+    source_path = _preview_source_path_for_part(part)
+    return {
+        "index": index,
+        "part": part,
+        "payload": payload,
+        "mins": np.asarray(mins, dtype=float),
+        "maxs": np.asarray(maxs, dtype=float),
+        "source_path": source_path,
+        "mesh_ext": Path(source_path or "").suffix.lower(),
+        "display_name": _part_display_name(part),
+        "segment": assemble.parse_part_name(part.name)[2],
+        "color": list(assemble.pick_color(part.name, index)[1]),
+    }
+
+
+def _preview_part_info(records: list[dict[str, Any]], offsets: list[list[float]]):
+    part_info = []
+    mesh_payloads = []
+    for record, offset in zip(records, offsets):
+        part_info.append((
+            record["display_name"],
+            None,
+            assemble.Location(assemble.Vector(*offset)),
+            tuple(record["color"]),
+            record["segment"],
+            record["mesh_ext"] in assemble.MESH_EXTENSIONS,
+        ))
+        mesh_payloads.append(record["payload"])
+    return part_info, mesh_payloads
+
+
+def _render_preview_assembly_fast(output_path: str, resolution: int = 900, target_triangles: int = 12000) -> None:
+    import pyvista as pv
+
+    pv.OFF_SCREEN = True
+    records = _preview_records()
+    offsets = _preview_stack_offsets(records)
+    progress.begin("Rendering", len(records) + 1, "Preparing preview meshes...")
+    plotter = pv.Plotter(off_screen=True, window_size=[resolution, resolution])
+    plotter.set_background("white", top="lightsteelblue")
+
+    for idx, (record, offset) in enumerate(zip(records, offsets), start=1):
+        part = record["part"]
+        payload = _preview_thumb_payload_for_part(part, target_triangles=target_triangles)
+        vertices, faces = _payload_arrays(payload)
+        if len(vertices) == 0 or len(faces) == 0:
+            progress.advance(1, f"Skipped {part.name}")
+            continue
+
+        transformed = vertices @ _part_linear_transform_matrix(part).T
+        transformed = transformed + np.asarray(offset, dtype=float) + np.asarray(part.settle_offset, dtype=float)
+        face_data = np.concatenate(
+            [np.full((len(faces), 1), 3, dtype=np.int64), np.asarray(faces, dtype=np.int64)],
+            axis=1,
+        ).reshape(-1)
+        mesh = pv.PolyData(np.asarray(transformed, dtype=float), face_data)
+        plotter.add_mesh(
+            mesh,
+            color=tuple(record["color"]),
+            ambient=0.28,
+            diffuse=0.7,
+            specular=0.35,
+            specular_power=30,
+            smooth_shading=True,
+        )
+        progress.advance(1, f"Prepared render mesh {idx} of {len(records)}: {part.name}")
+
+    plotter.camera_position = "iso"
+    plotter.reset_camera()
+    plotter.camera.zoom(0.92)
+
+    progress.advance(1, "Capturing screenshot...")
+    plotter.screenshot(output_path)
+    plotter.close()
+    progress.finish(f"Render saved: {output_path}")
+
+
+def _export_preview_assembly_mesh(output_path: str) -> None:
+    import trimesh
+
+    records = _preview_records()
+    offsets = _preview_stack_offsets(records)
+    progress.begin("Exporting", len(records) + 1, "Preparing assembly mesh...")
+    meshes = []
+    for idx, (record, offset) in enumerate(zip(records, offsets), start=1):
+        part = record["part"]
+        vertices, faces = _payload_arrays(record["payload"])
+        if len(vertices) == 0 or len(faces) == 0:
+            progress.advance(1, f"Skipped {part.name}")
+            continue
+        mesh = trimesh.Trimesh(
+            vertices=np.asarray(vertices, dtype=float),
+            faces=np.asarray(faces, dtype=np.int64),
+            process=False,
+        )
+        mesh.apply_transform(_part_transform_matrix_4x4(part))
+        mesh.apply_translation(np.asarray(offset, dtype=float) + np.asarray(part.settle_offset, dtype=float))
+        meshes.append(mesh)
+        progress.advance(1, f"Prepared assembly mesh {idx} of {len(records)}: {part.name}")
+
+    merged = trimesh.util.concatenate(meshes) if len(meshes) > 1 else (meshes[0] if meshes else None)
+    if merged is None:
+        raise RuntimeError("no mesh geometry available for assembly export")
+    progress.advance(1, "Writing assembly mesh...")
+    merged.export(output_path)
+    progress.finish(f"Assembly exported: {output_path}")
+
+
+def _build_fast_mesh_scene() -> dict[str, Any]:
+    progress.begin("Scene", len(state.parts) * 2, "Stacking preview meshes for scene...")
+    records = []
+    for idx, part in enumerate(state.parts, start=1):
+        with _SlowProgressDetail(
+            f"Preparing preview {idx} of {len(state.parts)}: {part.name}",
+            lambda elapsed, i=idx, name=part.name:
+                f"Reading preview mesh {i} of {len(state.parts)}: {name} ({elapsed:.0f}s)",
+        ):
+            record = _preview_record_for_part(idx - 1, part)
+        records.append(record)
+        progress.advance(1, f"Prepared preview {idx} of {len(state.parts)}: {part.name}")
+
+    offsets = _preview_stack_offsets(records)
+    combined = []
+    part_meshes = []
+    for idx, (record, offset) in enumerate(zip(records, offsets), start=1):
+        part = record["part"]
+        mesh_url = _mesh_file_url(record["source_path"]) if record["mesh_ext"] == ".stl" else None
+        use_mesh_url = bool(mesh_url)
         part_meshes.append({
             "name": part.name,
             "filePath": part.file_path,
-            "meshSourcePath": part.mesh_source_path,
+            "meshSourcePath": record["source_path"],
             "previewPath": part.preview_path,
             "previewOnly": part.preview_only,
             "previewLabel": (
                 f"Preview mesh: {Path(part.preview_path).name}"
-                if part.preview_only and part.preview_path
+                if part.preview_path
                 else None
             ),
             "orientationSteps": _serialize_orientation_steps(part.orientation_steps),
             "rot": list(part.rot_xyz),
             "scale": part.manual_scale,
             "material": part.material,
-            "mesh": None if use_mesh_url else payload,
-            "thumbMesh": thumb_payload,
-            "meshUrl": _mesh_file_url(part.mesh_source_path) if use_mesh_url else None,
+            "mesh": None if use_mesh_url else record["payload"],
+            "thumbMesh": _preview_thumb_payload_for_part(part),
+            "meshUrl": mesh_url,
             "meshFormat": "stl" if use_mesh_url else None,
         })
-        progress.advance(1, f"Prepared preview {idx} of {len(state.parts)}: {part.name}")
-
-    combined = []
-    for idx, (part, offset) in enumerate(zip(state.parts, offsets), start=1):
         settle = np.asarray(part.settle_offset, dtype=float)
         combined.append({
-            "name": part.name,
-            "color": list(assemble.pick_color(part.name, idx - 1)[1]),
+            "name": record["display_name"],
+            "color": record["color"],
             "partIndex": idx - 1,
             "offset": (np.asarray(offset, dtype=float) + settle).tolist(),
         })
         progress.advance(1, f"Prepared assembled mesh {idx} of {len(state.parts)}: {part.name}")
 
     progress.finish("Scene ready")
-    _record_debug_log("server", "scene-fast-path", "Used mesh preview fast path", {
+    _record_debug_log("server", "scene-fast-path", "Used preview mesh fast path", {
         "parts": [part.name for part in state.parts],
         "axis": state.axis,
     })
@@ -904,12 +1187,64 @@ def _solve_orientation_steps(workflow: str) -> tuple[list[tuple[tuple[float, flo
 
 
 def _centroid_along_stack_axis(part: PartState) -> float:
-    shape = _apply_manual_transforms(part)
-    xmin, ymin, zmin, xmax, ymax, zmax = assemble.get_tight_bounding_box(shape)
-    mins = [xmin, ymin, zmin]
-    maxs = [xmax, ymax, zmax]
+    mins, maxs = _preview_bounds_for_part(part)
     axis_index = {"x": 0, "y": 1, "z": 2}.get(state.axis, 2)
     return (mins[axis_index] + maxs[axis_index]) / 2.0
+
+
+def _preview_cross_section_diameter(part: PartState) -> float:
+    mins, maxs = _preview_bounds_for_part(part)
+    axis_index = {"x": 0, "y": 1, "z": 2}.get(state.axis, 2)
+    other_axes = [idx for idx in range(3) if idx != axis_index]
+    return max(float(maxs[idx] - mins[idx]) for idx in other_axes)
+
+
+def _autoscale_preview_parts() -> list[tuple[PartState, float]]:
+    by_level: dict[int, dict[str, list[PartState]]] = {}
+    for part in state.parts:
+        tier, levels, _segment = assemble.parse_part_name(part.name)
+        if tier is None or levels is None:
+            continue
+        for level in levels:
+            by_level.setdefault(level, {}).setdefault(tier, []).append(part)
+
+    outer_diams: dict[int, float] = {}
+    for level, tier_map in by_level.items():
+        outers = tier_map.get("outer")
+        if outers:
+            outer_diams[level] = _preview_cross_section_diameter(outers[0])
+
+    if outer_diams:
+        sorted_values = sorted(outer_diams.values())
+        ref_outer = sorted_values[len(sorted_values) // 2]
+    else:
+        ref_outer = None
+
+    scaled: list[tuple[PartState, float]] = []
+    for level, tier_map in by_level.items():
+        outer_diam = outer_diams.get(level, ref_outer)
+        if outer_diam is None:
+            continue
+        for tier_name in ("mid", "inner"):
+            for part in tier_map.get(tier_name, []):
+                current = _preview_cross_section_diameter(part)
+                if current <= 1e-9:
+                    continue
+                target_diam = assemble._parse_target_diameter(part.name)
+                factor = None
+                if target_diam is not None:
+                    factor = target_diam / current
+                else:
+                    ratio = outer_diam / current
+                    if ratio > assemble._INNER_TINY_RATIO:
+                        mm_factor = assemble._MM_TO_INCH
+                        cm_factor = assemble._CM_TO_INCH
+                        mm_diff = abs(outer_diam - (current * mm_factor))
+                        cm_diff = abs(outer_diam - (current * cm_factor))
+                        factor = mm_factor if mm_diff <= cm_diff else cm_factor
+                if factor is not None and abs(factor - 1.0) > 0.01:
+                    scaled.append((part, factor))
+    return scaled
 
 
 def _build_scene() -> dict[str, Any]:
@@ -1383,25 +1718,24 @@ def run_stage(name: str):
             return jsonify({"ok": True, "message": "Auto-stack complete"})
 
         if name == "auto_scale":
-            _ensure_all_real_geometry()
             progress.begin("Auto-scale", len(state.parts), "Scaling parts...")
-            entries = [(cq.Workplane("XY").newObject([cq.Shape(_apply_manual_transforms(p))]), p.name) for p in state.parts]
-            scaled = assemble.autoscale_parts(entries)
-            for i, (wp, _name) in enumerate(scaled):
-                state.parts[i].shape = wp.val().wrapped
-                state.parts[i].orientation_steps = []
-                state.parts[i].manual_scale = 1.0
-                state.parts[i].rot_xyz = (0.0, 0.0, 0.0)
-                state.parts[i].settle_offset = (0.0, 0.0, 0.0)
-                progress.advance(1, f"Scaled {state.parts[i].name}")
+            scaled_parts = {id(part): factor for part, factor in _autoscale_preview_parts()}
+            for part in state.parts:
+                factor = scaled_parts.get(id(part))
+                if factor is not None:
+                    part.manual_scale *= factor
+                    part.settle_offset = (0.0, 0.0, 0.0)
+                    progress.advance(1, f"Scaled {part.name} by x{factor:.3f}")
+                else:
+                    progress.advance(1, f"Left {part.name} unchanged")
             progress.finish("Auto-scale complete")
             return jsonify({"ok": True, "message": "Auto-scale complete"})
 
         if name == "auto_drop":
-            _ensure_all_real_geometry()
             axis_vec = assemble.AXIS_MAP.get(state.axis, assemble.AXIS_MAP["z"])
-            _assy, base_part_info = assemble.stack_parts(_parts_for_assembly(), axis_vec, state.gap)
-            mesh_payloads = _autodrop_mesh_payloads(base_part_info)
+            preview_records = _preview_records()
+            preview_offsets = _preview_stack_offsets(preview_records)
+            base_part_info, mesh_payloads = _preview_part_info(preview_records, preview_offsets)
             local_only, local_metrics = assemble.simulate_physics_contact_fast(
                 base_part_info, axis_vec, state.gap, rough_drop=False, debug=False, mesh_payloads=mesh_payloads,
             )
@@ -1440,37 +1774,43 @@ def run_stage(name: str):
             return jsonify({"ok": True, "message": f"Cut complete ({len(out)} parts)"})
 
         if name == "export_parts":
-            _ensure_all_real_geometry()
             progress.begin("Exporting", 1, "Exporting parts...")
-            assemble.export_transformed_parts(_parts_for_export(), "parts")
+            _export_parts_fast("parts")
             progress.finish("Parts exported")
             return jsonify({"ok": True, "message": "Exported transformed parts to ./parts"})
 
         if name == "render_whole":
-            _ensure_all_real_geometry()
-            axis_vec = assemble.AXIS_MAP.get(state.axis, assemble.AXIS_MAP["z"])
-            _assy, part_info = assemble.stack_parts(_parts_for_assembly(), axis_vec, state.gap)
-            part_info = _apply_settle_offsets(part_info)
-            data = [(name, shape, loc, rgb) for name, shape, loc, rgb, *_ in part_info]
             out = "web_render.png"
-            assemble.render_assembly(data, out, resolution=1200)
+            if _can_use_fast_mesh_scene(state.parts):
+                _render_preview_assembly_fast(out, resolution=900)
+            else:
+                _ensure_all_real_geometry()
+                axis_vec = assemble.AXIS_MAP.get(state.axis, assemble.AXIS_MAP["z"])
+                _assy, part_info = assemble.stack_parts(_parts_for_assembly(), axis_vec, state.gap)
+                part_info = _apply_settle_offsets(part_info)
+                data = [(name, shape, loc, rgb) for name, shape, loc, rgb, *_ in part_info]
+                assemble.render_assembly(data, out, resolution=1200)
             return jsonify({"ok": True, "message": f"Rendered {out}"})
 
         if name == "export_whole":
-            _ensure_all_real_geometry()
-            progress.begin("Exporting", 1, "Exporting assembly...")
-            axis_vec = assemble.AXIS_MAP.get(state.axis, assemble.AXIS_MAP["z"])
-            assy, _part_info = assemble.stack_parts(_parts_for_assembly(), axis_vec, state.gap)
-            adjusted_info = _apply_settle_offsets(_part_info)
-            assy = assemble.Assembly()
-            for entry in adjusted_info:
-                part_name, shape, loc, rgb = entry[:4]
-                wp = cq.Workplane("XY").newObject([cq.Shape(shape)])
-                cq_color = assemble.Color(*rgb) if len(rgb) == 3 else assemble.Color(*rgb[:3])
-                assy.add(wp, name=part_name, loc=loc, color=cq_color)
-            out = "web_assembly.step"
-            assemble.export_assembly_step(assy, out)
-            progress.finish("Assembly exported")
+            if state.parts and all(assemble.is_mesh_file(part.file_path) for part in state.parts):
+                out = "web_assembly.stl"
+                _export_preview_assembly_mesh(out)
+            else:
+                _ensure_all_real_geometry()
+                progress.begin("Exporting", 1, "Exporting assembly...")
+                axis_vec = assemble.AXIS_MAP.get(state.axis, assemble.AXIS_MAP["z"])
+                assy, _part_info = assemble.stack_parts(_parts_for_assembly(), axis_vec, state.gap)
+                adjusted_info = _apply_settle_offsets(_part_info)
+                assy = assemble.Assembly()
+                for entry in adjusted_info:
+                    part_name, shape, loc, rgb = entry[:4]
+                    wp = cq.Workplane("XY").newObject([cq.Shape(shape)])
+                    cq_color = assemble.Color(*rgb) if len(rgb) == 3 else assemble.Color(*rgb[:3])
+                    assy.add(wp, name=part_name, loc=loc, color=cq_color)
+                out = "web_assembly.step"
+                assemble.export_assembly_step(assy, out)
+                progress.finish("Assembly exported")
             return jsonify({"ok": True, "message": f"Exported {out}"})
 
         return _json_api_error(f"unknown stage '{name}'", 400)
