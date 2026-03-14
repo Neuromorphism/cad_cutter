@@ -17,9 +17,14 @@ This PR improves the web UI workflow for interactive model setup and makes orien
 - added decimated mesh proxies for:
   - thumbnail rendering
   - fast auto-orient solves
+- replaced the old client-only autodrop animation with a real backend settle stage
+- added a fast autodrop solver that:
+  - optionally does a coarse drop on decimated proxy meshes
+  - refines the final translation using only local top/bottom contact bands from the full meshes
+  - persists settle offsets into later scene/render/export/cut assembly paths
 - changed `auto_orient` to solve on cached decimated preview meshes, then store the resulting orientation as runtime transform steps so later exact-CAD export/cut stages still honor the orientation
 - kept exact geometry off the critical path for `auto_orient` and `auto_stack`
-- added a server regression test for the decimated preview auto-orient path
+- added server regression tests for the decimated preview auto-orient path and backend autodrop timing payload
 - updated Playwright coverage for the new workflow controls
 
 ## Why
@@ -33,3 +38,7 @@ The previous `auto_orient` path forced exact geometry and reused the older `orie
 - direct Flask-client timing check:
   - `outer_1.STEP` + `outer_2.STEP`
   - `auto_orient` completed in about `0.02s` on `cylinder` workflow using decimated preview meshes
+  - `autodrop` comparison on the same pair:
+    - `local_only`: about `2.132s`
+    - `proxy_then_local`: about `2.115s`
+    - result: the coarse proxy-drop step only saved about `0.017s`, so the win is negligible on this case

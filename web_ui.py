@@ -81,6 +81,7 @@ class PartState:
     material: str | None = None
     auto_oriented: bool = False
     orientation_steps: list[tuple[tuple[float, float, float], float]] = field(default_factory=list)
+    settle_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
     rot_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
     manual_scale: float = 1.0
 
@@ -396,6 +397,48 @@ def _part_has_runtime_transform(part: PartState) -> bool:
     )
 
 
+def _part_display_name(part: PartState) -> str:
+    return part.name if not part.material else f"{part.name}_{part.material}"
+
+
+def _location_to_offset(loc) -> tuple[float, float, float]:
+    coords = loc.toTuple()[0]
+    return (float(coords[0]), float(coords[1]), float(coords[2]))
+
+
+def _apply_settle_offsets(part_info):
+    offsets_by_name: dict[str, list[tuple[float, float, float]]] = {}
+    for part in state.parts:
+        offsets_by_name.setdefault(_part_display_name(part), []).append(part.settle_offset)
+
+    adjusted = []
+    for entry in part_info:
+        name, shape, loc, rgb = entry[:4]
+        rest = entry[4:]
+        offsets = offsets_by_name.get(name)
+        settle = offsets.pop(0) if offsets else (0.0, 0.0, 0.0)
+        if any(abs(v) > 1e-9 for v in settle):
+            loc = assemble.Location(assemble.Vector(*settle)) * loc
+        adjusted.append((name, shape, loc, rgb, *rest))
+    return adjusted
+
+
+def _store_settle_offsets(base_part_info, updated_part_info) -> None:
+    offsets_by_name: dict[str, list[tuple[float, float, float]]] = {}
+    for base, updated in zip(base_part_info, updated_part_info):
+        base_name, _shape, base_loc = base[:3]
+        updated_loc = updated[2]
+        base_offset = np.asarray(_location_to_offset(base_loc), dtype=float)
+        updated_offset = np.asarray(_location_to_offset(updated_loc), dtype=float)
+        delta = tuple((updated_offset - base_offset).tolist())
+        offsets_by_name.setdefault(base_name, []).append(delta)
+
+    for part in state.parts:
+        key = _part_display_name(part)
+        queue = offsets_by_name.get(key)
+        part.settle_offset = queue.pop(0) if queue else (0.0, 0.0, 0.0)
+
+
 def _parts_for_stack() -> list[tuple[cq.Workplane, str, str, bool]]:
     entries = []
     for idx, p in enumerate(state.parts):
@@ -506,6 +549,26 @@ def _orientation_payload_for_part(part: PartState, target_triangles: int = _ORIE
     return _decimate_payload(_mesh_payload(effective_shape, tolerance=0.8), target_triangles)
 
 
+def _autodrop_mesh_payloads(part_info) -> list[dict[str, Any] | None]:
+    payloads: list[dict[str, Any] | None] = []
+    part_lookup: dict[str, list[PartState]] = {}
+    for part in state.parts:
+        part_lookup.setdefault(_part_display_name(part), []).append(part)
+
+    for entry in part_info:
+        name, shape, _loc = entry[:3]
+        queue = part_lookup.get(name)
+        part = queue.pop(0) if queue else None
+        if part is None or not part.mesh_source_path or _part_has_runtime_transform(part):
+            payloads.append(None)
+            continue
+        try:
+            payloads.append(_load_mesh_payload_from_cache_file(part.mesh_source_path, shape))
+        except Exception:
+            payloads.append(None)
+    return payloads
+
+
 def _can_use_fast_mesh_scene(part_states: list[PartState]) -> bool:
     if not part_states:
         return False
@@ -578,11 +641,12 @@ def _build_fast_mesh_scene() -> dict[str, Any]:
 
     combined = []
     for idx, (part, offset) in enumerate(zip(state.parts, offsets), start=1):
+        settle = np.asarray(part.settle_offset, dtype=float)
         combined.append({
             "name": part.name,
             "color": list(assemble.pick_color(part.name, idx - 1)[1]),
             "partIndex": idx - 1,
-            "offset": offset,
+            "offset": (np.asarray(offset, dtype=float) + settle).tolist(),
         })
         progress.advance(1, f"Prepared assembled mesh {idx} of {len(state.parts)}: {part.name}")
 
@@ -731,6 +795,7 @@ def _build_scene() -> dict[str, Any]:
     })
     axis_vec = assemble.AXIS_MAP.get(state.axis, assemble.AXIS_MAP["z"])
     _assy, part_info = assemble.stack_parts(_parts_for_assembly(), axis_vec, state.gap)
+    part_info = _apply_settle_offsets(part_info)
     progress.begin("Scene", len(state.parts) + len(part_info), "Stacking parts for scene...")
 
     part_meshes = []
@@ -784,11 +849,13 @@ def _build_scene() -> dict[str, Any]:
     for idx, (name, shape, loc, rgb, *_rest) in enumerate(part_info, start=1):
         source_index = part_index_by_name.get(name)
         if source_index is not None:
+            settle = np.asarray(state.parts[source_index].settle_offset, dtype=float)
+            loc_offset = np.asarray(list(loc.toTuple()[0]), dtype=float)
             combined.append({
                 "name": name,
                 "color": list(rgb),
                 "partIndex": source_index,
-                "offset": list(loc.toTuple()[0]),
+                "offset": (loc_offset + settle).tolist(),
             })
         else:
             moved = assemble.apply_location(shape, loc)
@@ -1166,6 +1233,7 @@ def run_stage(name: str):
             for part in state.parts:
                 part.orientation_steps = list(steps)
                 part.auto_oriented = bool(steps)
+                part.settle_offset = (0.0, 0.0, 0.0)
             return jsonify({"ok": True, "message": "Auto-orient complete using decimated preview meshes"})
 
         if name == "auto_stack":
@@ -1175,6 +1243,8 @@ def run_stage(name: str):
                 ranked.append((_centroid_along_stack_axis(part), idx, part))
                 progress.advance(1, f"Ranked {part.name} for stacking")
             state.parts = [part for _centroid, _idx, part in sorted(ranked, key=lambda item: (item[0], item[1]))]
+            for part in state.parts:
+                part.settle_offset = (0.0, 0.0, 0.0)
             progress.finish("Auto-stack complete")
             return jsonify({"ok": True, "message": "Auto-stack complete"})
 
@@ -1188,15 +1258,48 @@ def run_stage(name: str):
                 state.parts[i].orientation_steps = []
                 state.parts[i].manual_scale = 1.0
                 state.parts[i].rot_xyz = (0.0, 0.0, 0.0)
+                state.parts[i].settle_offset = (0.0, 0.0, 0.0)
                 progress.advance(1, f"Scaled {state.parts[i].name}")
             progress.finish("Auto-scale complete")
             return jsonify({"ok": True, "message": "Auto-scale complete"})
+
+        if name == "auto_drop":
+            _ensure_all_real_geometry()
+            axis_vec = assemble.AXIS_MAP.get(state.axis, assemble.AXIS_MAP["z"])
+            _assy, base_part_info = assemble.stack_parts(_parts_for_assembly(), axis_vec, state.gap)
+            mesh_payloads = _autodrop_mesh_payloads(base_part_info)
+            local_only, local_metrics = assemble.simulate_physics_contact_fast(
+                base_part_info, axis_vec, state.gap, rough_drop=False, debug=False, mesh_payloads=mesh_payloads,
+            )
+            proxy_then_local, proxy_metrics = assemble.simulate_physics_contact_fast(
+                base_part_info, axis_vec, state.gap, rough_drop=True, debug=False, mesh_payloads=mesh_payloads,
+            )
+            use_proxy = proxy_metrics["elapsed_s"] < local_metrics["elapsed_s"]
+            chosen = proxy_then_local if use_proxy else local_only
+            chosen_metrics = proxy_metrics if use_proxy else local_metrics
+            _store_settle_offsets(base_part_info, chosen)
+            message = (
+                f"Autodrop complete using {chosen_metrics['method']} "
+                f"({chosen_metrics['elapsed_s']:.3f}s; "
+                f"local_only={local_metrics['elapsed_s']:.3f}s, "
+                f"proxy_then_local={proxy_metrics['elapsed_s']:.3f}s)"
+            )
+            return jsonify({
+                "ok": True,
+                "message": message,
+                "metrics": {
+                    "chosen": chosen_metrics,
+                    "local_only": local_metrics,
+                    "proxy_then_local": proxy_metrics,
+                },
+            })
 
         if name == "cut_inner_from_mid":
             _ensure_all_real_geometry()
             progress.begin("Cutting", 2, "Preparing cut...")
             axis_vec = assemble.AXIS_MAP.get(state.axis, assemble.AXIS_MAP["z"])
             _assy, part_info = assemble.stack_parts(_parts_for_assembly(), axis_vec, state.gap)
+            part_info = _apply_settle_offsets(part_info)
             progress.advance(1, "Cutting inner from mid...")
             out = assemble.mid_cut_parts(part_info, output_dir="parts", clearance=0.02, debug=True, section_number=state.section_number)
             progress.finish(f"Cut complete ({len(out)} parts)")
@@ -1213,6 +1316,7 @@ def run_stage(name: str):
             _ensure_all_real_geometry()
             axis_vec = assemble.AXIS_MAP.get(state.axis, assemble.AXIS_MAP["z"])
             _assy, part_info = assemble.stack_parts(_parts_for_assembly(), axis_vec, state.gap)
+            part_info = _apply_settle_offsets(part_info)
             data = [(name, shape, loc, rgb) for name, shape, loc, rgb, *_ in part_info]
             out = "web_render.png"
             assemble.render_assembly(data, out, resolution=1200)
@@ -1223,6 +1327,13 @@ def run_stage(name: str):
             progress.begin("Exporting", 1, "Exporting assembly...")
             axis_vec = assemble.AXIS_MAP.get(state.axis, assemble.AXIS_MAP["z"])
             assy, _part_info = assemble.stack_parts(_parts_for_assembly(), axis_vec, state.gap)
+            adjusted_info = _apply_settle_offsets(_part_info)
+            assy = assemble.Assembly()
+            for entry in adjusted_info:
+                part_name, shape, loc, rgb = entry[:4]
+                wp = cq.Workplane("XY").newObject([cq.Shape(shape)])
+                cq_color = assemble.Color(*rgb) if len(rgb) == 3 else assemble.Color(*rgb[:3])
+                assy.add(wp, name=part_name, loc=loc, color=cq_color)
             out = "web_assembly.step"
             assemble.export_assembly_step(assy, out)
             progress.finish("Assembly exported")
