@@ -45,9 +45,23 @@ def norm(a):
 
 
 class MeshThermalColorizer:
+    PALETTES = {
+        "red-blue": ((255, 0, 0), (0, 0, 255)),
+        "fire-ice": ((255, 96, 0), (32, 96, 255)),
+        "sunset": ((255, 72, 72), (61, 90, 254)),
+        "viridis-ish": ((253, 231, 37), (68, 1, 84)),
+        "grayscale": ((245, 245, 245), (20, 20, 20)),
+    }
+
     def __init__(self, source_color=(255, 0, 0), sink_color=(0, 0, 255), mode="top-bottom",
                  source_temp=500.0, sink_temp=300.0, ambient_temp=300.0, material="stainless_steel",
-                 dt=0.1, max_steps=4000):
+                 dt=0.1, max_steps=4000, diffusion_rate=1.0, source_band=0.03, sink_band=0.03,
+                 radial_inner=0.1, radial_outer=0.95, palette=None, reverse_palette=False):
+        if palette:
+            pal_source, pal_sink = self.palette_colors(palette)
+            source_color, sink_color = pal_source, pal_sink
+        if reverse_palette:
+            source_color, sink_color = sink_color, source_color
         self.source_color = source_color
         self.sink_color = sink_color
         self.mode = mode
@@ -56,6 +70,13 @@ class MeshThermalColorizer:
         self.ambient_temp = ambient_temp
         self.dt = dt
         self.max_steps = max_steps
+        self.diffusion_rate = max(0.0, diffusion_rate)
+        self.source_band = min(max(source_band, 0.0), 0.49)
+        self.sink_band = min(max(sink_band, 0.0), 0.49)
+        self.radial_inner = min(max(radial_inner, 0.0), 0.99)
+        self.radial_outer = min(max(radial_outer, 0.01), 1.0)
+        if self.radial_inner >= self.radial_outer:
+            raise ValueError("radial_inner must be less than radial_outer")
         self.diffusivity = MATERIAL_DB.get(material, MATERIAL_DB["stainless_steel"])["diffusivity"]
 
     @staticmethod
@@ -69,6 +90,13 @@ class MeshThermalColorizer:
     def _interp(hot, cold, t):
         t = max(0.0, min(1.0, t))
         return tuple(int((1 - t) * cold[i] + t * hot[i]) for i in range(3))
+
+    @classmethod
+    def palette_colors(cls, name: str) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
+        if name not in cls.PALETTES:
+            names = ", ".join(sorted(cls.PALETTES.keys()))
+            raise ValueError(f"Unknown palette '{name}'. Expected one of: {names}")
+        return cls.PALETTES[name]
 
     def load_mesh(self, filepath: str) -> Mesh:
         ext = Path(filepath).suffix.lower()
@@ -192,11 +220,31 @@ class MeshThermalColorizer:
             zs = [c[2] for c in centers]
             zmin, zmax = min(zs), max(zs)
             span = max(1e-12, zmax - zmin)
-            zsrc, zsink = zmax - 0.03 * span, zmin + 0.03 * span
+            zsrc, zsink = zmax - self.source_band * span, zmin + self.sink_band * span
             for i, c in enumerate(centers):
                 if c[2] >= zsrc:
                     src.add(i)
                 if c[2] <= zsink:
+                    sink.add(i)
+        elif self.mode == "side-side":
+            xs = [c[0] for c in centers]
+            xmin, xmax = min(xs), max(xs)
+            span = max(1e-12, xmax - xmin)
+            xsrc, xsink = xmax - self.source_band * span, xmin + self.sink_band * span
+            for i, c in enumerate(centers):
+                if c[0] >= xsrc:
+                    src.add(i)
+                if c[0] <= xsink:
+                    sink.add(i)
+        elif self.mode == "front-back":
+            ys = [c[1] for c in centers]
+            ymin, ymax = min(ys), max(ys)
+            span = max(1e-12, ymax - ymin)
+            ysrc, ysink = ymax - self.source_band * span, ymin + self.sink_band * span
+            for i, c in enumerate(centers):
+                if c[1] >= ysrc:
+                    src.add(i)
+                if c[1] <= ysink:
                     sink.add(i)
         elif self.mode == "radial":
             cx = sum(c[0] for c in centers) / len(centers)
@@ -206,12 +254,12 @@ class MeshThermalColorizer:
             for i, (a, b, c) in enumerate(mesh.faces):
                 rmin = min(vertex_rs[a], vertex_rs[b], vertex_rs[c])
                 rmax = max(vertex_rs[a], vertex_rs[b], vertex_rs[c])
-                if rmin <= 0.1 * R:
+                if rmin <= self.radial_inner * R:
                     sink.add(i)
-                if rmax >= 0.95 * R:
+                if rmax >= self.radial_outer * R:
                     src.add(i)
         else:
-            raise ValueError("mode must be top-bottom or radial")
+            raise ValueError("mode must be top-bottom, side-side, front-back, or radial")
         if not src or not sink:
             raise ValueError("Could not locate source/sink faces")
         return src, sink
@@ -243,7 +291,7 @@ class MeshThermalColorizer:
             T[i] = self.sink_temp
 
         mid = (self.source_temp + self.sink_temp) / 2
-        scale = self.diffusivity * self.dt * 1e6
+        scale = self.diffusivity * self.dt * 1e6 * self.diffusion_rate
         for step in range(self.max_steps):
             nxt = T[:]
             for i in range(len(T)):
@@ -400,7 +448,10 @@ def main() -> None:
     parser.add_argument("input", nargs="?", help="Input mesh (.wrl/.stl/.3mf)")
     parser.add_argument("-o", "--output", default="colored_output.ply", help="Output colored PLY")
     parser.add_argument("--render", default=None, help="Optional SVG render output path")
-    parser.add_argument("--mode", choices=["top-bottom", "radial"], default="top-bottom")
+    parser.add_argument("--mode", choices=["top-bottom", "side-side", "front-back", "radial"], default="top-bottom")
+    parser.add_argument("--palette", choices=sorted(MeshThermalColorizer.PALETTES.keys()), default=None,
+                        help="Optional source/sink palette name")
+    parser.add_argument("--reverse-palette", action="store_true", help="Swap source/sink palette colors")
     parser.add_argument("--source-color", type=MeshThermalColorizer.hex_color, default=(255, 0, 0))
     parser.add_argument("--sink-color", type=MeshThermalColorizer.hex_color, default=(0, 0, 255))
     parser.add_argument("--source-temp", type=float, default=500.0)
@@ -408,7 +459,17 @@ def main() -> None:
     parser.add_argument("--ambient-temp", type=float, default=300.0)
     parser.add_argument("--material", choices=sorted(MATERIAL_DB.keys()), default="stainless_steel")
     parser.add_argument("--dt", type=float, default=0.1)
+    parser.add_argument("--diffusion-rate", type=float, default=1.0,
+                        help="Multiplier on diffusion update (1.0 keeps legacy behavior)")
     parser.add_argument("--max-steps", type=int, default=4000)
+    parser.add_argument("--source-band", type=float, default=0.03,
+                        help="Fractional band from hot side used as source faces")
+    parser.add_argument("--sink-band", type=float, default=0.03,
+                        help="Fractional band from cold side used as sink faces")
+    parser.add_argument("--radial-inner", type=float, default=0.1,
+                        help="Inner radius fraction for radial sink selection")
+    parser.add_argument("--radial-outer", type=float, default=0.95,
+                        help="Outer radius fraction for radial source selection")
     parser.add_argument("--generate-test-renders", action="store_true")
     parser.add_argument("--test-output-dir", default="test_renders")
     args = parser.parse_args()
@@ -430,7 +491,14 @@ def main() -> None:
         ambient_temp=args.ambient_temp,
         material=args.material,
         dt=args.dt,
+        diffusion_rate=args.diffusion_rate,
         max_steps=args.max_steps,
+        source_band=args.source_band,
+        sink_band=args.sink_band,
+        radial_inner=args.radial_inner,
+        radial_outer=args.radial_outer,
+        palette=args.palette,
+        reverse_palette=args.reverse_palette,
     )
     app.process(args.input, args.output, args.render)
     print(f"✓ Colored mesh written to {args.output}")

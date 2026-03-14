@@ -22,3 +22,17 @@ This generates:
 - cylinder radial thermal coloring
 
 Outputs are generated artifacts and are intentionally ignored from git.
+
+
+## Customization
+- Modes: `top-bottom` (legacy default), `side-side`, `front-back`, `radial`
+- Simulation controls: `--dt`, `--max-steps`, `--diffusion-rate`
+- Boundary controls: `--source-band`, `--sink-band`, `--radial-inner`, `--radial-outer`
+- Color controls: `--source-color`, `--sink-color`, or `--palette` + `--reverse-palette`
+
+Example:
+```bash
+python wrl_color_gradient.py input.stl -o output.ply \
+  --mode side-side --max-steps 6000 --diffusion-rate 0.8 \
+  --palette fire-ice --source-band 0.05 --sink-band 0.04
+```

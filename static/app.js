@@ -12,6 +12,25 @@ const gradientInput  = document.getElementById('gradient-input');
 const gradientMode   = document.getElementById('gradient-mode');
 const gradientOutput = document.getElementById('gradient-output');
 const gradientRender = document.getElementById('gradient-render');
+const gradientPalette = document.getElementById('gradient-palette');
+const gradientReversePalette = document.getElementById('gradient-reverse-palette');
+const gradientSourceColor = document.getElementById('gradient-source-color');
+const gradientSinkColor = document.getElementById('gradient-sink-color');
+const gradientSourceTemp = document.getElementById('gradient-source-temp');
+const gradientSinkTemp = document.getElementById('gradient-sink-temp');
+const gradientAmbientTemp = document.getElementById('gradient-ambient-temp');
+const gradientDt = document.getElementById('gradient-dt');
+const gradientMaxSteps = document.getElementById('gradient-max-steps');
+const gradientDiffusionRate = document.getElementById('gradient-diffusion-rate');
+const gradientSourceBand = document.getElementById('gradient-source-band');
+const gradientSinkBand = document.getElementById('gradient-sink-band');
+const gradientRadialInner = document.getElementById('gradient-radial-inner');
+const gradientRadialOuter = document.getElementById('gradient-radial-outer');
+const mainCanvas = document.getElementById('main-canvas');
+const thumbs = document.getElementById('thumbnails');
+const axisSelect = document.getElementById('axis-select');
+const gapInput = document.getElementById('gap-input');
+const sectionInput = document.getElementById('section-input');
 const mainCanvas     = document.getElementById('main-canvas');
 const thumbs         = document.getElementById('thumbnails');
 const axisSelect     = document.getElementById('axis-select');
@@ -549,6 +568,44 @@ sectionInput.addEventListener('change', async () => {
   } catch (e) { toast('Config update failed', 'error'); }
 });
 
+document.querySelectorAll('[data-stage]').forEach((btn)=>btn.addEventListener('click', async ()=>{
+  const out = await api(`/api/stage/${btn.dataset.stage}`, {method:'POST', body:'{}'});
+  setStatus(out.message || 'Done');
+  await refreshScene();
+}));
+
+document.getElementById('refresh-gradient-files').addEventListener('click', refreshGradientFiles);
+document.getElementById('run-gradient-capability').addEventListener('click', async ()=>{
+  if (!gradientInput.value){
+    setStatus('No WRL/STL/3MF file available for gradient capability.');
+    return;
+  }
+  const out = await api('/api/capability/wrl_gradient', {
+    method:'POST',
+    body: JSON.stringify({
+      input: gradientInput.value,
+      mode: gradientMode.value,
+      palette: gradientPalette.value || null,
+      reversePalette: gradientReversePalette.checked,
+      sourceColor: gradientSourceColor.value || '#FF0000',
+      sinkColor: gradientSinkColor.value || '#0000FF',
+      sourceTemp: +gradientSourceTemp.value,
+      sinkTemp: +gradientSinkTemp.value,
+      ambientTemp: +gradientAmbientTemp.value,
+      dt: +gradientDt.value,
+      maxSteps: Math.max(1, Math.floor(+gradientMaxSteps.value || 4000)),
+      diffusionRate: +gradientDiffusionRate.value,
+      sourceBand: +gradientSourceBand.value,
+      sinkBand: +gradientSinkBand.value,
+      radialInner: +gradientRadialInner.value,
+      radialOuter: +gradientRadialOuter.value,
+      output: gradientOutput.value || 'web_colored_output.ply',
+      render: gradientRender.value || null,
+    }),
+  });
+  setStatus(out.message || 'Gradient capability complete');
+  await refreshFiles();
+  await refreshGradientFiles();
 // Pipeline stages
 document.querySelectorAll('[data-stage]').forEach(btn => {
   btn.addEventListener('click', withLoading(btn, async () => {

@@ -54,6 +54,44 @@
           </div>
         </div>
       </div>
+      <h3>WRL Color Gradient Capability</h3>
+      <div class="stages">
+        <button id="refresh-gradient-files">Refresh Gradient Files</button>
+        <select id="gradient-input"></select>
+        <label>Mode
+          <select id="gradient-mode">
+            <option value="top-bottom" selected>top-bottom</option>
+            <option value="side-side">side-side</option>
+            <option value="front-back">front-back</option>
+            <option value="radial">radial</option>
+          </select>
+        </label>
+        <label>Palette
+          <select id="gradient-palette">
+            <option value="">manual colors</option>
+            <option value="red-blue">red-blue</option>
+            <option value="fire-ice">fire-ice</option>
+            <option value="sunset">sunset</option>
+            <option value="viridis-ish">viridis-ish</option>
+            <option value="grayscale">grayscale</option>
+          </select>
+        </label>
+        <label><input id="gradient-reverse-palette" type="checkbox" /> Reverse palette</label>
+        <label>Source Color <input id="gradient-source-color" type="text" value="#FF0000" /></label>
+        <label>Sink Color <input id="gradient-sink-color" type="text" value="#0000FF" /></label>
+        <label>Source Temp <input id="gradient-source-temp" type="number" value="500" step="1" /></label>
+        <label>Sink Temp <input id="gradient-sink-temp" type="number" value="300" step="1" /></label>
+        <label>Ambient Temp <input id="gradient-ambient-temp" type="number" value="300" step="1" /></label>
+        <label>dt <input id="gradient-dt" type="number" value="0.1" step="0.01" min="0" /></label>
+        <label>Timesteps <input id="gradient-max-steps" type="number" value="4000" step="1" min="1" /></label>
+        <label>Diffusion Rate <input id="gradient-diffusion-rate" type="number" value="1.0" step="0.1" min="0" /></label>
+        <label>Source Band <input id="gradient-source-band" type="number" value="0.03" step="0.01" min="0" max="0.49" /></label>
+        <label>Sink Band <input id="gradient-sink-band" type="number" value="0.03" step="0.01" min="0" max="0.49" /></label>
+        <label>Radial Inner <input id="gradient-radial-inner" type="number" value="0.1" step="0.01" min="0" max="0.99" /></label>
+        <label>Radial Outer <input id="gradient-radial-outer" type="number" value="0.95" step="0.01" min="0.01" max="1" /></label>
+        <input id="gradient-output" type="text" value="web_colored_output.ply" placeholder="Output .ply" />
+        <input id="gradient-render" type="text" value="web_colored_output.svg" placeholder="Optional render .svg" />
+        <button id="run-gradient-capability">Run WRL Gradient</button>
 
       <!-- Pipeline stages -->
       <div class="sidebar-section">

@@ -225,6 +225,13 @@ def run_wrl_gradient_capability():
         material=data.get("material", "stainless_steel"),
         dt=float(data.get("dt", 0.1)),
         max_steps=int(data.get("maxSteps", 4000)),
+        diffusion_rate=float(data.get("diffusionRate", 1.0)),
+        source_band=float(data.get("sourceBand", 0.03)),
+        sink_band=float(data.get("sinkBand", 0.03)),
+        radial_inner=float(data.get("radialInner", 0.1)),
+        radial_outer=float(data.get("radialOuter", 0.95)),
+        palette=(data.get("palette") or None),
+        reverse_palette=bool(data.get("reversePalette", False)),
     )
     colorizer.process(str(input_path), output_ply, render_svg)
 
