@@ -11,11 +11,12 @@ from pathlib import Path
 from typing import Any
 
 import cadquery as cq
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request
 from OCP.BRepBuilderAPI import BRepBuilderAPI_GTransform
 from OCP.gp import gp_GTrsf
 
 import assemble
+from assemble import progress
 
 SUPPORTED_EXT = assemble.ALL_EXTENSIONS
 GRADIENT_EXT = {".wrl", ".vrml", ".stl", ".3mf"}
@@ -138,6 +139,44 @@ def _load_gradient_module():
     return module
 
 
+@app.route("/api/progress")
+def get_progress():
+    """Return current progress state as JSON for polling."""
+    return jsonify(progress.snapshot())
+
+
+@app.route("/api/progress/stream")
+def stream_progress():
+    """Server-Sent Events stream for real-time progress updates."""
+    import json
+    import queue
+    import threading
+
+    q = queue.Queue()
+
+    def listener(stage, current, total, message):
+        q.put({"stage": stage, "current": current, "total": total, "message": message})
+
+    progress.add_listener(listener)
+
+    def generate():
+        try:
+            while True:
+                try:
+                    data = q.get(timeout=30)
+                    yield f"data: {json.dumps(data)}\n\n"
+                except queue.Empty:
+                    # Send keepalive
+                    yield ": keepalive\n\n"
+        except GeneratorExit:
+            pass
+        finally:
+            progress.remove_listener(listener)
+
+    return Response(generate(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
 @app.route("/api/files")
 def list_files():
     cwd = Path.cwd()
@@ -202,12 +241,15 @@ def load_parts():
     data = request.get_json(force=True)
     files = data.get("files", [])
     state.parts.clear()
-    for rel in files:
+    progress.begin("Loading", len(files), "Loading parts...")
+    for i, rel in enumerate(files):
         path = Path(rel)
         if not path.is_absolute():
             path = Path.cwd() / path
         wp, name = assemble.load_part(str(path), require_solid=False)
         state.parts.append(PartState(file_path=str(path), name=name, source_ext=path.suffix.lower(), shape=wp.val().wrapped))
+        progress.advance(1, f"Loaded {name}")
+    progress.finish("Parts loaded")
     return jsonify({"ok": True, "count": len(state.parts)})
 
 
@@ -236,32 +278,43 @@ def update_part(index: int):
 @app.route("/api/stage/<name>", methods=["POST"])
 def run_stage(name: str):
     if name == "auto_orient":
+        progress.begin("Auto-orient", len(state.parts), "Orienting parts...")
         entries = [(cq.Workplane("XY").newObject([cq.Shape(p.shape)]), p.name) for p in state.parts]
         oriented = assemble.orient_to_cylinder(entries, gap=0.0)
         for i, (wp, _name) in enumerate(oriented):
             state.parts[i].shape = wp.val().wrapped
             state.parts[i].rot_xyz = (0.0, 0.0, 0.0)
             state.parts[i].auto_oriented = True
+            progress.advance(1, f"Oriented {state.parts[i].name}")
+        progress.finish("Auto-orient complete")
         return jsonify({"ok": True, "message": "Auto-orient complete"})
 
     if name == "auto_scale":
+        progress.begin("Auto-scale", len(state.parts), "Scaling parts...")
         entries = [(cq.Workplane("XY").newObject([cq.Shape(p.shape)]), p.name) for p in state.parts]
         scaled = assemble.autoscale_parts(entries)
         for i, (wp, _name) in enumerate(scaled):
             state.parts[i].shape = wp.val().wrapped
             state.parts[i].manual_scale = 1.0
+            progress.advance(1, f"Scaled {state.parts[i].name}")
+        progress.finish("Auto-scale complete")
         return jsonify({"ok": True, "message": "Auto-scale complete"})
 
     if name == "cut_inner_from_mid":
+        progress.begin("Cutting", 2, "Preparing cut...")
         parts_for_stack = _parts_for_stack()
         axis_vec = assemble.AXIS_MAP.get(state.axis, assemble.AXIS_MAP["z"])
         _assy, part_info = assemble.stack_parts(parts_for_stack, axis_vec, state.gap)
+        progress.advance(1, "Cutting inner from mid...")
         out = assemble.mid_cut_parts(part_info, output_dir="parts", clearance=0.02, debug=True, section_number=state.section_number)
+        progress.finish(f"Cut complete ({len(out)} parts)")
         return jsonify({"ok": True, "message": f"Cut complete ({len(out)} parts)"})
 
     if name == "export_parts":
+        progress.begin("Exporting", 1, "Exporting parts...")
         parts_for_stack = _parts_for_stack()
         assemble.export_transformed_parts(parts_for_stack, "parts")
+        progress.finish("Parts exported")
         return jsonify({"ok": True, "message": "Exported transformed parts to ./parts"})
 
     if name == "render_whole":
@@ -274,11 +327,13 @@ def run_stage(name: str):
         return jsonify({"ok": True, "message": f"Rendered {out}"})
 
     if name == "export_whole":
+        progress.begin("Exporting", 1, "Exporting assembly...")
         parts_for_stack = _parts_for_stack()
         axis_vec = assemble.AXIS_MAP.get(state.axis, assemble.AXIS_MAP["z"])
         assy, _part_info = assemble.stack_parts(parts_for_stack, axis_vec, state.gap)
         out = "web_assembly.step"
         assemble.export_assembly_step(assy, out)
+        progress.finish("Assembly exported")
         return jsonify({"ok": True, "message": f"Exported {out}"})
 
     return jsonify({"error": f"unknown stage '{name}'"}), 400
