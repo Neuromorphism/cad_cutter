@@ -52,6 +52,7 @@ class PartState:
 @dataclass
 class SessionState:
     parts: list[PartState] = field(default_factory=list)
+    parts_dir: Path = field(default_factory=lambda: Path.cwd().resolve())
     gap: float = 0.0
     axis: str = "z"
     cut_angle: float = 90.0
@@ -202,15 +203,50 @@ def stream_progress():
 
 @app.route("/api/files")
 def list_files():
-    cwd = Path.cwd()
-    out = [p.name for p in sorted(cwd.iterdir()) if p.is_file() and p.suffix.lower() in SUPPORTED_EXT]
-    return jsonify({"files": out})
+    out = [p.name for p in sorted(state.parts_dir.iterdir()) if p.is_file() and p.suffix.lower() in SUPPORTED_EXT]
+    return jsonify({"files": out, "parts_dir": str(state.parts_dir)})
+
+
+@app.route("/api/parts-dir", methods=["GET", "PATCH"])
+def parts_dir_config():
+    if request.method == "GET":
+        return jsonify({"parts_dir": str(state.parts_dir)})
+
+    data = request.get_json(force=True)
+    raw = str(data.get("path", "")).strip()
+    if not raw:
+        return jsonify({"error": "missing path"}), 400
+    try:
+        parts_dir = _safe_resolve(raw)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 403
+    if not parts_dir.exists() or not parts_dir.is_dir():
+        return jsonify({"error": f"directory not found: {parts_dir}"}), 404
+
+    state.parts_dir = parts_dir
+    return jsonify({"ok": True, "parts_dir": str(state.parts_dir)})
+
+
+@app.route("/api/upload-part", methods=["POST"])
+def upload_part():
+    if "file" not in request.files:
+        return jsonify({"error": "missing file"}), 400
+    f = request.files["file"]
+    name = Path(f.filename or "").name
+    if not name:
+        return jsonify({"error": "invalid filename"}), 400
+    ext = Path(name).suffix.lower()
+    if ext not in SUPPORTED_EXT:
+        return jsonify({"error": f"unsupported file extension: {ext}"}), 400
+
+    target = state.parts_dir / name
+    f.save(target)
+    return jsonify({"ok": True, "file": name, "saved_to": str(target)})
 
 
 @app.route("/api/gradient/files")
 def list_gradient_files():
-    cwd = Path.cwd()
-    out = [p.name for p in sorted(cwd.iterdir()) if p.is_file() and p.suffix.lower() in GRADIENT_EXT]
+    out = [p.name for p in sorted(state.parts_dir.iterdir()) if p.is_file() and p.suffix.lower() in GRADIENT_EXT]
     return jsonify({"files": out})
 
 
@@ -268,10 +304,9 @@ def load_parts():
     state.parts.clear()
     progress.begin("Loading", len(files), "Loading parts...")
     for i, rel in enumerate(files):
-        try:
-            path = _safe_resolve(rel)
-        except ValueError as e:
-            return jsonify({"error": str(e)}), 403
+        path = (state.parts_dir / rel).resolve()
+        if not str(path).startswith(str(state.parts_dir)):
+            return jsonify({"error": f"Path escapes parts directory: {rel}"}), 403
         wp, name = assemble.load_part(str(path), require_solid=False)
         state.parts.append(PartState(
             file_path=str(path), name=name,

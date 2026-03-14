@@ -114,6 +114,8 @@ python web_ui.py
 
 The UI supports:
 - selecting parts from the working directory
+- changing the active parts directory from the header (`Change Dir`)
+- browsing/uploading a local part file directly from your computer (`Browse Part`)
 - side-scrolling 3D thumbnails (orbit mouse controls)
 - a main 3D workspace with combined view and tile view
 - per-part manual rotation (X/Y/Z) and manual scaling near each thumbnail

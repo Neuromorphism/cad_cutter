@@ -16,7 +16,12 @@
     </h1>
     <div class="controls">
       <button id="refresh-files" class="btn-sm" data-tooltip="Scan directory for CAD files">&#x21BB; Refresh</button>
+      <button id="change-dir" class="btn-sm" data-tooltip="Change parts directory">&#x1F4C1; Change Dir</button>
+      <button id="browse-part" class="btn-sm" data-tooltip="Upload a part file from your computer">&#x1F4CE; Browse Part</button>
+      <input id="browse-part-input" type="file" accept=".step,.stp,.stl,.obj,.3mf,.wrl,.vrml,.brep,.iges,.igs" style="display:none" />
       <button id="load-selected" class="btn-primary btn-sm" data-tooltip="Load checked files into workspace">&#x25B6; Load Selected</button>
+      <span class="divider"></span>
+      <span id="parts-dir-label" title="Current parts directory">Dir: .</span>
       <span class="divider"></span>
       <div class="control-group">
         <label>Axis
