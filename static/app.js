@@ -30,6 +30,12 @@ const mainCanvas = document.getElementById('main-canvas');
 const thumbs = document.getElementById('thumbnails');
 const axisSelect = document.getElementById('axis-select');
 const gapInput = document.getElementById('gap-input');
+const startSimBtn = document.getElementById('start-sim');
+
+let sceneData = null;
+let tileView = false;
+let mainAnimation = null;
+let thumbAnimations = [];
 const sectionInput = document.getElementById('section-input');
 const mainCanvas     = document.getElementById('main-canvas');
 const thumbs         = document.getElementById('thumbnails');
@@ -78,6 +84,18 @@ function setStatus(msg, busy = false) {
 
 function setBusy(msg) { setStatus(msg, true); }
 function setIdle(msg) { setStatus(msg || 'Ready'); }
+
+function stopMainAnimation() {
+  if (mainAnimation) {
+    mainAnimation();
+    mainAnimation = null;
+  }
+}
+function stopThumbAnimations() {
+  thumbAnimations.forEach((stop) => stop());
+  thumbAnimations = [];
+}
+
 
 /* ── API wrapper with error handling ── */
 async function api(path, opts = {}) {
@@ -182,6 +200,8 @@ function fitCamera(camera, controls, group) {
 }
 
 function animate(ctx, frameHook = null){
+  let last = performance.now();
+  let animation = null;
   if (activeAnimation) {
     cancelAnimationFrame(activeAnimation);
     activeAnimation = null;
@@ -193,6 +213,15 @@ function animate(ctx, frameHook = null){
     last = now;
     if (frameHook) frameHook(dt);
     ctx.renderer.render(ctx.scene, ctx.camera);
+    animation = requestAnimationFrame(tick);
+  };
+  tick();
+  return () => {
+    if (animation !== null) {
+      cancelAnimationFrame(animation);
+      animation = null;
+    }
+  };
     activeAnimation = requestAnimationFrame(tick);
   };
   tick();
@@ -264,10 +293,36 @@ function startPhysicsSim() {
 
   ctx.scene.add(group);
   fitCamera(ctx.camera, ctx.controls, group);
+  stopMainAnimation();
+  mainAnimation = animate(ctx);
+}
+
+function startPhysicsSim() {
+  if (!sceneData || tileView) {
+    setStatus('Switch to Combined View to run the physics sim.');
+    return;
+  }
+
+  const ctx = buildRenderer(mainCanvas);
+  const group = new THREE.Group();
+  const bodies = [];
+
+  sceneData.combined.forEach((p, i) => {
+    const mesh = meshFromPayload(p.mesh, p.color);
+    const dropHeight = 100 + (i * 20);
+    mesh.position.y += dropHeight;
+    group.add(mesh);
+    bodies.push({ mesh, targetY: mesh.position.y - dropHeight, vy: 0, settled: false });
+  });
+
+  ctx.scene.add(group);
+  fitCamera(ctx.camera, ctx.controls, group);
   setStatus('Physics sim running...');
 
   const gravity = -260;
   let simDone = false;
+  stopMainAnimation();
+  mainAnimation = animate(ctx, (dt) => {
   animate(ctx, (dt) => {
     let settledCount = 0;
     for (const body of bodies) {
@@ -321,7 +376,8 @@ function buildThumb(part, idx) {
   const mesh = meshFromPayload(part.mesh);
   ctx.scene.add(mesh);
   fitCamera(ctx.camera, ctx.controls, mesh);
-  animate(ctx);
+  const stopThumbAnimation = animate(ctx);
+  thumbAnimations.push(stopThumbAnimation);
 
   // Material dropdown
   const materialSelect = wrap.querySelector('select[data-k="material"]');
@@ -362,6 +418,9 @@ function buildThumb(part, idx) {
   thumbs.appendChild(wrap);
 }
 
+function renderThumbs(){
+  stopThumbAnimations();
+  thumbs.innerHTML='';
 function renderThumbs() {
   thumbs.innerHTML = '';
   if (!sceneData || !sceneData.parts.length) {
@@ -631,6 +690,9 @@ tileBtn.addEventListener('click', () => { tileView = true; updateViewButtons(); 
 
 document.getElementById('combined-view').addEventListener('click', ()=>{tileView=false; renderMain();});
 document.getElementById('tile-view').addEventListener('click', ()=>{tileView=true; renderMain();});
+if (startSimBtn) {
+  startSimBtn.addEventListener('click', startPhysicsSim);
+}
 startSimBtn.addEventListener('click', startPhysicsSim);
 // Gradient capability
 document.getElementById('refresh-gradient-files').addEventListener('click', refreshGradientFiles);
