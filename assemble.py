@@ -38,9 +38,112 @@ import glob
 import argparse
 import math
 import tempfile
+import importlib.util
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import threading
+import time
+
 import numpy as np
+
+# ---------------------------------------------------------------------------
+# Progress tracking
+# ---------------------------------------------------------------------------
+
+class ProgressTracker:
+    """Lightweight progress tracker for CLI and web UI.
+
+    In CLI mode, prints a progress bar to stderr.
+    Listeners (e.g. the web UI) can subscribe via ``add_listener`` to receive
+    ``(stage, current, total, message)`` callbacks.
+    """
+
+    _instance = None
+    _lock = threading.Lock()
+
+    def __init__(self):
+        self._listeners = []
+        self._stage = ""
+        self._current = 0
+        self._total = 0
+        self._message = ""
+        self._cli_enabled = True
+
+    @classmethod
+    def get(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = cls()
+        return cls._instance
+
+    # -- listener API (used by web UI) --
+    def add_listener(self, fn):
+        self._listeners.append(fn)
+
+    def remove_listener(self, fn):
+        self._listeners = [f for f in self._listeners if f is not fn]
+
+    # -- progress API --
+    def begin(self, stage: str, total: int, message: str = ""):
+        self._stage = stage
+        self._current = 0
+        self._total = total
+        self._message = message or stage
+        self._notify()
+        self._print_bar()
+
+    def advance(self, step: int = 1, message: str = ""):
+        self._current = min(self._current + step, self._total)
+        if message:
+            self._message = message
+        self._notify()
+        self._print_bar()
+
+    def finish(self, message: str = ""):
+        self._current = self._total
+        if message:
+            self._message = message
+        self._notify()
+        self._print_bar(final=True)
+
+    def _notify(self):
+        for fn in self._listeners:
+            try:
+                fn(self._stage, self._current, self._total, self._message)
+            except Exception:
+                pass
+
+    def _print_bar(self, final=False):
+        if not self._cli_enabled:
+            return
+        total = self._total
+        current = self._current
+        if total <= 0:
+            return
+        pct = current / total
+        bar_len = 30
+        filled = int(bar_len * pct)
+        bar = "\u2588" * filled + "\u2591" * (bar_len - filled)
+        line = f"\r  [{bar}] {current}/{total} {self._message}"
+        import sys as _sys
+        _sys.stderr.write(line)
+        if final:
+            _sys.stderr.write("\n")
+        _sys.stderr.flush()
+
+    def snapshot(self):
+        """Return current state as a dict (used by web polling endpoint)."""
+        return {
+            "stage": self._stage,
+            "current": self._current,
+            "total": self._total,
+            "message": self._message,
+        }
+
+
+progress = ProgressTracker.get()
 
 # ---------------------------------------------------------------------------
 # GPU acceleration (optional — graceful fallback to CPU)
@@ -144,6 +247,57 @@ DEFAULT_PALETTE = [
 CAD_EXTENSIONS = {".step", ".stp", ".iges", ".igs", ".brep"}
 MESH_EXTENSIONS = {".stl", ".obj", ".ply", ".3mf"}
 ALL_EXTENSIONS = CAD_EXTENSIONS | MESH_EXTENSIONS
+
+
+def _load_gradient_module():
+    """Load the vendored WRL/STL/3MF thermal colorizer module."""
+    mod_path = Path(__file__).resolve().parent / "wrl-color-gradient-app" / "wrl_color_gradient.py"
+    if not mod_path.exists():
+        raise FileNotFoundError(
+            f"Gradient capability module not found at '{mod_path}'. "
+            "Ensure wrl-color-gradient-app is present in the repository."
+        )
+    spec = importlib.util.spec_from_file_location("wrl_color_gradient", mod_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load gradient module from '{mod_path}'.")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def run_gradient_capability(args):
+    """Run thermal colorization on a mesh input and write colored output files."""
+    filepaths = expand_inputs(args.inputs)
+    if not filepaths:
+        print("No matching files found for gradient capability. Exiting.")
+        return 1
+
+    input_path = filepaths[0]
+    if not os.path.exists(input_path):
+        print(f"Input '{input_path}' not found.")
+        return 1
+
+    module = _load_gradient_module()
+    colorizer = module.MeshThermalColorizer(
+        source_color=module.MeshThermalColorizer.hex_color(args.gradient_source_color),
+        sink_color=module.MeshThermalColorizer.hex_color(args.gradient_sink_color),
+        mode=args.gradient_mode,
+        source_temp=args.gradient_source_temp,
+        sink_temp=args.gradient_sink_temp,
+        ambient_temp=args.gradient_ambient_temp,
+        material=args.gradient_material,
+        dt=args.gradient_dt,
+        max_steps=args.gradient_max_steps,
+    )
+    colorizer.process(input_path, args.gradient_output, args.gradient_render)
+    print("\n=== Gradient Capability Complete ===")
+    print(f"  Input:      {input_path}")
+    print(f"  Mode:       {args.gradient_mode}")
+    print(f"  Output PLY: {args.gradient_output}")
+    if args.gradient_render:
+        print(f"  Output SVG: {args.gradient_render}")
+    return 0
 
 
 def expand_inputs(raw_inputs):
@@ -2633,7 +2787,7 @@ def midscale_parts(part_info, debug=False):
     return updated
 
 
-def mid_cut_parts(part_info, output_dir="parts", clearance=0.02, debug=False):
+def mid_cut_parts(part_info, output_dir="parts", clearance=0.02, debug=False, section_number=None):
     """Cut mid-tier parts to clear inner-tier parts and export the cut mids.
 
     This operation is applied in world coordinates.  Returned part_info entries
@@ -2664,6 +2818,8 @@ def mid_cut_parts(part_info, output_dir="parts", clearance=0.02, debug=False):
     for entry in world_entries:
         if entry["tier"] != "mid":
             continue
+        if section_number is not None and section_number not in entry["levels"]:
+            continue
 
         matching_inners = [
             inner for inner in inner_entries
@@ -2692,7 +2848,8 @@ def mid_cut_parts(part_info, output_dir="parts", clearance=0.02, debug=False):
     for e in world_entries:
         updated.append((e["name"], e["shape"], Location(), e["rgb"], e["segment"], e["is_mesh"]))
 
-    print(f"  Mid-cut complete ({cut_count} mid part(s) cut, clearance={clearance:.4f} in).")
+    section_text = f", section={section_number}" if section_number is not None else ""
+    print(f"  Mid-cut complete ({cut_count} mid part(s) cut, clearance={clearance:.4f} in{section_text}).")
     print(f"  Mid-cut parts saved in: {output_dir}")
     return updated
 
@@ -2795,7 +2952,9 @@ def render_assembly(parts_data, output_path, resolution=2048, cut_shape=None):
     plotter = pv.Plotter(off_screen=True, window_size=[resolution, resolution])
 
     if cut_shape is not None:
+        progress.begin("Rendering", 2, "Tessellating cut shape...")
         verts, faces = tessellate_shape(cut_shape, tolerance=0.05)
+        progress.advance(1, "Adding mesh to renderer...")
         if len(verts) > 0:
             mesh = pv.PolyData(verts, faces.ravel())
             plotter.add_mesh(
@@ -2804,12 +2963,15 @@ def render_assembly(parts_data, output_path, resolution=2048, cut_shape=None):
                 smooth_shading=True, split_sharp_edges=True,
             )
     else:
+        render_total = len(parts_data) + 1  # +1 for screenshot
+        progress.begin("Rendering", render_total, "Tessellating parts...")
         for i, entry in enumerate(parts_data):
             # Support both 4-tuple and 5-tuple (with segment) formats
             name, shape, loc, rgb = entry[0], entry[1], entry[2], entry[3]
             translated = apply_location(shape, loc)
             verts, faces = tessellate_shape(translated, tolerance=0.05)
             if len(verts) == 0:
+                progress.advance(1, f"Skipped {name}")
                 continue
 
             mesh = pv.PolyData(verts, faces.ravel())
@@ -2819,6 +2981,7 @@ def render_assembly(parts_data, output_path, resolution=2048, cut_shape=None):
                 ambient=0.25, diffuse=0.7, specular=0.5, specular_power=40,
                 smooth_shading=True, split_sharp_edges=True,
             )
+            progress.advance(1, f"Tessellated {name}")
 
     # --- Position lights relative to model bounds ---
     plotter.camera_position = 'iso'
@@ -2913,8 +3076,10 @@ def render_assembly(parts_data, output_path, resolution=2048, cut_shape=None):
         except Exception:
             pass
 
+    progress.advance(1, "Capturing screenshot...")
     plotter.screenshot(output_path)
     plotter.close()
+    progress.finish(f"Render saved: {output_path}")
     print(f"Render saved: {output_path}")
 
 
@@ -3091,6 +3256,9 @@ def run_validation_pipeline(shape, resolution=512, mismatch_ratio=0.01, debug=Fa
 
 def run_pipeline(args):
     """Execute the full assembly pipeline."""
+    if getattr(args, "gradient_only", False):
+        return run_gradient_capability(args)
+
     # 0. Configure GPU acceleration
     if getattr(args, "no_gpu", False):
         set_gpu_enabled(False)
@@ -3127,6 +3295,7 @@ def run_pipeline(args):
     for fp in valid_paths:
         unique_by_real.setdefault(os.path.realpath(fp), fp)
 
+    progress.begin("Loading", len(unique_by_real), "Loading parts...")
     if len(unique_by_real) > 1:
         # Parallel loading for unique files only.
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -3141,8 +3310,10 @@ def run_pipeline(args):
                 try:
                     wp, _name = future.result()
                     loaded_unique[real] = wp
-                    print(f"  Loaded: {os.path.splitext(os.path.basename(src_fp))[0]}")
+                    basename = os.path.splitext(os.path.basename(src_fp))[0]
+                    progress.advance(1, f"Loaded {basename}")
                 except Exception as e:
+                    progress.advance(1, f"ERROR {os.path.basename(src_fp)}")
                     print(f"  ERROR loading '{src_fp}': {e}")
     else:
         loaded_unique = {}
@@ -3150,9 +3321,12 @@ def run_pipeline(args):
             try:
                 wp, _name = load_part(filepath, require_solid=require_mesh_solids)
                 loaded_unique[real] = wp
-                print(f"  Loaded: {os.path.splitext(os.path.basename(filepath))[0]}")
+                basename = os.path.splitext(os.path.basename(filepath))[0]
+                progress.advance(1, f"Loaded {basename}")
             except Exception as e:
+                progress.advance(1, f"ERROR {os.path.basename(filepath)}")
                 print(f"  ERROR loading '{filepath}': {e}")
+    progress.finish("Parts loaded")
 
     # Preserve original input order, but reuse already loaded geometry.
     for fp in valid_paths:
@@ -3203,7 +3377,9 @@ def run_pipeline(args):
     # 2. Stack parts
     axis_vec = AXIS_MAP[args.axis]
     print(f"\nStacking {len(parts)} part(s) along {args.axis.upper()}-axis (gap={args.gap})...")
+    progress.begin("Stacking", 1, "Stacking parts...")
     assy, part_info = stack_parts(parts, axis_vec, args.gap)
+    progress.finish(f"Assembly: {len(part_info)} part(s)")
     print(f"  Assembly created with {len(part_info)} part(s).")
 
     # 2b. Physics simulation (optional)
@@ -3359,6 +3535,7 @@ def run_pipeline(args):
         else:
             cut_results = None
 
+        progress.begin("Cutting", len(moved_parts), "Cutting parts...")
         for idx, (pname, moved_shape, segment, part_is_mesh) in enumerate(moved_parts):
             try:
                 if cut_results is not None:
@@ -3372,6 +3549,7 @@ def run_pipeline(args):
                     cut_skip += 1
                     if args.debug:
                         print(f"  [DEBUG] '{pname}': fully removed by cutter.")
+                    progress.advance(1, f"Cut {pname} (removed)")
                     continue
 
                 # Verify the result is not empty
@@ -3382,15 +3560,19 @@ def run_pipeline(args):
                     cut_ok += 1
                     if args.debug:
                         print(f"  [DEBUG] '{pname}': cut succeeded.")
+                    progress.advance(1, f"Cut {pname}")
                 else:
                     cut_skip += 1
                     if args.debug:
                         print(f"  [DEBUG] '{pname}': fully removed by cutter.")
+                    progress.advance(1, f"Cut {pname} (removed)")
             except Exception as e:
                 print(f"  Warning: cut failed for '{pname}': {e}")
                 # Include the original uncut part
                 cut_builder.Add(cut_compound, moved_shape)
                 cut_ok += 1
+                progress.advance(1, f"Cut {pname} (fallback)")
+        progress.finish("Cutting complete")
 
         if args.debug and not use_direct:
             cutter = make_cutter(bbox_vals, args.cut_angle, axis_vec)
@@ -3559,6 +3741,54 @@ def build_parser():
     parser.add_argument(
         "--no-gpu", action="store_true", default=False,
         help="Disable GPU acceleration even when hardware is available.",
+    )
+    parser.add_argument(
+        "--gradient-only", action="store_true",
+        help="Run the vendored WRL/STL/3MF thermal gradient colorizer capability and skip CAD assembly.",
+    )
+    parser.add_argument(
+        "--gradient-output", default="colored_output.ply",
+        help="Gradient capability output PLY path (default: colored_output.ply).",
+    )
+    parser.add_argument(
+        "--gradient-render", default=None,
+        help="Optional SVG preview path for gradient capability.",
+    )
+    parser.add_argument(
+        "--gradient-mode", choices=["top-bottom", "radial"], default="top-bottom",
+        help="Gradient coloring mode.",
+    )
+    parser.add_argument(
+        "--gradient-source-color", default="#FF0000",
+        help="Hot/source color as hex RGB (default: #FF0000).",
+    )
+    parser.add_argument(
+        "--gradient-sink-color", default="#0000FF",
+        help="Cold/sink color as hex RGB (default: #0000FF).",
+    )
+    parser.add_argument(
+        "--gradient-source-temp", type=float, default=500.0,
+        help="Source temperature for gradient simulation.",
+    )
+    parser.add_argument(
+        "--gradient-sink-temp", type=float, default=300.0,
+        help="Sink temperature for gradient simulation.",
+    )
+    parser.add_argument(
+        "--gradient-ambient-temp", type=float, default=300.0,
+        help="Ambient temperature for gradient simulation.",
+    )
+    parser.add_argument(
+        "--gradient-material", choices=["stainless_steel", "aluminum"], default="stainless_steel",
+        help="Material preset used for thermal diffusivity.",
+    )
+    parser.add_argument(
+        "--gradient-dt", type=float, default=0.1,
+        help="Simulation timestep for gradient capability.",
+    )
+    parser.add_argument(
+        "--gradient-max-steps", type=int, default=4000,
+        help="Maximum simulation steps for gradient capability.",
     )
     return parser
 

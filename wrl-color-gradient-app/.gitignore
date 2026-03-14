@@ -1,0 +1,9 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Generated mesh/renders
+artifacts/
+test_renders/
+*.ply
+*.svg
