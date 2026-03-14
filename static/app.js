@@ -14,6 +14,8 @@ const thumbs         = document.getElementById('thumbnails');
 const axisSelect     = document.getElementById('axis-select');
 const gapInput       = document.getElementById('gap-input');
 const sectionInput   = document.getElementById('section-input');
+const partsDirLabel  = document.getElementById('parts-dir-label');
+const browsePartInput = document.getElementById('browse-part-input');
 const partCountEl    = document.getElementById('part-count');
 const viewportHint   = document.getElementById('viewport-hint');
 const toastContainer = document.getElementById('toast-container');
@@ -390,6 +392,9 @@ async function refreshFiles() {
   setBusy('Scanning for files...');
   try {
     const data = await api('/api/files');
+    if (partsDirLabel) {
+      partsDirLabel.textContent = `Dir: ${data.parts_dir}`;
+    }
     fileList.innerHTML = '';
     if (data.files.length === 0) {
       fileList.innerHTML = '<div class="empty-state"><span class="empty-icon">&#x1F4ED;</span><p>No supported CAD files found</p></div>';
@@ -413,6 +418,44 @@ async function refreshFiles() {
   } catch (e) {
     setIdle();
     toast('Failed to scan files: ' + e.message, 'error');
+  }
+}
+
+async function changePartsDir() {
+  const raw = prompt('Enter parts directory (relative to current working directory):', '.');
+  if (raw === null) return;
+  const path = raw.trim();
+  if (!path) return;
+
+  setBusy('Updating parts directory...');
+  try {
+    const data = await api('/api/parts-dir', {
+      method: 'PATCH',
+      body: JSON.stringify({ path }),
+    });
+    if (partsDirLabel) {
+      partsDirLabel.textContent = `Dir: ${data.parts_dir}`;
+    }
+    toast(`Parts directory set to ${data.parts_dir}`, 'success');
+    await refreshFiles();
+  } catch (e) {
+    setIdle();
+    toast('Failed to update parts directory: ' + e.message, 'error');
+  }
+}
+
+async function uploadSelectedPartFile(file) {
+  const form = new FormData();
+  form.append('file', file);
+  const res = await fetch('/api/upload-part', { method: 'POST', body: form });
+  if (!res.ok) {
+    let data = {};
+    try {
+      data = await res.json();
+    } catch (_) {
+      // noop
+    }
+    throw new Error(data.error || `HTTP ${res.status}`);
   }
 }
 
@@ -512,6 +555,34 @@ function withLoading(btn, fn) {
 
 // File management
 document.getElementById('refresh-files').addEventListener('click', refreshFiles);
+document.getElementById('change-dir').addEventListener('click', withLoading(
+  document.getElementById('change-dir'),
+  async () => {
+    await changePartsDir();
+  }
+));
+document.getElementById('browse-part').addEventListener('click', () => browsePartInput.click());
+browsePartInput.addEventListener('change', withLoading(
+  document.getElementById('browse-part'),
+  async () => {
+    const [file] = browsePartInput.files || [];
+    if (!file) return;
+    setBusy(`Uploading ${file.name}...`);
+    try {
+      await uploadSelectedPartFile(file);
+      toast(`Uploaded ${file.name}`, 'success');
+      await refreshFiles();
+      const checkbox = [...fileList.querySelectorAll('input')].find((el) => el.value === file.name);
+      if (checkbox) checkbox.checked = true;
+      document.getElementById('load-selected').click();
+    } catch (e) {
+      setIdle();
+      toast('Upload failed: ' + e.message, 'error');
+    } finally {
+      browsePartInput.value = '';
+    }
+  }
+));
 document.getElementById('load-selected').addEventListener('click', withLoading(
   document.getElementById('load-selected'),
   async () => {
