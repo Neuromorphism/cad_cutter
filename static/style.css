@@ -14,3 +14,5 @@ aside { border-right:1px solid #323847; padding:12px; overflow:auto; }
 .thumb-controls { display:grid; grid-template-columns:repeat(2,1fr); gap:4px; font-size:12px; }
 input, select, button { background:#242b38; color:#edf0f7; border:1px solid #41495a; border-radius:4px; }
 button { padding:6px 8px; cursor:pointer; }
+
+.material-field { grid-column: span 2; }
