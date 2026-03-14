@@ -147,3 +147,26 @@ def test_auto_orient_stage_uses_decimated_preview_meshes(client):
     assert "decimated preview meshes" in data["message"]
     assert web_ui.state.parts[0].auto_oriented is True
     assert web_ui.state.parts[0].orientation_steps
+
+
+def test_auto_drop_stage_returns_timing_metrics_and_persists_offsets(client):
+    client, tmp_path = client
+
+    lower = tmp_path / "outer_1.step"
+    upper = tmp_path / "outer_2.step"
+    cq.exporters.export(cq.Workplane("XY").cylinder(20, 10), str(lower))
+    cq.exporters.export(cq.Workplane("XY").transformed(offset=(0, 0, 40)).cylinder(20, 8), str(upper))
+
+    load_resp = client.post("/api/load", json={"files": ["outer_1.step", "outer_2.step"], "include_scene": True})
+    assert load_resp.status_code == 200
+
+    resp = client.post("/api/stage/auto_drop", json={})
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data is not None
+    assert "local_only" in data["metrics"]
+    assert "proxy_then_local" in data["metrics"]
+    assert any(abs(v) >= 0 for v in web_ui.state.parts[1].settle_offset)
+
+    scene = web_ui._build_scene()
+    assert len(scene["combined"]) == 2

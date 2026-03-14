@@ -2157,6 +2157,243 @@ def _mesh_convex_hull(mesh):
         return mesh
 
 
+def _decimate_trimesh(mesh, target_faces=4000):
+    """Return a simplified mesh for fast preview/contact solving."""
+    if mesh is None or len(mesh.faces) <= target_faces:
+        return mesh
+    simple = None
+    simplify = getattr(mesh, "simplify_quadric_decimation", None) or getattr(mesh, "simplify_quadratic_decimation", None)
+    if callable(simplify):
+        try:
+            simple = simplify(target_faces)
+        except TypeError:
+            simple = simplify(face_count=target_faces)
+        except Exception:
+            simple = None
+    if simple is None or len(getattr(simple, "faces", [])) == 0 or len(simple.faces) >= len(mesh.faces):
+        step = max(1, len(mesh.faces) // target_faces)
+        simple = mesh.copy()
+        simple.update_faces(np.arange(len(simple.faces))[::step])
+        simple.remove_unreferenced_vertices()
+    return simple
+
+
+def _contact_band_vertices(mesh, ax, side, band_ratio=0.08, max_points=4000):
+    if mesh is None or len(mesh.vertices) == 0:
+        return np.zeros((0, 3), dtype=float)
+    bounds = mesh.bounds
+    span = bounds[1, ax] - bounds[0, ax]
+    depth = max(span * band_ratio, 1e-3)
+    verts = np.asarray(mesh.vertices, dtype=float)
+    if side == "top":
+        threshold = bounds[1, ax] - depth
+        band = verts[verts[:, ax] >= threshold]
+    else:
+        threshold = bounds[0, ax] + depth
+        band = verts[verts[:, ax] <= threshold]
+    if len(band) > max_points:
+        step = max(1, len(band) // max_points)
+        band = band[::step]
+    return band
+
+
+def _local_band_drop(falling_band, settled_band, ax, grid=28, tolerance=0.02):
+    """Estimate contact drop using only bottom/top local vertex bands."""
+    if len(falling_band) == 0 or len(settled_band) == 0:
+        return None
+
+    other_axes = [d for d in range(3) if d != ax]
+    mins = np.maximum(falling_band[:, other_axes].min(axis=0), settled_band[:, other_axes].min(axis=0))
+    maxs = np.minimum(falling_band[:, other_axes].max(axis=0), settled_band[:, other_axes].max(axis=0))
+    if np.any(maxs <= mins):
+        return None
+
+    def _clip(points):
+        mask = np.ones(len(points), dtype=bool)
+        for i, oa in enumerate(other_axes):
+            mask &= points[:, oa] >= mins[i]
+            mask &= points[:, oa] <= maxs[i]
+        return points[mask]
+
+    falling = _clip(falling_band)
+    settled = _clip(settled_band)
+    if len(falling) == 0 or len(settled) == 0:
+        return None
+
+    span = np.maximum(maxs - mins, 1e-6)
+    def _bins(points):
+        uv = (points[:, other_axes] - mins) / span
+        ij = np.clip((uv * grid).astype(int), 0, grid - 1)
+        return ij[:, 0] * grid + ij[:, 1]
+
+    settle_bins = _bins(settled)
+    fall_bins = _bins(falling)
+    settle_top = {}
+    for key, value in zip(settle_bins, settled[:, ax]):
+        prev = settle_top.get(int(key))
+        if prev is None or value > prev:
+            settle_top[int(key)] = float(value)
+
+    best_drop = None
+    for key, value in zip(fall_bins, falling[:, ax]):
+        top = settle_top.get(int(key))
+        if top is None:
+            continue
+        candidate = float(value - top)
+        if candidate < -tolerance:
+            continue
+        if best_drop is None or candidate < best_drop:
+            best_drop = candidate
+
+    if best_drop is None:
+        return None
+    return max(0.0, best_drop)
+
+
+def simulate_physics_contact_fast(part_info, axis_vec, gap, *, rough_drop=True, debug=False):
+    """Fast settle solver using decimated proxies plus local contact bands.
+
+    Returns ``(updated_part_info, metrics_dict)``.
+    """
+    import trimesh
+
+    if not part_info:
+        return part_info, {"method": "empty", "rough_drop": False, "elapsed_s": 0.0}
+
+    t0 = time.time()
+    ax = 0 if axis_vec.x else 1 if axis_vec.y else 2
+    other_axes = [d for d in range(3) if d != ax]
+    bodies = []
+
+    progress.begin("Autodrop", len(part_info) * 2, "Preparing contact meshes...")
+    for idx, entry in enumerate(part_info, start=1):
+        if len(entry) == 6:
+            name, shape, loc, rgb, segment, is_mesh = entry
+        else:
+            name, shape, loc, rgb, segment = entry
+            is_mesh = False
+        moved = apply_location(shape, loc)
+        full_mesh = _shape_to_clean_trimesh(moved, tolerance=0.08, angular=0.35)
+        proxy_mesh = _decimate_trimesh(full_mesh.copy() if full_mesh is not None else None, target_faces=3500) if full_mesh is not None else None
+        bodies.append({
+            "entry": entry,
+            "name": name,
+            "shape": shape,
+            "loc": loc,
+            "rgb": rgb,
+            "segment": segment,
+            "is_mesh": is_mesh,
+            "full_mesh": full_mesh,
+            "proxy_mesh": proxy_mesh,
+            "offset": np.zeros(3, dtype=float),
+            "bottom_band": _contact_band_vertices(full_mesh, ax, "bottom"),
+            "top_band": _contact_band_vertices(full_mesh, ax, "top"),
+            "proxy_bottom": _contact_band_vertices(proxy_mesh, ax, "bottom") if proxy_mesh is not None else np.zeros((0, 3)),
+            "proxy_top": _contact_band_vertices(proxy_mesh, ax, "top") if proxy_mesh is not None else np.zeros((0, 3)),
+        })
+        progress.advance(1, f"Prepared contact mesh {idx} of {len(part_info)}: {name}")
+
+    bodies.sort(key=lambda b: b["full_mesh"].bounds[0, ax] if b["full_mesh"] is not None else 0.0)
+    settled = []
+    refine_time = 0.0
+    rough_time = 0.0
+
+    for idx, body in enumerate(bodies, start=1):
+        mesh = body["full_mesh"]
+        if mesh is None:
+            progress.advance(1, f"Skipped autodrop mesh {idx} of {len(bodies)}: {body['name']}")
+            continue
+
+        floor_drop = mesh.bounds[0, ax]
+        best_drop = floor_drop
+
+        if rough_drop:
+            t_rough = time.time()
+            coarse = floor_drop
+            for settled_body in settled:
+                overlap = True
+                my_bounds = mesh.bounds
+                ot_bounds = settled_body["proxy_mesh"].bounds if settled_body["proxy_mesh"] is not None else settled_body["full_mesh"].bounds
+                for oa in other_axes:
+                    if my_bounds[0, oa] >= ot_bounds[1, oa] or my_bounds[1, oa] <= ot_bounds[0, oa]:
+                        overlap = False
+                        break
+                if not overlap:
+                    continue
+                candidate = _local_band_drop(body["proxy_bottom"], settled_body["proxy_top"], ax)
+                if candidate is not None and candidate < coarse:
+                    coarse = candidate
+            best_drop = coarse
+            rough_time += time.time() - t_rough
+
+        t_refine = time.time()
+        refined = floor_drop
+        for settled_body in settled:
+            overlap = True
+            my_bounds = mesh.bounds
+            ot_bounds = settled_body["full_mesh"].bounds
+            for oa in other_axes:
+                if my_bounds[0, oa] >= ot_bounds[1, oa] or my_bounds[1, oa] <= ot_bounds[0, oa]:
+                    overlap = False
+                    break
+            if not overlap:
+                continue
+            candidate = _local_band_drop(body["bottom_band"], settled_body["top_band"], ax)
+            if candidate is not None and candidate < refined:
+                refined = candidate
+        refine_time += time.time() - t_refine
+
+        final_drop = min(best_drop, refined) if rough_drop else refined
+        if final_drop > 1e-5:
+            body["offset"][ax] -= final_drop
+            body["full_mesh"] = body["full_mesh"].copy()
+            translation = np.zeros(3, dtype=float)
+            translation[ax] = -final_drop
+            body["full_mesh"].apply_translation(translation)
+            if body["proxy_mesh"] is not None:
+                body["proxy_mesh"] = body["proxy_mesh"].copy()
+                body["proxy_mesh"].apply_translation(translation)
+            body["bottom_band"] = body["bottom_band"].copy()
+            body["bottom_band"][:, ax] -= final_drop
+            body["top_band"] = body["top_band"].copy()
+            body["top_band"][:, ax] -= final_drop
+            if len(body["proxy_bottom"]):
+                body["proxy_bottom"] = body["proxy_bottom"].copy()
+                body["proxy_bottom"][:, ax] -= final_drop
+            if len(body["proxy_top"]):
+                body["proxy_top"] = body["proxy_top"].copy()
+                body["proxy_top"][:, ax] -= final_drop
+        settled.append(body)
+        progress.advance(1, f"Settled {idx} of {len(bodies)}: {body['name']}")
+
+    progress.finish("Autodrop complete")
+
+    updated = []
+    for body in bodies:
+        name = body["name"]
+        shape = body["shape"]
+        loc = body["loc"]
+        rgb = body["rgb"]
+        segment = body["segment"]
+        is_mesh = body["is_mesh"]
+        dx, dy, dz = body["offset"]
+        if abs(dx) > 1e-8 or abs(dy) > 1e-8 or abs(dz) > 1e-8:
+            loc = Location(Vector(dx, dy, dz)) * loc
+        updated.append((name, shape, loc, rgb, segment, is_mesh))
+
+    metrics = {
+        "method": "proxy_then_local" if rough_drop else "local_only",
+        "rough_drop": rough_drop,
+        "elapsed_s": time.time() - t0,
+        "rough_s": rough_time,
+        "refine_s": refine_time,
+        "count": len(updated),
+    }
+    if debug:
+        print(f"  [AUTODROP] {metrics}")
+    return updated, metrics
+
+
 def simulate_physics(part_info, axis_vec, gap, max_iters=50,
                      settle_threshold=1e-4, debug=False):
     """Run a quick gravity-settle simulation on assembled parts.
