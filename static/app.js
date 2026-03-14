@@ -20,9 +20,14 @@ const toastContainer = document.getElementById('toast-container');
 const combinedBtn    = document.getElementById('combined-view');
 const tileBtn        = document.getElementById('tile-view');
 
+const progressContainer = document.getElementById('progress-container');
+const progressFill      = document.getElementById('progress-fill');
+const progressText      = document.getElementById('progress-text');
+
 let sceneData = null;
 let tileView  = false;
 let mainCtx   = null;  // persistent renderer context
+let progressSSE = null; // SSE connection for progress
 
 const MATERIAL_OPTIONS = [
   '', 'steel', 'aluminum', 'copper', 'brass', 'bronze', 'gold', 'titanium',
@@ -68,7 +73,7 @@ function showViewportLoader(msg = 'Loading...') {
   const overlay = document.createElement('div');
   overlay.className = 'loading-overlay';
   overlay.id = 'viewport-loader';
-  overlay.innerHTML = `<div class="spinner"></div><p>${msg}</p>`;
+  overlay.innerHTML = `<div class="spinner"></div><p class="loader-msg">${msg}</p><div class="viewport-progress"><div class="progress-bar"><div class="progress-fill" id="viewport-progress-fill"></div></div><span class="progress-text" id="viewport-progress-text"></span></div>`;
   mainCanvas.appendChild(overlay);
 }
 
@@ -360,16 +365,74 @@ async function refreshGradientFiles() {
   }
 }
 
+/* ── Progress bar helpers ── */
+function showProgress(current, total, message) {
+  progressContainer.style.display = 'flex';
+  if (total > 0) {
+    const pct = Math.round((current / total) * 100);
+    progressFill.style.width = pct + '%';
+    progressFill.classList.remove('indeterminate');
+    progressText.textContent = `${current}/${total} (${pct}%)`;
+  } else {
+    progressFill.classList.add('indeterminate');
+    progressText.textContent = message || '';
+  }
+}
+
+function hideProgress() {
+  progressContainer.style.display = 'none';
+  progressFill.style.width = '0%';
+  progressFill.classList.remove('indeterminate');
+  progressText.textContent = '';
+}
+
+function startProgressStream() {
+  if (progressSSE) progressSSE.close();
+  progressSSE = new EventSource('/api/progress/stream');
+  progressSSE.onmessage = (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      if (data.total > 0) {
+        showProgress(data.current, data.total, data.message);
+        setStatus(data.message, true);
+        // Also update viewport overlay if visible
+        const vpFill = document.getElementById('viewport-progress-fill');
+        const vpText = document.getElementById('viewport-progress-text');
+        const vpMsg = document.querySelector('#viewport-loader .loader-msg');
+        if (vpFill) vpFill.style.width = Math.round((data.current / data.total) * 100) + '%';
+        if (vpText) vpText.textContent = `${data.current}/${data.total}`;
+        if (vpMsg) vpMsg.textContent = data.message;
+      }
+    } catch (_) {}
+  };
+  progressSSE.onerror = () => {
+    // Reconnect silently on error
+    if (progressSSE) progressSSE.close();
+    progressSSE = null;
+  };
+}
+
+function stopProgressStream() {
+  if (progressSSE) {
+    progressSSE.close();
+    progressSSE = null;
+  }
+  // Small delay to let user see 100% before hiding
+  setTimeout(hideProgress, 600);
+}
+
 /* ── Button loading state helper ── */
 function withLoading(btn, fn) {
   return async (...args) => {
     btn.classList.add('loading');
     btn.disabled = true;
+    startProgressStream();
     try {
       await fn(...args);
     } finally {
       btn.classList.remove('loading');
       btn.disabled = false;
+      stopProgressStream();
     }
   };
 }
@@ -388,6 +451,7 @@ document.getElementById('load-selected').addEventListener('click', withLoading(
     }
     setBusy('Loading parts...');
     showViewportLoader('Loading parts...');
+    startProgressStream();
     try {
       await api('/api/load', { method: 'POST', body: JSON.stringify({ files }) });
       toast(`Loaded ${files.length} part${files.length !== 1 ? 's' : ''}`, 'success');
@@ -397,6 +461,8 @@ document.getElementById('load-selected').addEventListener('click', withLoading(
       removeViewportLoader();
       setIdle();
       toast('Failed to load parts: ' + e.message, 'error');
+    } finally {
+      stopProgressStream();
     }
   }
 ));

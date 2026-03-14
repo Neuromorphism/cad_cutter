@@ -694,6 +694,50 @@ button.loading::after {
 #status-bar .status-dot.idle { background: var(--text-dim); }
 #status-bar .status-dot.busy { background: var(--warning); animation: pulse 1.2s infinite; }
 
+/* ── Progress bar ── */
+.progress-container {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: 8px;
+  flex: 1;
+  max-width: 360px;
+}
+
+.progress-bar {
+  flex: 1;
+  height: 6px;
+  background: var(--bg-overlay);
+  border-radius: 3px;
+  overflow: hidden;
+  position: relative;
+}
+
+.progress-fill {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, var(--accent-dark), var(--accent));
+  border-radius: 3px;
+  transition: width .3s ease;
+}
+
+.progress-fill.indeterminate {
+  width: 30%;
+  animation: indeterminate 1.5s ease-in-out infinite;
+}
+
+.progress-text {
+  font-size: .7rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  min-width: 48px;
+}
+
+@keyframes indeterminate {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(433%); }
+}
+
 /* ── Loading overlay ── */
 .loading-overlay {
   position: absolute;
@@ -720,6 +764,24 @@ button.loading::after {
 .loading-overlay p {
   font-size: .85rem;
   color: var(--text-muted);
+}
+
+.viewport-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 240px;
+  margin-top: 4px;
+}
+
+.viewport-progress .progress-bar {
+  flex: 1;
+  height: 4px;
+}
+
+.viewport-progress .progress-text {
+  font-size: .7rem;
+  color: var(--text-dim);
 }
 
 /* ── Animations ── */

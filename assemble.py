@@ -42,7 +42,108 @@ import importlib.util
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import threading
+import time
+
 import numpy as np
+
+# ---------------------------------------------------------------------------
+# Progress tracking
+# ---------------------------------------------------------------------------
+
+class ProgressTracker:
+    """Lightweight progress tracker for CLI and web UI.
+
+    In CLI mode, prints a progress bar to stderr.
+    Listeners (e.g. the web UI) can subscribe via ``add_listener`` to receive
+    ``(stage, current, total, message)`` callbacks.
+    """
+
+    _instance = None
+    _lock = threading.Lock()
+
+    def __init__(self):
+        self._listeners = []
+        self._stage = ""
+        self._current = 0
+        self._total = 0
+        self._message = ""
+        self._cli_enabled = True
+
+    @classmethod
+    def get(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = cls()
+        return cls._instance
+
+    # -- listener API (used by web UI) --
+    def add_listener(self, fn):
+        self._listeners.append(fn)
+
+    def remove_listener(self, fn):
+        self._listeners = [f for f in self._listeners if f is not fn]
+
+    # -- progress API --
+    def begin(self, stage: str, total: int, message: str = ""):
+        self._stage = stage
+        self._current = 0
+        self._total = total
+        self._message = message or stage
+        self._notify()
+        self._print_bar()
+
+    def advance(self, step: int = 1, message: str = ""):
+        self._current = min(self._current + step, self._total)
+        if message:
+            self._message = message
+        self._notify()
+        self._print_bar()
+
+    def finish(self, message: str = ""):
+        self._current = self._total
+        if message:
+            self._message = message
+        self._notify()
+        self._print_bar(final=True)
+
+    def _notify(self):
+        for fn in self._listeners:
+            try:
+                fn(self._stage, self._current, self._total, self._message)
+            except Exception:
+                pass
+
+    def _print_bar(self, final=False):
+        if not self._cli_enabled:
+            return
+        total = self._total
+        current = self._current
+        if total <= 0:
+            return
+        pct = current / total
+        bar_len = 30
+        filled = int(bar_len * pct)
+        bar = "\u2588" * filled + "\u2591" * (bar_len - filled)
+        line = f"\r  [{bar}] {current}/{total} {self._message}"
+        import sys as _sys
+        _sys.stderr.write(line)
+        if final:
+            _sys.stderr.write("\n")
+        _sys.stderr.flush()
+
+    def snapshot(self):
+        """Return current state as a dict (used by web polling endpoint)."""
+        return {
+            "stage": self._stage,
+            "current": self._current,
+            "total": self._total,
+            "message": self._message,
+        }
+
+
+progress = ProgressTracker.get()
 
 # ---------------------------------------------------------------------------
 # GPU acceleration (optional — graceful fallback to CPU)
@@ -2851,7 +2952,9 @@ def render_assembly(parts_data, output_path, resolution=2048, cut_shape=None):
     plotter = pv.Plotter(off_screen=True, window_size=[resolution, resolution])
 
     if cut_shape is not None:
+        progress.begin("Rendering", 2, "Tessellating cut shape...")
         verts, faces = tessellate_shape(cut_shape, tolerance=0.05)
+        progress.advance(1, "Adding mesh to renderer...")
         if len(verts) > 0:
             mesh = pv.PolyData(verts, faces.ravel())
             plotter.add_mesh(
@@ -2860,12 +2963,15 @@ def render_assembly(parts_data, output_path, resolution=2048, cut_shape=None):
                 smooth_shading=True, split_sharp_edges=True,
             )
     else:
+        render_total = len(parts_data) + 1  # +1 for screenshot
+        progress.begin("Rendering", render_total, "Tessellating parts...")
         for i, entry in enumerate(parts_data):
             # Support both 4-tuple and 5-tuple (with segment) formats
             name, shape, loc, rgb = entry[0], entry[1], entry[2], entry[3]
             translated = apply_location(shape, loc)
             verts, faces = tessellate_shape(translated, tolerance=0.05)
             if len(verts) == 0:
+                progress.advance(1, f"Skipped {name}")
                 continue
 
             mesh = pv.PolyData(verts, faces.ravel())
@@ -2875,6 +2981,7 @@ def render_assembly(parts_data, output_path, resolution=2048, cut_shape=None):
                 ambient=0.25, diffuse=0.7, specular=0.5, specular_power=40,
                 smooth_shading=True, split_sharp_edges=True,
             )
+            progress.advance(1, f"Tessellated {name}")
 
     # --- Position lights relative to model bounds ---
     plotter.camera_position = 'iso'
@@ -2969,8 +3076,10 @@ def render_assembly(parts_data, output_path, resolution=2048, cut_shape=None):
         except Exception:
             pass
 
+    progress.advance(1, "Capturing screenshot...")
     plotter.screenshot(output_path)
     plotter.close()
+    progress.finish(f"Render saved: {output_path}")
     print(f"Render saved: {output_path}")
 
 
@@ -3186,6 +3295,7 @@ def run_pipeline(args):
     for fp in valid_paths:
         unique_by_real.setdefault(os.path.realpath(fp), fp)
 
+    progress.begin("Loading", len(unique_by_real), "Loading parts...")
     if len(unique_by_real) > 1:
         # Parallel loading for unique files only.
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -3200,8 +3310,10 @@ def run_pipeline(args):
                 try:
                     wp, _name = future.result()
                     loaded_unique[real] = wp
-                    print(f"  Loaded: {os.path.splitext(os.path.basename(src_fp))[0]}")
+                    basename = os.path.splitext(os.path.basename(src_fp))[0]
+                    progress.advance(1, f"Loaded {basename}")
                 except Exception as e:
+                    progress.advance(1, f"ERROR {os.path.basename(src_fp)}")
                     print(f"  ERROR loading '{src_fp}': {e}")
     else:
         loaded_unique = {}
@@ -3209,9 +3321,12 @@ def run_pipeline(args):
             try:
                 wp, _name = load_part(filepath, require_solid=require_mesh_solids)
                 loaded_unique[real] = wp
-                print(f"  Loaded: {os.path.splitext(os.path.basename(filepath))[0]}")
+                basename = os.path.splitext(os.path.basename(filepath))[0]
+                progress.advance(1, f"Loaded {basename}")
             except Exception as e:
+                progress.advance(1, f"ERROR {os.path.basename(filepath)}")
                 print(f"  ERROR loading '{filepath}': {e}")
+    progress.finish("Parts loaded")
 
     # Preserve original input order, but reuse already loaded geometry.
     for fp in valid_paths:
@@ -3262,7 +3377,9 @@ def run_pipeline(args):
     # 2. Stack parts
     axis_vec = AXIS_MAP[args.axis]
     print(f"\nStacking {len(parts)} part(s) along {args.axis.upper()}-axis (gap={args.gap})...")
+    progress.begin("Stacking", 1, "Stacking parts...")
     assy, part_info = stack_parts(parts, axis_vec, args.gap)
+    progress.finish(f"Assembly: {len(part_info)} part(s)")
     print(f"  Assembly created with {len(part_info)} part(s).")
 
     # 2b. Physics simulation (optional)
@@ -3418,6 +3535,7 @@ def run_pipeline(args):
         else:
             cut_results = None
 
+        progress.begin("Cutting", len(moved_parts), "Cutting parts...")
         for idx, (pname, moved_shape, segment, part_is_mesh) in enumerate(moved_parts):
             try:
                 if cut_results is not None:
@@ -3431,6 +3549,7 @@ def run_pipeline(args):
                     cut_skip += 1
                     if args.debug:
                         print(f"  [DEBUG] '{pname}': fully removed by cutter.")
+                    progress.advance(1, f"Cut {pname} (removed)")
                     continue
 
                 # Verify the result is not empty
@@ -3441,15 +3560,19 @@ def run_pipeline(args):
                     cut_ok += 1
                     if args.debug:
                         print(f"  [DEBUG] '{pname}': cut succeeded.")
+                    progress.advance(1, f"Cut {pname}")
                 else:
                     cut_skip += 1
                     if args.debug:
                         print(f"  [DEBUG] '{pname}': fully removed by cutter.")
+                    progress.advance(1, f"Cut {pname} (removed)")
             except Exception as e:
                 print(f"  Warning: cut failed for '{pname}': {e}")
                 # Include the original uncut part
                 cut_builder.Add(cut_compound, moved_shape)
                 cut_ok += 1
+                progress.advance(1, f"Cut {pname} (fallback)")
+        progress.finish("Cutting complete")
 
         if args.debug and not use_direct:
             cutter = make_cutter(bbox_vals, args.cut_angle, axis_vec)
