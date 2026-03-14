@@ -322,6 +322,15 @@ function showViewportLoader(msg = 'Loading...') {
   renderProgressHistory();
 }
 
+function updateViewportLoader(msg) {
+  const overlay = document.getElementById('viewport-loader');
+  const msgEl = overlay?.querySelector('.loader-msg');
+  if (!overlay || !msgEl) return;
+  msgEl.textContent = msg;
+  lastProgressEventAt = Date.now();
+  addDebugLog('loader-update', msg);
+}
+
 function removeViewportLoader() {
   const existing = document.getElementById('viewport-loader');
   if (existing) existing.remove();
@@ -475,11 +484,16 @@ async function ensureSceneMeshes(scene, context = 'scene') {
   const pending = (scene?.parts || []).filter((part) => !part.mesh && part.meshUrl);
   if (!pending.length) return;
 
+  stopProgressStream();
+  startStallWatchdog(context);
   for (let idx = 0; idx < pending.length; idx += 1) {
     const part = pending[idx];
-    addDebugLog('mesh-fetch', `Fetching ${part.meshFormat?.toUpperCase() || 'mesh'} ${idx + 1} of ${pending.length}: ${part.name}`);
+    const fetchMsg = `Fetching ${part.meshFormat?.toUpperCase() || 'mesh'} ${idx + 1} of ${pending.length}: ${part.name}`;
+    updateViewportLoader(fetchMsg);
+    addDebugLog('mesh-fetch', fetchMsg);
     const geometry = await loadRemoteGeometry(part);
     part.meshGeometry = geometry;
+    lastProgressEventAt = Date.now();
     addDebugLog('mesh-fetch', `Fetched ${part.meshFormat?.toUpperCase() || 'mesh'} ${idx + 1} of ${pending.length}: ${part.name}`);
   }
 }
