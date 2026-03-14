@@ -2149,6 +2149,37 @@ def _shape_to_clean_trimesh(shape, tolerance=0.05, angular=0.5):
     return mesh
 
 
+def payload_to_clean_trimesh(payload, process=False):
+    """Convert cached mesh payload data into a cleaned trimesh."""
+    import trimesh
+
+    vertices = np.asarray(payload.get("vertices", []), dtype=np.float64).reshape(-1, 3)
+    faces = np.asarray(payload.get("indices", []), dtype=np.int64).reshape(-1, 3)
+    if len(vertices) == 0 or len(faces) == 0:
+        return None
+
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=process)
+    if len(mesh.faces) == 0:
+        return None
+
+    face_areas = mesh.area_faces
+    valid_mask = face_areas > 0
+    if not valid_mask.all():
+        mesh.update_faces(valid_mask)
+    mesh.remove_unreferenced_vertices()
+    mesh.merge_vertices()
+    mesh.fix_normals()
+
+    if len(mesh.faces) == 0:
+        return None
+
+    if not mesh.is_watertight:
+        trimesh.repair.fill_holes(mesh)
+        trimesh.repair.fix_winding(mesh)
+
+    return mesh
+
+
 def _mesh_convex_hull(mesh):
     """Return the convex hull of a trimesh for fast collision checks."""
     try:
@@ -2250,7 +2281,7 @@ def _local_band_drop(falling_band, settled_band, ax, grid=28, tolerance=0.02):
     return max(0.0, best_drop)
 
 
-def simulate_physics_contact_fast(part_info, axis_vec, gap, *, rough_drop=True, debug=False):
+def simulate_physics_contact_fast(part_info, axis_vec, gap, *, rough_drop=True, debug=False, mesh_payloads=None):
     """Fast settle solver using decimated proxies plus local contact bands.
 
     Returns ``(updated_part_info, metrics_dict)``.
@@ -2266,14 +2297,24 @@ def simulate_physics_contact_fast(part_info, axis_vec, gap, *, rough_drop=True, 
     bodies = []
 
     progress.begin("Autodrop", len(part_info) * 2, "Preparing contact meshes...")
-    for idx, entry in enumerate(part_info, start=1):
+    mesh_payloads = mesh_payloads or [None] * len(part_info)
+    for idx, (entry, payload) in enumerate(zip(part_info, mesh_payloads), start=1):
         if len(entry) == 6:
             name, shape, loc, rgb, segment, is_mesh = entry
         else:
             name, shape, loc, rgb, segment = entry
             is_mesh = False
-        moved = apply_location(shape, loc)
-        full_mesh = _shape_to_clean_trimesh(moved, tolerance=0.08, angular=0.35)
+        full_mesh = None
+        if payload is not None:
+            full_mesh = payload_to_clean_trimesh(payload, process=False)
+            if full_mesh is not None:
+                coords = np.asarray(loc.toTuple()[0], dtype=float)
+                if np.any(np.abs(coords) > 1e-9):
+                    full_mesh = full_mesh.copy()
+                    full_mesh.apply_translation(coords)
+        if full_mesh is None:
+            moved = apply_location(shape, loc)
+            full_mesh = _shape_to_clean_trimesh(moved, tolerance=0.08, angular=0.35)
         proxy_mesh = _decimate_trimesh(full_mesh.copy() if full_mesh is not None else None, target_faces=3500) if full_mesh is not None else None
         bodies.append({
             "entry": entry,

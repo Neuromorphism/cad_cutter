@@ -549,6 +549,26 @@ def _orientation_payload_for_part(part: PartState, target_triangles: int = _ORIE
     return _decimate_payload(_mesh_payload(effective_shape, tolerance=0.8), target_triangles)
 
 
+def _autodrop_mesh_payloads(part_info) -> list[dict[str, Any] | None]:
+    payloads: list[dict[str, Any] | None] = []
+    part_lookup: dict[str, list[PartState]] = {}
+    for part in state.parts:
+        part_lookup.setdefault(_part_display_name(part), []).append(part)
+
+    for entry in part_info:
+        name, shape, _loc = entry[:3]
+        queue = part_lookup.get(name)
+        part = queue.pop(0) if queue else None
+        if part is None or not part.mesh_source_path or _part_has_runtime_transform(part):
+            payloads.append(None)
+            continue
+        try:
+            payloads.append(_load_mesh_payload_from_cache_file(part.mesh_source_path, shape))
+        except Exception:
+            payloads.append(None)
+    return payloads
+
+
 def _can_use_fast_mesh_scene(part_states: list[PartState]) -> bool:
     if not part_states:
         return False
@@ -1247,11 +1267,12 @@ def run_stage(name: str):
             _ensure_all_real_geometry()
             axis_vec = assemble.AXIS_MAP.get(state.axis, assemble.AXIS_MAP["z"])
             _assy, base_part_info = assemble.stack_parts(_parts_for_assembly(), axis_vec, state.gap)
+            mesh_payloads = _autodrop_mesh_payloads(base_part_info)
             local_only, local_metrics = assemble.simulate_physics_contact_fast(
-                base_part_info, axis_vec, state.gap, rough_drop=False, debug=False,
+                base_part_info, axis_vec, state.gap, rough_drop=False, debug=False, mesh_payloads=mesh_payloads,
             )
             proxy_then_local, proxy_metrics = assemble.simulate_physics_contact_fast(
-                base_part_info, axis_vec, state.gap, rough_drop=True, debug=False,
+                base_part_info, axis_vec, state.gap, rough_drop=True, debug=False, mesh_payloads=mesh_payloads,
             )
             use_proxy = proxy_metrics["elapsed_s"] < local_metrics["elapsed_s"]
             chosen = proxy_then_local if use_proxy else local_only
