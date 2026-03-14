@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
+import queue
 import sys
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -20,6 +23,18 @@ from assemble import progress
 
 SUPPORTED_EXT = assemble.ALL_EXTENSIONS
 GRADIENT_EXT = {".wrl", ".vrml", ".stl", ".3mf"}
+
+
+def _safe_resolve(user_path: str) -> Path:
+    """Resolve a user-supplied path and ensure it stays within cwd.
+
+    Raises ValueError if the resolved path escapes the working directory.
+    """
+    cwd = Path.cwd().resolve()
+    resolved = (cwd / user_path).resolve()
+    if not str(resolved).startswith(str(cwd)):
+        raise ValueError(f"Path escapes working directory: {user_path}")
+    return resolved
 
 
 @dataclass
@@ -47,7 +62,12 @@ state = SessionState()
 app = Flask(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Geometry helpers
+# ---------------------------------------------------------------------------
+
 def _mesh_payload(shape, tolerance: float = 0.5) -> dict[str, Any]:
+    """Tessellate a shape and return a dict of flat vertex/index lists."""
     verts, faces = assemble.tessellate_shape(shape, tolerance=tolerance)
     if len(verts) == 0:
         return {"vertices": [], "indices": []}
@@ -121,10 +141,9 @@ def _build_scene() -> dict[str, Any]:
     return {"parts": part_meshes, "combined": combined}
 
 
-@app.route("/")
-def index():
-    return render_template("index.html")
-
+# ---------------------------------------------------------------------------
+# Gradient module loader
+# ---------------------------------------------------------------------------
 
 def _load_gradient_module():
     mod_path = Path(__file__).resolve().parent / "wrl-color-gradient-app" / "wrl_color_gradient.py"
@@ -139,6 +158,15 @@ def _load_gradient_module():
     return module
 
 
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+
 @app.route("/api/progress")
 def get_progress():
     """Return current progress state as JSON for polling."""
@@ -148,11 +176,7 @@ def get_progress():
 @app.route("/api/progress/stream")
 def stream_progress():
     """Server-Sent Events stream for real-time progress updates."""
-    import json
-    import queue
-    import threading
-
-    q = queue.Queue()
+    q: queue.Queue = queue.Queue()
 
     def listener(stage, current, total, message):
         q.put({"stage": stage, "current": current, "total": total, "message": message})
@@ -166,7 +190,6 @@ def stream_progress():
                     data = q.get(timeout=30)
                     yield f"data: {json.dumps(data)}\n\n"
                 except queue.Empty:
-                    # Send keepalive
                     yield ": keepalive\n\n"
         except GeneratorExit:
             pass
@@ -180,20 +203,14 @@ def stream_progress():
 @app.route("/api/files")
 def list_files():
     cwd = Path.cwd()
-    out = []
-    for p in sorted(cwd.iterdir()):
-        if p.is_file() and p.suffix.lower() in SUPPORTED_EXT:
-            out.append(str(p.name))
+    out = [p.name for p in sorted(cwd.iterdir()) if p.is_file() and p.suffix.lower() in SUPPORTED_EXT]
     return jsonify({"files": out})
 
 
 @app.route("/api/gradient/files")
 def list_gradient_files():
     cwd = Path.cwd()
-    out = []
-    for p in sorted(cwd.iterdir()):
-        if p.is_file() and p.suffix.lower() in GRADIENT_EXT:
-            out.append(str(p.name))
+    out = [p.name for p in sorted(cwd.iterdir()) if p.is_file() and p.suffix.lower() in GRADIENT_EXT]
     return jsonify({"files": out})
 
 
@@ -204,9 +221,10 @@ def run_wrl_gradient_capability():
     if not input_file:
         return jsonify({"error": "missing input"}), 400
 
-    input_path = Path(input_file)
-    if not input_path.is_absolute():
-        input_path = Path.cwd() / input_path
+    try:
+        input_path = _safe_resolve(input_file)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 403
     if not input_path.exists():
         return jsonify({"error": f"input not found: {input_path}"}), 404
 
@@ -250,11 +268,15 @@ def load_parts():
     state.parts.clear()
     progress.begin("Loading", len(files), "Loading parts...")
     for i, rel in enumerate(files):
-        path = Path(rel)
-        if not path.is_absolute():
-            path = Path.cwd() / path
+        try:
+            path = _safe_resolve(rel)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 403
         wp, name = assemble.load_part(str(path), require_solid=False)
-        state.parts.append(PartState(file_path=str(path), name=name, source_ext=path.suffix.lower(), shape=wp.val().wrapped))
+        state.parts.append(PartState(
+            file_path=str(path), name=name,
+            source_ext=path.suffix.lower(), shape=wp.val().wrapped,
+        ))
         progress.advance(1, f"Loaded {name}")
     progress.finish("Parts loaded")
     return jsonify({"ok": True, "count": len(state.parts)})
@@ -265,15 +287,19 @@ def get_scene():
     return jsonify(_build_scene())
 
 
-@app.route("/api/part/<int:index>", methods=["PATCH"])
-def update_part(index: int):
-    if index < 0 or index >= len(state.parts):
+@app.route("/api/part/<int:idx>", methods=["PATCH"])
+def update_part(idx: int):
+    if idx < 0 or idx >= len(state.parts):
         return jsonify({"error": "invalid index"}), 404
     data = request.get_json(force=True)
-    p = state.parts[index]
+    p = state.parts[idx]
     if "rotation" in data:
         rot = data["rotation"]
-        p.rot_xyz = (float(rot.get("x", p.rot_xyz[0])), float(rot.get("y", p.rot_xyz[1])), float(rot.get("z", p.rot_xyz[2])))
+        p.rot_xyz = (
+            float(rot.get("x", p.rot_xyz[0])),
+            float(rot.get("y", p.rot_xyz[1])),
+            float(rot.get("z", p.rot_xyz[2])),
+        )
     if "scale" in data:
         p.manual_scale = max(0.01, float(data["scale"]))
     if "material" in data:
@@ -361,12 +387,38 @@ def set_config():
     return jsonify({"ok": True})
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 def main():
     parser = argparse.ArgumentParser(description="CAD cutter web UI")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=12080)
+    parser.add_argument("--no-reload", action="store_true",
+                        help="Disable auto-reload on source changes")
     args = parser.parse_args()
-    app.run(host=args.host, port=args.port, debug=False)
+
+    use_reloader = not args.no_reload
+
+    # Try livereload for instant browser refresh on static/template changes.
+    # Falls back to Flask's built-in reloader for Python source changes.
+    if use_reloader:
+        try:
+            from livereload import Server
+            server = Server(app.wsgi_app)
+            server.watch("templates/")
+            server.watch("static/")
+            server.watch("web_ui.py")
+            print(f" * LiveReload server on http://{args.host}:{args.port}")
+            print(" * Watching templates/, static/, and web_ui.py for changes")
+            server.serve(host=args.host, port=args.port)
+        except ImportError:
+            print(" * livereload not installed, using Flask debug reloader")
+            print(" * Install with: pip install livereload")
+            app.run(host=args.host, port=args.port, debug=True)
+    else:
+        app.run(host=args.host, port=args.port, debug=False)
 
 
 if __name__ == "__main__":

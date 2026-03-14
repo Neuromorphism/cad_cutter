@@ -1,9 +1,6 @@
 import * as THREE from 'https://unpkg.com/three@0.161.0/build/three.module.js';
 import { OrbitControls } from 'https://unpkg.com/three@0.161.0/examples/jsm/controls/OrbitControls.js';
 
-const startSimBtn = document.getElementById('start-sim');
-
-let activeAnimation = null;
 /* ── DOM refs ── */
 const fileList       = document.getElementById('file-list');
 const statusEl       = document.getElementById('status');
@@ -12,31 +9,6 @@ const gradientInput  = document.getElementById('gradient-input');
 const gradientMode   = document.getElementById('gradient-mode');
 const gradientOutput = document.getElementById('gradient-output');
 const gradientRender = document.getElementById('gradient-render');
-const gradientPalette = document.getElementById('gradient-palette');
-const gradientReversePalette = document.getElementById('gradient-reverse-palette');
-const gradientSourceColor = document.getElementById('gradient-source-color');
-const gradientSinkColor = document.getElementById('gradient-sink-color');
-const gradientSourceTemp = document.getElementById('gradient-source-temp');
-const gradientSinkTemp = document.getElementById('gradient-sink-temp');
-const gradientAmbientTemp = document.getElementById('gradient-ambient-temp');
-const gradientDt = document.getElementById('gradient-dt');
-const gradientMaxSteps = document.getElementById('gradient-max-steps');
-const gradientDiffusionRate = document.getElementById('gradient-diffusion-rate');
-const gradientSourceBand = document.getElementById('gradient-source-band');
-const gradientSinkBand = document.getElementById('gradient-sink-band');
-const gradientRadialInner = document.getElementById('gradient-radial-inner');
-const gradientRadialOuter = document.getElementById('gradient-radial-outer');
-const mainCanvas = document.getElementById('main-canvas');
-const thumbs = document.getElementById('thumbnails');
-const axisSelect = document.getElementById('axis-select');
-const gapInput = document.getElementById('gap-input');
-const startSimBtn = document.getElementById('start-sim');
-
-let sceneData = null;
-let tileView = false;
-let mainAnimation = null;
-let thumbAnimations = [];
-const sectionInput = document.getElementById('section-input');
 const mainCanvas     = document.getElementById('main-canvas');
 const thumbs         = document.getElementById('thumbnails');
 const axisSelect     = document.getElementById('axis-select');
@@ -47,6 +19,7 @@ const viewportHint   = document.getElementById('viewport-hint');
 const toastContainer = document.getElementById('toast-container');
 const combinedBtn    = document.getElementById('combined-view');
 const tileBtn        = document.getElementById('tile-view');
+const startSimBtn    = document.getElementById('start-sim');
 
 const progressContainer = document.getElementById('progress-container');
 const progressFill      = document.getElementById('progress-fill');
@@ -54,8 +27,10 @@ const progressText      = document.getElementById('progress-text');
 
 let sceneData = null;
 let tileView  = false;
-let mainCtx   = null;  // persistent renderer context
-let progressSSE = null; // SSE connection for progress
+let mainCtx   = null;
+let progressSSE = null;
+let mainAnimation = null;
+let thumbAnimations = [];
 
 const MATERIAL_OPTIONS = [
   '', 'steel', 'aluminum', 'copper', 'brass', 'bronze', 'gold', 'titanium',
@@ -91,11 +66,11 @@ function stopMainAnimation() {
     mainAnimation = null;
   }
 }
+
 function stopThumbAnimations() {
   thumbAnimations.forEach((stop) => stop());
   thumbAnimations = [];
 }
-
 
 /* ── API wrapper with error handling ── */
 async function api(path, opts = {}) {
@@ -113,7 +88,15 @@ function showViewportLoader(msg = 'Loading...') {
   const overlay = document.createElement('div');
   overlay.className = 'loading-overlay';
   overlay.id = 'viewport-loader';
-  overlay.innerHTML = `<div class="spinner"></div><p class="loader-msg">${msg}</p><div class="viewport-progress"><div class="progress-bar"><div class="progress-fill" id="viewport-progress-fill"></div></div><span class="progress-text" id="viewport-progress-text"></span></div>`;
+  overlay.innerHTML = `
+    <div class="spinner"></div>
+    <p class="loader-msg">${msg}</p>
+    <div class="viewport-progress">
+      <div class="progress-bar">
+        <div class="progress-fill" id="viewport-progress-fill"></div>
+      </div>
+      <span class="progress-text" id="viewport-progress-text"></span>
+    </div>`;
   mainCanvas.appendChild(overlay);
 }
 
@@ -130,15 +113,12 @@ function buildRenderer(container) {
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.1;
 
-  // Clear only the canvas, preserve overlays
   const existingCanvas = container.querySelector('canvas');
   if (existingCanvas) existingCanvas.remove();
   container.insertBefore(renderer.domElement, container.firstChild);
 
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x0d1117);
-
-  // Subtle gradient via fog
   scene.fog = new THREE.FogExp2(0x0d1117, 0.0008);
 
   const camera = new THREE.PerspectiveCamera(
@@ -151,7 +131,6 @@ function buildRenderer(container) {
   controls.dampingFactor = 0.08;
   controls.rotateSpeed = 0.8;
 
-  // Lighting setup — more sophisticated
   const hemi = new THREE.HemisphereLight(0xc8d8f0, 0x1a2030, 0.6);
   scene.add(hemi);
 
@@ -167,7 +146,6 @@ function buildRenderer(container) {
   rim.position.set(0, -20, -80);
   scene.add(rim);
 
-  // Ground plane grid
   const grid = new THREE.GridHelper(600, 40, 0x1a2030, 0x141a22);
   grid.material.transparent = true;
   grid.material.opacity = 0.5;
@@ -199,52 +177,41 @@ function fitCamera(camera, controls, group) {
   controls.update();
 }
 
-function animate(ctx, frameHook = null){
+function animate(ctx, frameHook = null) {
+  let animId = null;
   let last = performance.now();
-  let animation = null;
-  if (activeAnimation) {
-    cancelAnimationFrame(activeAnimation);
-    activeAnimation = null;
-  }
-  let last = performance.now();
-  const tick = ()=>{
+  const tick = () => {
     const now = performance.now();
     const dt = Math.min((now - last) / 1000, 0.05);
     last = now;
     if (frameHook) frameHook(dt);
+    ctx.controls.update();
     ctx.renderer.render(ctx.scene, ctx.camera);
-    animation = requestAnimationFrame(tick);
+    animId = requestAnimationFrame(tick);
   };
   tick();
   return () => {
-    if (animation !== null) {
-      cancelAnimationFrame(animation);
-      animation = null;
+    if (animId !== null) {
+      cancelAnimationFrame(animId);
+      animId = null;
     }
   };
-    activeAnimation = requestAnimationFrame(tick);
-  };
-  tick();
 }
 
 /* ── Main 3D viewport ── */
 function renderMain() {
   if (!sceneData) return;
 
-  // Hide hint when we have data
   if (viewportHint) viewportHint.style.display = 'none';
 
-  // Reuse or create renderer
   if (mainCtx) {
-    // Clear scene objects (keep lights, grid)
     mainCtx.scene.children
       .filter(c => c.type === 'Group')
       .forEach(c => mainCtx.scene.remove(c));
   } else {
     mainCtx = buildRenderer(mainCanvas);
-    animate(mainCtx);
+    mainAnimation = animate(mainCtx);
 
-    // Handle resize
     const ro = new ResizeObserver(() => {
       if (!mainCtx) return;
       const w = mainCanvas.clientWidth;
@@ -273,9 +240,10 @@ function renderMain() {
   removeViewportLoader();
 }
 
+/* ── Physics simulation ── */
 function startPhysicsSim() {
   if (!sceneData || tileView) {
-    setStatus('Switch to Combined View to run the physics sim.');
+    toast('Switch to Combined View to run the physics sim.', 'warning');
     return;
   }
 
@@ -293,37 +261,12 @@ function startPhysicsSim() {
 
   ctx.scene.add(group);
   fitCamera(ctx.camera, ctx.controls, group);
-  stopMainAnimation();
-  mainAnimation = animate(ctx);
-}
-
-function startPhysicsSim() {
-  if (!sceneData || tileView) {
-    setStatus('Switch to Combined View to run the physics sim.');
-    return;
-  }
-
-  const ctx = buildRenderer(mainCanvas);
-  const group = new THREE.Group();
-  const bodies = [];
-
-  sceneData.combined.forEach((p, i) => {
-    const mesh = meshFromPayload(p.mesh, p.color);
-    const dropHeight = 100 + (i * 20);
-    mesh.position.y += dropHeight;
-    group.add(mesh);
-    bodies.push({ mesh, targetY: mesh.position.y - dropHeight, vy: 0, settled: false });
-  });
-
-  ctx.scene.add(group);
-  fitCamera(ctx.camera, ctx.controls, group);
-  setStatus('Physics sim running...');
+  setBusy('Physics sim running...');
 
   const gravity = -260;
   let simDone = false;
   stopMainAnimation();
   mainAnimation = animate(ctx, (dt) => {
-  animate(ctx, (dt) => {
     let settledCount = 0;
     for (const body of bodies) {
       if (body.settled) {
@@ -345,7 +288,7 @@ function startPhysicsSim() {
     }
     if (!simDone && settledCount === bodies.length) {
       simDone = true;
-      setStatus('Physics sim complete. Parts dropped into place.');
+      setIdle('Physics sim complete. Parts dropped into place.');
     }
   });
 }
@@ -371,7 +314,6 @@ function buildThumb(part, idx) {
 
   const canvas = wrap.querySelector('.thumb-canvas');
   const ctx = buildRenderer(canvas);
-  // Remove grid from thumbnails
   if (ctx.grid) ctx.scene.remove(ctx.grid);
   const mesh = meshFromPayload(part.mesh);
   ctx.scene.add(mesh);
@@ -379,7 +321,6 @@ function buildThumb(part, idx) {
   const stopThumbAnimation = animate(ctx);
   thumbAnimations.push(stopThumbAnimation);
 
-  // Material dropdown
   const materialSelect = wrap.querySelector('select[data-k="material"]');
   MATERIAL_OPTIONS.forEach(m => {
     const opt = document.createElement('option');
@@ -389,7 +330,6 @@ function buildThumb(part, idx) {
     materialSelect.appendChild(opt);
   });
 
-  // Value change handlers
   const sendUpdate = async () => {
     const rotation = {
       x: +wrap.querySelector('input[data-k="x"]').value,
@@ -418,10 +358,8 @@ function buildThumb(part, idx) {
   thumbs.appendChild(wrap);
 }
 
-function renderThumbs(){
-  stopThumbAnimations();
-  thumbs.innerHTML='';
 function renderThumbs() {
+  stopThumbAnimations();
   thumbs.innerHTML = '';
   if (!sceneData || !sceneData.parts.length) {
     partCountEl.textContent = '0 parts';
@@ -461,7 +399,6 @@ async function refreshFiles() {
         const row = document.createElement('div');
         row.className = 'file-row';
         row.innerHTML = `<input type="checkbox" value="${f}"/><span class="file-name">${f}</span><span class="file-ext">${ext}</span>`;
-        // Click anywhere on row to toggle checkbox
         row.addEventListener('click', e => {
           if (e.target.tagName !== 'INPUT') {
             const cb = row.querySelector('input');
@@ -532,7 +469,6 @@ function startProgressStream() {
       if (data.total > 0) {
         showProgress(data.current, data.total, data.message);
         setStatus(data.message, true);
-        // Also update viewport overlay if visible
         const vpFill = document.getElementById('viewport-progress-fill');
         const vpText = document.getElementById('viewport-progress-text');
         const vpMsg = document.querySelector('#viewport-loader .loader-msg');
@@ -543,7 +479,6 @@ function startProgressStream() {
     } catch (_) {}
   };
   progressSSE.onerror = () => {
-    // Reconnect silently on error
     if (progressSSE) progressSSE.close();
     progressSSE = null;
   };
@@ -554,7 +489,6 @@ function stopProgressStream() {
     progressSSE.close();
     progressSSE = null;
   }
-  // Small delay to let user see 100% before hiding
   setTimeout(hideProgress, 600);
 }
 
@@ -588,7 +522,6 @@ document.getElementById('load-selected').addEventListener('click', withLoading(
     }
     setBusy('Loading parts...');
     showViewportLoader('Loading parts...');
-    startProgressStream();
     try {
       await api('/api/load', { method: 'POST', body: JSON.stringify({ files }) });
       toast(`Loaded ${files.length} part${files.length !== 1 ? 's' : ''}`, 'success');
@@ -598,8 +531,6 @@ document.getElementById('load-selected').addEventListener('click', withLoading(
       removeViewportLoader();
       setIdle();
       toast('Failed to load parts: ' + e.message, 'error');
-    } finally {
-      stopProgressStream();
     }
   }
 ));
@@ -627,44 +558,6 @@ sectionInput.addEventListener('change', async () => {
   } catch (e) { toast('Config update failed', 'error'); }
 });
 
-document.querySelectorAll('[data-stage]').forEach((btn)=>btn.addEventListener('click', async ()=>{
-  const out = await api(`/api/stage/${btn.dataset.stage}`, {method:'POST', body:'{}'});
-  setStatus(out.message || 'Done');
-  await refreshScene();
-}));
-
-document.getElementById('refresh-gradient-files').addEventListener('click', refreshGradientFiles);
-document.getElementById('run-gradient-capability').addEventListener('click', async ()=>{
-  if (!gradientInput.value){
-    setStatus('No WRL/STL/3MF file available for gradient capability.');
-    return;
-  }
-  const out = await api('/api/capability/wrl_gradient', {
-    method:'POST',
-    body: JSON.stringify({
-      input: gradientInput.value,
-      mode: gradientMode.value,
-      palette: gradientPalette.value || null,
-      reversePalette: gradientReversePalette.checked,
-      sourceColor: gradientSourceColor.value || '#FF0000',
-      sinkColor: gradientSinkColor.value || '#0000FF',
-      sourceTemp: +gradientSourceTemp.value,
-      sinkTemp: +gradientSinkTemp.value,
-      ambientTemp: +gradientAmbientTemp.value,
-      dt: +gradientDt.value,
-      maxSteps: Math.max(1, Math.floor(+gradientMaxSteps.value || 4000)),
-      diffusionRate: +gradientDiffusionRate.value,
-      sourceBand: +gradientSourceBand.value,
-      sinkBand: +gradientSinkBand.value,
-      radialInner: +gradientRadialInner.value,
-      radialOuter: +gradientRadialOuter.value,
-      output: gradientOutput.value || 'web_colored_output.ply',
-      render: gradientRender.value || null,
-    }),
-  });
-  setStatus(out.message || 'Gradient capability complete');
-  await refreshFiles();
-  await refreshGradientFiles();
 // Pipeline stages
 document.querySelectorAll('[data-stage]').forEach(btn => {
   btn.addEventListener('click', withLoading(btn, async () => {
@@ -687,13 +580,10 @@ document.querySelectorAll('[data-stage]').forEach(btn => {
 // View mode toggle
 combinedBtn.addEventListener('click', () => { tileView = false; updateViewButtons(); renderMain(); });
 tileBtn.addEventListener('click', () => { tileView = true; updateViewButtons(); renderMain(); });
-
-document.getElementById('combined-view').addEventListener('click', ()=>{tileView=false; renderMain();});
-document.getElementById('tile-view').addEventListener('click', ()=>{tileView=true; renderMain();});
 if (startSimBtn) {
   startSimBtn.addEventListener('click', startPhysicsSim);
 }
-startSimBtn.addEventListener('click', startPhysicsSim);
+
 // Gradient capability
 document.getElementById('refresh-gradient-files').addEventListener('click', refreshGradientFiles);
 document.getElementById('run-gradient-capability').addEventListener('click', withLoading(
@@ -725,7 +615,7 @@ document.getElementById('run-gradient-capability').addEventListener('click', wit
   }
 ));
 
-/* ── Keyboard shortcut: Ctrl+L = load, Ctrl+R = refresh ── */
+/* ── Keyboard shortcut: Ctrl+L = load ── */
 document.addEventListener('keydown', e => {
   if (e.ctrlKey && e.key === 'l') {
     e.preventDefault();
