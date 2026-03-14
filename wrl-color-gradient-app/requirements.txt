@@ -1,0 +1,15 @@
+# Core numerical computation for thermal simulation
+numpy>=1.26
+scipy>=1.11
+
+# Mesh loading/writing across WRL/STL/3MF and other common formats
+trimesh>=4.4
+meshio>=5.3
+lxml>=5.2
+
+# Optional visualization/rendering for test images and debugging
+matplotlib>=3.8
+pyvista>=0.43
+
+# CLI ergonomics and richer terminal UX (optional but useful)
+rich>=13.7

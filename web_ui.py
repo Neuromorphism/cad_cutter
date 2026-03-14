@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -16,6 +18,7 @@ from OCP.gp import gp_GTrsf
 import assemble
 
 SUPPORTED_EXT = assemble.ALL_EXTENSIONS
+GRADIENT_EXT = {".wrl", ".vrml", ".stl", ".3mf"}
 
 
 @dataclass
@@ -118,6 +121,19 @@ def index():
     return render_template("index.html")
 
 
+def _load_gradient_module():
+    mod_path = Path(__file__).resolve().parent / "wrl-color-gradient-app" / "wrl_color_gradient.py"
+    if not mod_path.exists():
+        raise FileNotFoundError(f"Gradient module not found: {mod_path}")
+    spec = importlib.util.spec_from_file_location("wrl_color_gradient", mod_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to import gradient module from {mod_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 @app.route("/api/files")
 def list_files():
     cwd = Path.cwd()
@@ -126,6 +142,55 @@ def list_files():
         if p.is_file() and p.suffix.lower() in SUPPORTED_EXT:
             out.append(str(p.name))
     return jsonify({"files": out})
+
+
+@app.route("/api/gradient/files")
+def list_gradient_files():
+    cwd = Path.cwd()
+    out = []
+    for p in sorted(cwd.iterdir()):
+        if p.is_file() and p.suffix.lower() in GRADIENT_EXT:
+            out.append(str(p.name))
+    return jsonify({"files": out})
+
+
+@app.route("/api/capability/wrl_gradient", methods=["POST"])
+def run_wrl_gradient_capability():
+    data = request.get_json(force=True)
+    input_file = data.get("input")
+    if not input_file:
+        return jsonify({"error": "missing input"}), 400
+
+    input_path = Path(input_file)
+    if not input_path.is_absolute():
+        input_path = Path.cwd() / input_path
+    if not input_path.exists():
+        return jsonify({"error": f"input not found: {input_path}"}), 404
+
+    output_ply = data.get("output", "web_colored_output.ply")
+    render_svg = data.get("render")
+    mode = data.get("mode", "top-bottom")
+
+    module = _load_gradient_module()
+    colorizer = module.MeshThermalColorizer(
+        source_color=module.MeshThermalColorizer.hex_color(data.get("sourceColor", "#FF0000")),
+        sink_color=module.MeshThermalColorizer.hex_color(data.get("sinkColor", "#0000FF")),
+        mode=mode,
+        source_temp=float(data.get("sourceTemp", 500.0)),
+        sink_temp=float(data.get("sinkTemp", 300.0)),
+        ambient_temp=float(data.get("ambientTemp", 300.0)),
+        material=data.get("material", "stainless_steel"),
+        dt=float(data.get("dt", 0.1)),
+        max_steps=int(data.get("maxSteps", 4000)),
+    )
+    colorizer.process(str(input_path), output_ply, render_svg)
+
+    return jsonify({
+        "ok": True,
+        "message": f"Gradient output written to {output_ply}",
+        "output": output_ply,
+        "render": render_svg,
+    })
 
 
 @app.route("/api/load", methods=["POST"])
