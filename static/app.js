@@ -1,5 +1,6 @@
 import * as THREE from '/static/vendor/three.module.js';
 import { OrbitControls } from '/static/vendor/OrbitControls.js';
+import { STLLoader } from '/static/vendor/STLLoader.js';
 
 /* ── DOM refs ── */
 const fileList       = document.getElementById('file-list');
@@ -11,6 +12,7 @@ const gradientOutput = document.getElementById('gradient-output');
 const gradientRender = document.getElementById('gradient-render');
 const mainCanvas     = document.getElementById('main-canvas');
 const thumbs         = document.getElementById('thumbnails');
+const workflowSelect = document.getElementById('workflow-select');
 const axisSelect     = document.getElementById('axis-select');
 const gapInput       = document.getElementById('gap-input');
 const sectionInput   = document.getElementById('section-input');
@@ -21,7 +23,6 @@ const viewportHint   = document.getElementById('viewport-hint');
 const toastContainer = document.getElementById('toast-container');
 const combinedBtn    = document.getElementById('combined-view');
 const tileBtn        = document.getElementById('tile-view');
-const startSimBtn    = document.getElementById('start-sim');
 const dirOverlay     = document.getElementById('dir-overlay');
 const dirList        = document.getElementById('dir-list');
 const dirCurrent     = document.getElementById('dir-current');
@@ -60,7 +61,9 @@ let pendingDebugFlush = [];
 let debugFlushTimer = null;
 let debugFlushInFlight = false;
 let geometryCache = new WeakMap();
+let remoteGeometryCache = new Map();
 let thumbRenderGeneration = 0;
+const stlLoader = new STLLoader();
 
 const MATERIAL_OPTIONS = [
   '', 'steel', 'aluminum', 'copper', 'brass', 'bronze', 'gold', 'titanium',
@@ -319,6 +322,15 @@ function showViewportLoader(msg = 'Loading...') {
   renderProgressHistory();
 }
 
+function updateViewportLoader(msg) {
+  const overlay = document.getElementById('viewport-loader');
+  const msgEl = overlay?.querySelector('.loader-msg');
+  if (!overlay || !msgEl) return;
+  msgEl.textContent = msg;
+  lastProgressEventAt = Date.now();
+  addDebugLog('loader-update', msg);
+}
+
 function removeViewportLoader() {
   const existing = document.getElementById('viewport-loader');
   if (existing) existing.remove();
@@ -389,8 +401,8 @@ function buildRenderer(container) {
   container.insertBefore(renderer.domElement, container.firstChild);
 
   const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x0d1117);
-  scene.fog = new THREE.FogExp2(0x0d1117, 0.0008);
+  scene.background = new THREE.Color(0x111821);
+  scene.fog = new THREE.FogExp2(0x111821, 0.00055);
 
   const camera = new THREE.PerspectiveCamera(
     45, container.clientWidth / container.clientHeight, 0.1, 10000
@@ -402,19 +414,22 @@ function buildRenderer(container) {
   controls.dampingFactor = 0.08;
   controls.rotateSpeed = 0.8;
 
-  const hemi = new THREE.HemisphereLight(0xc8d8f0, 0x1a2030, 0.6);
+  const ambient = new THREE.AmbientLight(0xf6f8ff, 0.75);
+  scene.add(ambient);
+
+  const hemi = new THREE.HemisphereLight(0xe4efff, 0x26313f, 1.2);
   scene.add(hemi);
 
-  const key = new THREE.DirectionalLight(0xffffff, 1.2);
-  key.position.set(80, 120, 60);
+  const key = new THREE.DirectionalLight(0xffffff, 2.4);
+  key.position.set(120, 160, 90);
   scene.add(key);
 
-  const fill = new THREE.DirectionalLight(0x8899bb, 0.4);
-  fill.position.set(-60, 40, -30);
+  const fill = new THREE.DirectionalLight(0xb7cae8, 1.0);
+  fill.position.set(-80, 70, -50);
   scene.add(fill);
 
-  const rim = new THREE.DirectionalLight(0x6688cc, 0.3);
-  rim.position.set(0, -20, -80);
+  const rim = new THREE.DirectionalLight(0xa5b9de, 0.7);
+  rim.position.set(20, -10, -100);
   scene.add(rim);
 
   const grid = new THREE.GridHelper(600, 40, 0x1a2030, 0x141a22);
@@ -426,12 +441,23 @@ function buildRenderer(container) {
 }
 
 function geometryFromPayload(payload) {
+  if (!payload || !Array.isArray(payload.vertices) || !Array.isArray(payload.indices)) {
+    const summary = payload && typeof payload === 'object' ? Object.keys(payload) : payload;
+    throw new Error(`Invalid mesh payload: ${JSON.stringify(summary)}`);
+  }
   const cached = geometryCache.get(payload);
   if (cached) return cached;
 
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(payload.vertices), 3));
-  geo.setIndex(new Uint32Array(payload.indices));
+  const indexed = new THREE.BufferGeometry();
+  indexed.setAttribute('position', new THREE.BufferAttribute(new Float32Array(payload.vertices), 3));
+  const vertexCount = payload.vertices.length / 3;
+  const IndexArray = vertexCount < 65536 ? Uint16Array : Uint32Array;
+  indexed.setIndex(Array.from(new IndexArray(payload.indices)));
+  indexed.computeVertexNormals();
+
+  const geo = indexed.toNonIndexed();
+  geo.computeBoundingBox();
+  geo.computeBoundingSphere();
   geo.computeVertexNormals();
   geometryCache.set(payload, geo);
   return geo;
@@ -439,13 +465,23 @@ function geometryFromPayload(payload) {
 
 function meshFromPayload(payload, color = [0.6, 0.7, 0.8]) {
   const geo = geometryFromPayload(payload);
-  const mat = new THREE.MeshStandardMaterial({
-    color: new THREE.Color(...color),
-    metalness: 0.35,
-    roughness: 0.45,
-    envMapIntensity: 0.5,
-  });
+  const mat = materialForColor(color);
   return new THREE.Mesh(geo, mat);
+}
+
+function materialForColor(color = [0.6, 0.7, 0.8]) {
+  return new THREE.MeshStandardMaterial({
+    color: new THREE.Color(...color),
+    metalness: 0.05,
+    roughness: 0.75,
+    side: THREE.DoubleSide,
+  });
+}
+
+function buildVisualFromGeometry(geometry, color = [0.6, 0.7, 0.8]) {
+  const mesh = new THREE.Mesh(geometry, materialForColor(color));
+  mesh.frustumCulled = false;
+  return mesh;
 }
 
 function isLargeThumbPayload(payload) {
@@ -453,12 +489,48 @@ function isLargeThumbPayload(payload) {
   return vertexCount > 250000;
 }
 
+function thumbPayloadForPart(part) {
+  return part?.thumbMesh || part?.mesh || null;
+}
+
+async function loadRemoteGeometry(part) {
+  if (!part?.meshUrl || part.meshFormat !== 'stl') return null;
+  const cached = remoteGeometryCache.get(part.meshUrl);
+  if (cached) return cached;
+  const geometry = await stlLoader.loadAsync(part.meshUrl);
+  geometry.computeVertexNormals();
+  remoteGeometryCache.set(part.meshUrl, geometry);
+  return geometry;
+}
+
+async function ensureSceneMeshes(scene, context = 'scene') {
+  const pending = (scene?.parts || []).filter((part) => !part.mesh && part.meshUrl);
+  if (!pending.length) return;
+
+  stopProgressStream();
+  startStallWatchdog(context);
+  for (let idx = 0; idx < pending.length; idx += 1) {
+    const part = pending[idx];
+    const fetchMsg = `Fetching ${part.meshFormat?.toUpperCase() || 'mesh'} ${idx + 1} of ${pending.length}: ${part.name}`;
+    updateViewportLoader(fetchMsg);
+    addDebugLog('mesh-fetch', fetchMsg);
+    const geometry = await loadRemoteGeometry(part);
+    part.meshGeometry = geometry;
+    lastProgressEventAt = Date.now();
+    addDebugLog('mesh-fetch', `Fetched ${part.meshFormat?.toUpperCase() || 'mesh'} ${idx + 1} of ${pending.length}: ${part.name}`);
+  }
+}
+
 function meshFromSceneEntry(entry, fallbackColor = [0.6, 0.7, 0.8]) {
   let mesh;
   if (entry.mesh) {
-    mesh = meshFromPayload(entry.mesh, entry.color || fallbackColor);
+    mesh = buildVisualFromGeometry(geometryFromPayload(entry.mesh), entry.color || fallbackColor);
+  } else if (typeof entry.partIndex === 'number' && sceneData?.parts?.[entry.partIndex]?.meshGeometry) {
+    mesh = buildVisualFromGeometry(sceneData.parts[entry.partIndex].meshGeometry, entry.color || fallbackColor);
+    const [x, y, z] = entry.offset || [0, 0, 0];
+    mesh.position.set(x, y, z);
   } else if (typeof entry.partIndex === 'number' && sceneData?.parts?.[entry.partIndex]?.mesh) {
-    mesh = meshFromPayload(sceneData.parts[entry.partIndex].mesh, entry.color || fallbackColor);
+    mesh = buildVisualFromGeometry(geometryFromPayload(sceneData.parts[entry.partIndex].mesh), entry.color || fallbackColor);
     const [x, y, z] = entry.offset || [0, 0, 0];
     mesh.position.set(x, y, z);
   } else {
@@ -467,12 +539,25 @@ function meshFromSceneEntry(entry, fallbackColor = [0.6, 0.7, 0.8]) {
   return mesh;
 }
 
+function geometryForPart(part, context) {
+  if (part?.meshGeometry) return part.meshGeometry;
+  if (part?.mesh) return geometryFromPayload(part.mesh);
+  addDebugLog('render-skip', `No mesh data available for ${context}`, {
+    part: part?.name || null,
+    keys: part && typeof part === 'object' ? Object.keys(part) : [],
+  });
+  return null;
+}
+
 function fitCamera(camera, controls, group) {
   const box = new THREE.Box3().setFromObject(group);
   const size = box.getSize(new THREE.Vector3()).length() || 1;
   const center = box.getCenter(new THREE.Vector3());
   controls.target.copy(center);
   camera.position.copy(center.clone().add(new THREE.Vector3(size * 0.9, size * 0.7, size * 0.9)));
+  camera.near = Math.max(0.1, size / 1000);
+  camera.far = Math.max(5000, size * 10);
+  camera.updateProjectionMatrix();
   controls.update();
 }
 
@@ -531,7 +616,9 @@ function renderMain() {
     });
   } else {
     sceneData.parts.forEach((p, i) => {
-      const mesh = meshFromPayload(p.mesh);
+      const geometry = geometryForPart(p, `tile:${p.name || i}`);
+      if (!geometry) return;
+      const mesh = buildVisualFromGeometry(geometry);
       mesh.position.x = i * 120;
       group.add(mesh);
     });
@@ -539,10 +626,16 @@ function renderMain() {
 
   mainCtx.scene.add(group);
   fitCamera(mainCtx.camera, mainCtx.controls, group);
+  mainCtx.renderer.render(mainCtx.scene, mainCtx.camera);
   removeViewportLoader();
   addDebugLog('render-ready', `Rendered ${tileView ? 'tile' : 'combined'} view`, {
     parts: sceneData.parts?.length || 0,
     combined: sceneData.combined?.length || 0,
+    drawCalls: mainCtx.renderer.info.render.calls,
+    triangles: mainCtx.renderer.info.render.triangles,
+    lines: mainCtx.renderer.info.render.lines,
+    points: mainCtx.renderer.info.render.points,
+    sceneChildren: group.children.length,
   });
 }
 
@@ -626,7 +719,8 @@ function buildThumb(part, idx, deferPreview = false) {
 
   const canvas = wrap.querySelector('.thumb-canvas');
   const renderPreview = () => {
-    if (isLargeThumbPayload(part.mesh)) {
+    const thumbPayload = thumbPayloadForPart(part);
+    if (isLargeThumbPayload(thumbPayload)) {
       canvas.innerHTML = `
         <div class="thumb-placeholder">
           <span class="thumb-placeholder-title">Large mesh</span>
@@ -636,11 +730,37 @@ function buildThumb(part, idx, deferPreview = false) {
     }
     const ctx = buildRenderer(canvas);
     if (ctx.grid) ctx.scene.remove(ctx.grid);
-    const mesh = meshFromPayload(part.mesh);
-    ctx.scene.add(mesh);
-    fitCamera(ctx.camera, ctx.controls, mesh);
-    const stopThumbAnimation = animate(ctx);
-    thumbAnimations.push(stopThumbAnimation);
+    const showMesh = (mesh) => {
+      ctx.scene.add(mesh);
+      fitCamera(ctx.camera, ctx.controls, mesh);
+      ctx.renderer.render(ctx.scene, ctx.camera);
+      const stopThumbAnimation = animate(ctx);
+      thumbAnimations.push(stopThumbAnimation);
+    };
+    if (part.meshGeometry) {
+      showMesh(buildVisualFromGeometry(part.meshGeometry));
+    } else if (thumbPayload) {
+      showMesh(buildVisualFromGeometry(geometryFromPayload(thumbPayload)));
+    } else if (part.meshUrl && part.meshFormat === 'stl') {
+      loadRemoteGeometry(part)
+        .then((geometry) => {
+          part.meshGeometry = geometry;
+          showMesh(buildVisualFromGeometry(geometry));
+        })
+        .catch((error) => {
+          canvas.innerHTML = `
+            <div class="thumb-placeholder">
+              <span class="thumb-placeholder-title">Preview failed</span>
+              <span class="thumb-placeholder-copy">${error.message}</span>
+            </div>`;
+        });
+    } else {
+      canvas.innerHTML = `
+        <div class="thumb-placeholder">
+          <span class="thumb-placeholder-title">No preview mesh</span>
+          <span class="thumb-placeholder-copy">This part did not provide a renderable preview.</span>
+        </div>`;
+    }
   };
 
   if (deferPreview) {
@@ -712,6 +832,19 @@ function updateViewButtons() {
   tileBtn.classList.toggle('active', tileView);
 }
 
+function updateWorkflowUI() {
+  const workflow = workflowSelect?.value || 'cylinder';
+  document.querySelectorAll('[data-workflows]').forEach((el) => {
+    const allowed = (el.dataset.workflows || '')
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const visible = !allowed.length || allowed.includes(workflow);
+    el.classList.toggle('hidden', !visible);
+    if ('disabled' in el) el.disabled = !visible;
+  });
+}
+
 /* ── Data refresh ── */
 async function refreshScene() {
   try {
@@ -722,6 +855,7 @@ async function refreshScene() {
     }
     addDebugLog('scene-refresh', 'Requesting scene payload');
     sceneData = await api('/api/scene', { timeoutMs: 15000 });
+    await ensureSceneMeshes(sceneData, 'scene-fetch');
     addDebugLog('scene-refresh', 'Scene payload received', {
       parts: sceneData.parts?.length || 0,
       combined: sceneData.combined?.length || 0,
@@ -1055,6 +1189,7 @@ document.getElementById('load-selected').addEventListener('click', withLoading(
           combined: loadResult.scene.combined?.length || 0,
         });
         sceneData = loadResult.scene;
+        await ensureSceneMeshes(sceneData, 'load-inline');
         renderMain();
         renderThumbs();
       } else {
@@ -1071,6 +1206,16 @@ document.getElementById('load-selected').addEventListener('click', withLoading(
 ));
 
 // Config changes
+workflowSelect?.addEventListener('change', async () => {
+  try {
+    await api('/api/config', { method: 'PATCH', body: JSON.stringify({ workflow: workflowSelect.value }) });
+    updateWorkflowUI();
+    toast(`Workflow set to ${workflowSelect.options[workflowSelect.selectedIndex]?.textContent || workflowSelect.value}`, 'success');
+  } catch (e) {
+    toast('Workflow update failed', 'error');
+  }
+});
+
 axisSelect.addEventListener('change', async () => {
   try {
     await api('/api/config', { method: 'PATCH', body: JSON.stringify({ axis: axisSelect.value }) });
@@ -1113,12 +1258,17 @@ document.querySelectorAll('[data-stage]').forEach(btn => {
   }));
 });
 
+document.querySelectorAll('[data-client-stage]').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    if (btn.dataset.clientStage === 'auto_drop') {
+      startPhysicsSim();
+    }
+  });
+});
+
 // View mode toggle
 combinedBtn.addEventListener('click', () => { tileView = false; updateViewButtons(); renderMain(); });
 tileBtn.addEventListener('click', () => { tileView = true; updateViewButtons(); renderMain(); });
-if (startSimBtn) {
-  startSimBtn.addEventListener('click', startPhysicsSim);
-}
 
 dirSelectBtn?.addEventListener('click', withLoading(dirSelectBtn, async () => {
   await applyPartsDir(dirBrowseState.selected || dirBrowseState.current);
@@ -1223,4 +1373,5 @@ refreshFiles();
 refreshGradientFiles();
 renderDebugLog();
 updateDebugPanelState();
+updateWorkflowUI();
 addDebugLog('app-init', 'Web UI initialized');

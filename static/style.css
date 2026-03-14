@@ -50,6 +50,8 @@ body {
   line-height: 1.5;
   overflow: hidden;
   height: 100vh;
+  display: flex;
+  flex-direction: column;
 }
 
 .hidden {
@@ -67,8 +69,8 @@ header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 20px;
-  height: 56px;
+  padding: 8px 20px;
+  min-height: 56px;
   background: var(--bg-surface);
   border-bottom: 1px solid var(--border);
   z-index: 10;
@@ -117,6 +119,8 @@ header h1 .logo-icon {
   display: flex;
   gap: 8px;
   align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .controls .divider {
@@ -151,11 +155,16 @@ header h1 .logo-icon {
   width: 56px;
 }
 
+#workflow-select {
+  width: 132px;
+}
+
 /* ── Main layout ── */
 main {
   display: grid;
   grid-template-columns: 280px 1fr;
-  height: calc(100vh - 56px);
+  flex: 1;
+  min-height: 0;
 }
 
 /* ── Sidebar ── */

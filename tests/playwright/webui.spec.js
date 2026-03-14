@@ -35,6 +35,8 @@ test.describe('CAD Cutter web UI', () => {
     await expect(page.getByRole('button', { name: /change dir/i })).toBeVisible();
     await expect(page.locator('#webui-version')).toBeVisible();
     await expect(page.locator('#webui-version')).not.toHaveText('');
+    await expect(page.locator('#workflow-select')).toBeVisible();
+    await expect(page.getByRole('button', { name: /autodrop/i })).toBeVisible();
 
     const button = page.getByRole('button', { name: /change dir/i });
     await button.hover();
@@ -92,5 +94,19 @@ test.describe('CAD Cutter web UI', () => {
     await page.locator('#debug-toggle').click();
     await expect(page.locator('#debug-log')).toContainText('Using scene payload returned from load');
     await expect(page.locator('#debug-log')).not.toContainText('GET /api/scene');
+  });
+
+  test('loads outer STEP sections and shows visible canvases', async ({ page }) => {
+    await page.goto('/');
+    await switchToRepoRoot(page);
+
+    await page.locator('#file-list .file-row', { hasText: 'outer_1.STEP' }).click();
+    await page.locator('#file-list .file-row', { hasText: 'outer_2.STEP' }).click();
+    await page.getByRole('button', { name: /load selected/i }).click();
+
+    await expect(page.locator('#part-count')).toContainText('2 parts');
+    await expect(page.locator('#status')).toContainText(/loaded|scene ready/i);
+    await expect(page.locator('#thumbnails .thumb')).toHaveCount(2);
+    await expect(page.locator('.toast-error')).toHaveCount(0);
   });
 });
