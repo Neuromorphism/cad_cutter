@@ -7,9 +7,11 @@ const mainCanvas = document.getElementById('main-canvas');
 const thumbs = document.getElementById('thumbnails');
 const axisSelect = document.getElementById('axis-select');
 const gapInput = document.getElementById('gap-input');
+const startSimBtn = document.getElementById('start-sim');
 
 let sceneData = null;
 let tileView = false;
+let mainAnimation = null;
 
 function setStatus(msg) { statusEl.textContent = msg; }
 
@@ -51,8 +53,24 @@ function fitCamera(camera, controls, group) {
   controls.update();
 }
 
-function animate(ctx){
-  const tick = ()=>{ctx.renderer.render(ctx.scene, ctx.camera); requestAnimationFrame(tick);}; tick();
+function animate(ctx, frameHook = null){
+  let last = performance.now();
+  let animation = null;
+  const tick = ()=>{
+    const now = performance.now();
+    const dt = Math.min((now - last) / 1000, 0.05);
+    last = now;
+    if (frameHook) frameHook(dt);
+    ctx.renderer.render(ctx.scene, ctx.camera);
+    animation = requestAnimationFrame(tick);
+  };
+  tick();
+  return () => {
+    if (animation !== null) {
+      cancelAnimationFrame(animation);
+      animation = null;
+    }
+  };
 }
 
 function renderMain() {
@@ -70,7 +88,60 @@ function renderMain() {
   }
   ctx.scene.add(group);
   fitCamera(ctx.camera, ctx.controls, group);
-  animate(ctx);
+  if (mainAnimation) mainAnimation();
+  mainAnimation = animate(ctx);
+}
+
+function startPhysicsSim() {
+  if (!sceneData || tileView) {
+    setStatus('Switch to Combined View to run the physics sim.');
+    return;
+  }
+
+  const ctx = buildRenderer(mainCanvas);
+  const group = new THREE.Group();
+  const bodies = [];
+
+  sceneData.combined.forEach((p, i) => {
+    const mesh = meshFromPayload(p.mesh, p.color);
+    const dropHeight = 100 + (i * 20);
+    mesh.position.y += dropHeight;
+    group.add(mesh);
+    bodies.push({ mesh, targetY: mesh.position.y - dropHeight, vy: 0, settled: false });
+  });
+
+  ctx.scene.add(group);
+  fitCamera(ctx.camera, ctx.controls, group);
+  setStatus('Physics sim running...');
+
+  const gravity = -260;
+  let simDone = false;
+  if (mainAnimation) mainAnimation();
+  mainAnimation = animate(ctx, (dt) => {
+    let settledCount = 0;
+    for (const body of bodies) {
+      if (body.settled) {
+        settledCount += 1;
+        continue;
+      }
+      body.vy += gravity * dt;
+      body.mesh.position.y += body.vy * dt;
+
+      if (body.mesh.position.y <= body.targetY) {
+        body.mesh.position.y = body.targetY;
+        body.vy *= -0.28;
+        if (Math.abs(body.vy) < 6) {
+          body.vy = 0;
+          body.settled = true;
+          settledCount += 1;
+        }
+      }
+    }
+    if (!simDone && settledCount === bodies.length) {
+      simDone = true;
+      setStatus('Physics sim complete. Parts dropped into place.');
+    }
+  });
 }
 
 function buildThumb(part, idx){
@@ -146,5 +217,6 @@ document.querySelectorAll('[data-stage]').forEach((btn)=>btn.addEventListener('c
 
 document.getElementById('combined-view').addEventListener('click', ()=>{tileView=false; renderMain();});
 document.getElementById('tile-view').addEventListener('click', ()=>{tileView=true; renderMain();});
+startSimBtn.addEventListener('click', startPhysicsSim);
 
 refreshFiles();
