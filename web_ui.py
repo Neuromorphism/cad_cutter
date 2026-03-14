@@ -24,6 +24,7 @@ class PartState:
     name: str
     source_ext: str
     shape: Any
+    material: str | None = None
     auto_oriented: bool = False
     rot_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
     manual_scale: float = 1.0
@@ -35,6 +36,7 @@ class SessionState:
     gap: float = 0.0
     axis: str = "z"
     cut_angle: float = 90.0
+    section_number: int | None = None
 
 
 state = SessionState()
@@ -82,7 +84,8 @@ def _parts_for_stack() -> list[tuple[cq.Workplane, str, str, bool]]:
     for p in state.parts:
         transformed = _apply_manual_transforms(p)
         wp = cq.Workplane("XY").newObject([cq.Shape(transformed)])
-        entries.append((wp, p.name, p.source_ext, assemble.is_mesh_file(p.file_path)))
+        name = p.name if not p.material else f"{p.name}_{p.material}"
+        entries.append((wp, name, p.source_ext, assemble.is_mesh_file(p.file_path)))
     return entries
 
 
@@ -102,6 +105,7 @@ def _build_scene() -> dict[str, Any]:
             "filePath": part_state.file_path,
             "rot": list(part_state.rot_xyz),
             "scale": part_state.manual_scale,
+            "material": part_state.material,
             "mesh": mesh,
         })
 
@@ -158,6 +162,9 @@ def update_part(index: int):
         p.rot_xyz = (float(rot.get("x", p.rot_xyz[0])), float(rot.get("y", p.rot_xyz[1])), float(rot.get("z", p.rot_xyz[2])))
     if "scale" in data:
         p.manual_scale = max(0.01, float(data["scale"]))
+    if "material" in data:
+        material = str(data["material"]).strip().lower()
+        p.material = material or None
     return jsonify({"ok": True})
 
 
@@ -184,7 +191,7 @@ def run_stage(name: str):
         parts_for_stack = _parts_for_stack()
         axis_vec = assemble.AXIS_MAP.get(state.axis, assemble.AXIS_MAP["z"])
         _assy, part_info = assemble.stack_parts(parts_for_stack, axis_vec, state.gap)
-        out = assemble.mid_cut_parts(part_info, output_dir="parts", clearance=0.02, debug=True)
+        out = assemble.mid_cut_parts(part_info, output_dir="parts", clearance=0.02, debug=True, section_number=state.section_number)
         return jsonify({"ok": True, "message": f"Cut complete ({len(out)} parts)"})
 
     if name == "export_parts":
@@ -221,6 +228,9 @@ def set_config():
         state.gap = float(data["gap"])
     if "cut_angle" in data:
         state.cut_angle = float(data["cut_angle"])
+    if "section_number" in data:
+        sec = data["section_number"]
+        state.section_number = None if sec in (None, "") else int(sec)
     return jsonify({"ok": True})
 
 

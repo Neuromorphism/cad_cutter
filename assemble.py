@@ -2633,7 +2633,7 @@ def midscale_parts(part_info, debug=False):
     return updated
 
 
-def mid_cut_parts(part_info, output_dir="parts", clearance=0.02, debug=False):
+def mid_cut_parts(part_info, output_dir="parts", clearance=0.02, debug=False, section_number=None):
     """Cut mid-tier parts to clear inner-tier parts and export the cut mids.
 
     This operation is applied in world coordinates.  Returned part_info entries
@@ -2664,6 +2664,8 @@ def mid_cut_parts(part_info, output_dir="parts", clearance=0.02, debug=False):
     for entry in world_entries:
         if entry["tier"] != "mid":
             continue
+        if section_number is not None and section_number not in entry["levels"]:
+            continue
 
         matching_inners = [
             inner for inner in inner_entries
@@ -2692,7 +2694,8 @@ def mid_cut_parts(part_info, output_dir="parts", clearance=0.02, debug=False):
     for e in world_entries:
         updated.append((e["name"], e["shape"], Location(), e["rgb"], e["segment"], e["is_mesh"]))
 
-    print(f"  Mid-cut complete ({cut_count} mid part(s) cut, clearance={clearance:.4f} in).")
+    section_text = f", section={section_number}" if section_number is not None else ""
+    print(f"  Mid-cut complete ({cut_count} mid part(s) cut, clearance={clearance:.4f} in{section_text}).")
     print(f"  Mid-cut parts saved in: {output_dir}")
     return updated
 

@@ -7,9 +7,17 @@ const mainCanvas = document.getElementById('main-canvas');
 const thumbs = document.getElementById('thumbnails');
 const axisSelect = document.getElementById('axis-select');
 const gapInput = document.getElementById('gap-input');
+const sectionInput = document.getElementById('section-input');
 
 let sceneData = null;
 let tileView = false;
+
+
+const MATERIAL_OPTIONS = [
+  '', 'steel', 'aluminum', 'copper', 'brass', 'bronze', 'gold', 'titanium',
+  'chrome', 'plastic', 'rubber', 'ceramic', 'glass', 'wood', 'oak', 'pine',
+  'stone', 'concrete', 'red', 'green', 'blue', 'black', 'white'
+];
 
 function setStatus(msg) { statusEl.textContent = msg; }
 
@@ -81,6 +89,7 @@ function buildThumb(part, idx){
   <label>Ry <input type="number" value="${part.rot[1]}" data-k="y"/></label>
   <label>Rz <input type="number" value="${part.rot[2]}" data-k="z"/></label>
   <label>Scale <input type="number" step="0.1" value="${part.scale}" data-k="scale"/></label>
+  <label class="material-field">Material <select data-k="material"></select></label>
   <button data-act="focus">Zoom to Main</button>
   </div>`;
 
@@ -91,12 +100,30 @@ function buildThumb(part, idx){
   fitCamera(ctx.camera, ctx.controls, mesh);
   animate(ctx);
 
+  const materialSelect = wrap.querySelector('select[data-k="material"]');
+  MATERIAL_OPTIONS.forEach((m) => {
+    const opt = document.createElement('option');
+    opt.value = m;
+    opt.textContent = m || 'auto';
+    if ((part.material || '') === m) opt.selected = true;
+    materialSelect.appendChild(opt);
+  });
+
   wrap.querySelectorAll('input').forEach((inp)=>inp.addEventListener('change', async ()=>{
     const rotation = {x:+wrap.querySelector('input[data-k="x"]').value, y:+wrap.querySelector('input[data-k="y"]').value, z:+wrap.querySelector('input[data-k="z"]').value};
     const scale = +wrap.querySelector('input[data-k="scale"]').value;
-    await api(`/api/part/${idx}`, {method:'PATCH', body: JSON.stringify({rotation, scale})});
+    const material = wrap.querySelector('select[data-k="material"]').value;
+    await api(`/api/part/${idx}`, {method:'PATCH', body: JSON.stringify({rotation, scale, material})});
     await refreshScene();
   }));
+
+  materialSelect.addEventListener('change', async ()=>{
+    const rotation = {x:+wrap.querySelector('input[data-k="x"]').value, y:+wrap.querySelector('input[data-k="y"]').value, z:+wrap.querySelector('input[data-k="z"]').value};
+    const scale = +wrap.querySelector('input[data-k="scale"]').value;
+    const material = materialSelect.value;
+    await api(`/api/part/${idx}`, {method:'PATCH', body: JSON.stringify({rotation, scale, material})});
+    await refreshScene();
+  });
 
   wrap.querySelector('[data-act="focus"]').addEventListener('click', ()=>{
     tileView = true;
@@ -137,6 +164,11 @@ document.getElementById('load-selected').addEventListener('click', async ()=>{
 
 axisSelect.addEventListener('change', async ()=>{ await api('/api/config',{method:'PATCH', body:JSON.stringify({axis:axisSelect.value})}); await refreshScene(); });
 gapInput.addEventListener('change', async ()=>{ await api('/api/config',{method:'PATCH', body:JSON.stringify({gap:+gapInput.value})}); await refreshScene(); });
+sectionInput.addEventListener('change', async ()=>{
+  const raw = sectionInput.value.trim();
+  const section_number = raw === '' ? null : Math.max(1, Math.floor(+raw));
+  await api('/api/config',{method:'PATCH', body:JSON.stringify({section_number})});
+});
 
 document.querySelectorAll('[data-stage]').forEach((btn)=>btn.addEventListener('click', async ()=>{
   const out = await api(`/api/stage/${btn.dataset.stage}`, {method:'POST', body:'{}'});
