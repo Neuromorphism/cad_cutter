@@ -93,6 +93,7 @@ class SessionState:
     gap: float = 0.0
     axis: str = "z"
     workflow: str = "cylinder"
+    fine_orient: bool = False
     cut_angle: float = 90.0
     section_number: int | None = None
 
@@ -397,6 +398,13 @@ def _part_has_runtime_transform(part: PartState) -> bool:
     )
 
 
+def _serialize_orientation_steps(steps: list[tuple[tuple[float, float, float], float]]) -> list[dict[str, Any]]:
+    return [
+        {"axis": [float(axis[0]), float(axis[1]), float(axis[2])], "angle": float(angle_rad)}
+        for axis, angle_rad in steps
+    ]
+
+
 def _part_display_name(part: PartState) -> str:
     return part.name if not part.material else f"{part.name}_{part.material}"
 
@@ -452,6 +460,18 @@ def _parts_for_stack() -> list[tuple[cq.Workplane, str, str, bool]]:
 def _parts_for_assembly() -> list[tuple[cq.Workplane, str]]:
     """Return the subset of part data expected by assemble.stack_parts()."""
     return [(wp, name) for wp, name, *_ in _parts_for_stack()]
+
+
+def _parts_for_export() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for part in state.parts:
+        out.append({
+            "name": _part_display_name(part),
+            "shape": _apply_manual_transforms(part),
+            "source_ext": part.source_ext,
+            "is_mesh": assemble.is_mesh_file(part.file_path),
+        })
+    return out
 
 
 def _mesh_bbox(payload: dict[str, Any]) -> tuple[list[float], list[float]]:
@@ -629,6 +649,7 @@ def _build_fast_mesh_scene() -> dict[str, Any]:
                 if part.preview_only and part.preview_path
                 else None
             ),
+            "orientationSteps": _serialize_orientation_steps(part.orientation_steps),
             "rot": list(part.rot_xyz),
             "scale": part.manual_scale,
             "material": part.material,
@@ -720,7 +741,109 @@ def _ensure_all_real_geometry() -> None:
         _ensure_real_geometry(part)
 
 
-def _solve_orientation_steps(workflow: str) -> list[tuple[tuple[float, float, float], float]]:
+def _orientation_axis_index() -> int:
+    return {"x": 0, "y": 1, "z": 2}.get(state.axis, 2)
+
+
+def _orientation_slice_metrics(rotated: np.ndarray) -> tuple[float, float, int, float]:
+    axis_index = _orientation_axis_index()
+    other_axes = [idx for idx in range(3) if idx != axis_index]
+    coords = rotated[:, axis_index]
+    span = float(coords.max() - coords.min())
+    if span < 1e-6:
+        return 1e6, 1e6, 0, 1e6
+
+    mins = rotated.min(axis=0)
+    maxs = rotated.max(axis=0)
+    radial_extents = [float(maxs[idx] - mins[idx]) for idx in other_axes]
+    radial_balance = abs(radial_extents[0] - radial_extents[1]) / max(max(radial_extents), 1e-6)
+
+    edges = np.linspace(float(coords.min()), float(coords.max()), 13)
+    center_drifts: list[float] = []
+    radius_cvs: list[float] = []
+    min_points = max(24, min(200, len(rotated) // 20))
+    used = 0
+    for start, end in zip(edges[:-1], edges[1:]):
+        mask = (coords >= start) & (coords < end)
+        pts = rotated[mask][:, other_axes]
+        if len(pts) < min_points:
+            continue
+        center = pts.mean(axis=0)
+        radii = np.linalg.norm(pts - center, axis=1)
+        mean_radius = float(np.mean(radii))
+        if mean_radius < 1e-6:
+            continue
+        center_drifts.append(float(np.linalg.norm(center)) / mean_radius)
+        radius_cvs.append(float(np.std(radii)) / mean_radius)
+        used += 1
+
+    if not used:
+        return 1e6, 1e6, 0, radial_balance + 1.0
+    return float(np.mean(center_drifts)), float(np.mean(radius_cvs)), used, radial_balance
+
+
+def _cylinder_taper_penalty(rotated: np.ndarray) -> float:
+    axis_index = _orientation_axis_index()
+    other_axes = [idx for idx in range(3) if idx != axis_index]
+    coords = rotated[:, axis_index]
+    mid = float((coords.min() + coords.max()) / 2.0)
+    bottom = rotated[coords < mid][:, other_axes]
+    top = rotated[coords >= mid][:, other_axes]
+    if not len(bottom) or not len(top):
+        return 0.0
+    bottom_center = bottom.mean(axis=0)
+    top_center = top.mean(axis=0)
+    r_bottom = float(np.mean(np.linalg.norm(bottom - bottom_center, axis=1)))
+    r_top = float(np.mean(np.linalg.norm(top - top_center, axis=1)))
+    if r_bottom < 1e-6:
+        return 0.0
+    return max(0.0, (r_top - r_bottom) / r_bottom)
+
+
+def _axis_alignment_candidates(target: np.ndarray) -> list[tuple[str, list[tuple[tuple[float, float, float], float]]]]:
+    axes = [
+        ("+x", np.array([1.0, 0.0, 0.0], dtype=float)),
+        ("-x", np.array([-1.0, 0.0, 0.0], dtype=float)),
+        ("+y", np.array([0.0, 1.0, 0.0], dtype=float)),
+        ("-y", np.array([0.0, -1.0, 0.0], dtype=float)),
+        ("+z", np.array([0.0, 0.0, 1.0], dtype=float)),
+        ("-z", np.array([0.0, 0.0, -1.0], dtype=float)),
+    ]
+    return [(label, _rotation_steps_to_axis(source_axis, target, False)) for label, source_axis in axes]
+
+
+def _solve_orientation_steps_axis_aligned(workflow: str) -> list[tuple[tuple[float, float, float], float]]:
+    clouds: list[np.ndarray] = []
+    progress.begin("Auto-orient", len(state.parts) + 7, "Checking axis-aligned orientations...")
+    for idx, part in enumerate(state.parts, start=1):
+        payload = _orientation_payload_for_part(part)
+        clouds.append(_sample_vertices(payload))
+        progress.advance(1, f"Sampled orientation proxy {idx} of {len(state.parts)}: {part.name}")
+
+    if not clouds:
+        progress.finish("Auto-orient skipped")
+        return []
+
+    all_vertices = np.vstack(clouds)
+    target = _axis_vector(state.axis)
+    ranked: list[tuple[float, str, list[tuple[tuple[float, float, float], float]]]] = []
+    for idx, (label, steps) in enumerate(_axis_alignment_candidates(target), start=1):
+        rotated = _apply_steps_to_vertices(all_vertices, steps)
+        center_drift, radius_cv, slice_count, radial_balance = _orientation_slice_metrics(rotated)
+        taper_penalty = _cylinder_taper_penalty(rotated) if workflow == "cylinder" else 0.0
+        coverage_penalty = 0.35 * max(0, 4 - slice_count)
+        score = (center_drift * 4.0) + (radius_cv * 8.0) + (radial_balance * 2.0) + coverage_penalty + (taper_penalty * 3.0)
+        ranked.append((score, label, steps))
+        progress.advance(1, f"Checked axis orientation {idx} of 6: {label} (score {score:.3f})")
+
+    ranked.sort(key=lambda item: item[0])
+    best_score, best_label, best_steps = ranked[0]
+    progress.note(f"Selected axis orientation {best_label} (score {best_score:.3f})")
+    progress.finish("Auto-orient complete")
+    return best_steps
+
+
+def _solve_orientation_steps_fine(workflow: str) -> list[tuple[tuple[float, float, float], float]]:
     clouds: list[np.ndarray] = []
     progress.begin("Auto-orient", len(state.parts) + 2, "Sampling preview meshes for orientation...")
     for idx, part in enumerate(state.parts, start=1):
@@ -774,6 +897,12 @@ def _solve_orientation_steps(workflow: str) -> list[tuple[tuple[float, float, fl
     return steps
 
 
+def _solve_orientation_steps(workflow: str) -> tuple[list[tuple[tuple[float, float, float], float]], str]:
+    if state.fine_orient:
+        return _solve_orientation_steps_fine(workflow), "fine-grained preview solve"
+    return _solve_orientation_steps_axis_aligned(workflow), "axis-aligned six-way heuristic"
+
+
 def _centroid_along_stack_axis(part: PartState) -> float:
     shape = _apply_manual_transforms(part)
     xmin, ymin, zmin, xmax, ymax, zmax = assemble.get_tight_bounding_box(shape)
@@ -802,10 +931,7 @@ def _build_scene() -> dict[str, Any]:
     combined = []
     part_index_by_name = {entry[1]: entry[4] for entry in stack_parts}
     for idx, (entry, part_state) in enumerate(zip(stack_parts, state.parts), start=1):
-        can_reuse_cached_mesh = (
-            bool(part_state.mesh_source_path)
-            and not _part_has_runtime_transform(part_state)
-        )
+        can_reuse_cached_mesh = bool(part_state.mesh_source_path)
         with _SlowProgressDetail(
             f"Preparing preview {idx} of {len(state.parts)}: {part_state.name}",
             lambda elapsed, i=idx, name=part_state.name:
@@ -829,6 +955,7 @@ def _build_scene() -> dict[str, Any]:
                 if part_state.preview_only and part_state.preview_path
                 else None
             ),
+            "orientationSteps": _serialize_orientation_steps(part_state.orientation_steps),
             "rot": list(part_state.rot_xyz),
             "scale": part_state.manual_scale,
             "material": part_state.material,
@@ -904,6 +1031,7 @@ def index():
         webui_version=_WEBUI_VERSION,
         workflows=SUPPORTED_WORKFLOWS,
         current_workflow=state.workflow,
+        fine_orient=state.fine_orient,
     )
 
 
@@ -918,10 +1046,16 @@ def get_version():
     return jsonify({"webui_version": _WEBUI_VERSION})
 
 
-@app.route("/api/debug-log", methods=["GET", "POST"])
+@app.route("/api/debug-log", methods=["GET", "POST", "DELETE"])
 def debug_log():
     if request.method == "GET":
         return jsonify({"entries": _debug_log_snapshot()})
+    if request.method == "DELETE":
+        with _DEBUG_LOG_LOCK:
+            _DEBUG_LOG.clear()
+        if _DEBUG_LOG_PATH.exists():
+            _DEBUG_LOG_PATH.write_text("", encoding="utf-8")
+        return jsonify({"ok": True})
 
     data = request.get_json(force=True)
     entries = data.get("entries", [])
@@ -1229,12 +1363,12 @@ def update_part(idx: int):
 def run_stage(name: str):
     try:
         if name == "auto_orient":
-            steps = _solve_orientation_steps(state.workflow)
+            steps, mode_label = _solve_orientation_steps(state.workflow)
             for part in state.parts:
                 part.orientation_steps = list(steps)
-                part.auto_oriented = bool(steps)
+                part.auto_oriented = True
                 part.settle_offset = (0.0, 0.0, 0.0)
-            return jsonify({"ok": True, "message": "Auto-orient complete using decimated preview meshes"})
+            return jsonify({"ok": True, "message": f"Auto-orient complete using {mode_label}"})
 
         if name == "auto_stack":
             progress.begin("Auto-stack", len(state.parts), "Ordering parts for stacking...")
@@ -1308,7 +1442,7 @@ def run_stage(name: str):
         if name == "export_parts":
             _ensure_all_real_geometry()
             progress.begin("Exporting", 1, "Exporting parts...")
-            assemble.export_transformed_parts(_parts_for_stack(), "parts")
+            assemble.export_transformed_parts(_parts_for_export(), "parts")
             progress.finish("Parts exported")
             return jsonify({"ok": True, "message": "Exported transformed parts to ./parts"})
 
@@ -1353,6 +1487,8 @@ def set_config():
         state.axis = data["axis"]
     if "workflow" in data and data["workflow"] in SUPPORTED_WORKFLOWS:
         state.workflow = data["workflow"]
+    if "fine_orient" in data:
+        state.fine_orient = bool(data["fine_orient"])
     if "gap" in data:
         state.gap = float(data["gap"])
     if "cut_angle" in data:

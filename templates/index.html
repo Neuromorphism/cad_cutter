@@ -32,6 +32,10 @@
             {% endfor %}
           </select>
         </label>
+        <label class="checkbox-label">
+          <input id="fine-orient-toggle" type="checkbox" {% if fine_orient %}checked{% endif %} />
+          Fine-grained orient
+        </label>
         <label>Axis
           <select id="axis-select">
             <option value="x">X</option>

@@ -13,6 +13,7 @@ const gradientRender = document.getElementById('gradient-render');
 const mainCanvas     = document.getElementById('main-canvas');
 const thumbs         = document.getElementById('thumbnails');
 const workflowSelect = document.getElementById('workflow-select');
+const fineOrientToggle = document.getElementById('fine-orient-toggle');
 const axisSelect     = document.getElementById('axis-select');
 const gapInput       = document.getElementById('gap-input');
 const sectionInput   = document.getElementById('section-input');
@@ -64,6 +65,16 @@ let geometryCache = new WeakMap();
 let remoteGeometryCache = new Map();
 let thumbRenderGeneration = 0;
 const stlLoader = new STLLoader();
+const STAGE_TIMEOUT_MS = {
+  auto_orient: 15000,
+  auto_stack: 15000,
+  auto_scale: 30000,
+  auto_drop: 30000,
+  cut_inner_from_mid: 30000,
+  export_parts: 30000,
+  render_whole: 45000,
+  export_whole: 30000,
+};
 
 const MATERIAL_OPTIONS = [
   '', 'steel', 'aluminum', 'copper', 'brass', 'bronze', 'gold', 'titanium',
@@ -484,6 +495,37 @@ function buildVisualFromGeometry(geometry, color = [0.6, 0.7, 0.8]) {
   return mesh;
 }
 
+function applyPartTransforms(mesh, part, offset = null) {
+  if (!mesh || !part) return mesh;
+  mesh.rotation.set(0, 0, 0);
+  mesh.quaternion.identity();
+  mesh.scale.setScalar(1);
+  mesh.position.set(0, 0, 0);
+
+  for (const step of part.orientationSteps || []) {
+    const axis = Array.isArray(step?.axis) ? step.axis : [0, 0, 1];
+    const angle = Number(step?.angle || 0);
+    const vec = new THREE.Vector3(axis[0] || 0, axis[1] || 0, axis[2] || 0);
+    if (vec.lengthSq() > 1e-12 && Math.abs(angle) > 1e-9) {
+      vec.normalize();
+      mesh.applyQuaternion(new THREE.Quaternion().setFromAxisAngle(vec, angle));
+    }
+  }
+
+  const scale = Number(part.scale || 1);
+  mesh.scale.setScalar(Number.isFinite(scale) && scale > 0 ? scale : 1);
+
+  const rot = Array.isArray(part.rot) ? part.rot : [0, 0, 0];
+  mesh.rotateX(THREE.MathUtils.degToRad(Number(rot[0] || 0)));
+  mesh.rotateY(THREE.MathUtils.degToRad(Number(rot[1] || 0)));
+  mesh.rotateZ(THREE.MathUtils.degToRad(Number(rot[2] || 0)));
+
+  if (Array.isArray(offset) && offset.length === 3) {
+    mesh.position.set(Number(offset[0] || 0), Number(offset[1] || 0), Number(offset[2] || 0));
+  }
+  return mesh;
+}
+
 function isLargeThumbPayload(payload) {
   const vertexCount = Array.isArray(payload?.vertices) ? payload.vertices.length / 3 : 0;
   return vertexCount > 250000;
@@ -523,18 +565,20 @@ async function ensureSceneMeshes(scene, context = 'scene') {
 
 function meshFromSceneEntry(entry, fallbackColor = [0.6, 0.7, 0.8]) {
   let mesh;
+  const sourcePart = typeof entry.partIndex === 'number' ? sceneData?.parts?.[entry.partIndex] : null;
   if (entry.mesh) {
     mesh = buildVisualFromGeometry(geometryFromPayload(entry.mesh), entry.color || fallbackColor);
   } else if (typeof entry.partIndex === 'number' && sceneData?.parts?.[entry.partIndex]?.meshGeometry) {
     mesh = buildVisualFromGeometry(sceneData.parts[entry.partIndex].meshGeometry, entry.color || fallbackColor);
-    const [x, y, z] = entry.offset || [0, 0, 0];
-    mesh.position.set(x, y, z);
   } else if (typeof entry.partIndex === 'number' && sceneData?.parts?.[entry.partIndex]?.mesh) {
     mesh = buildVisualFromGeometry(geometryFromPayload(sceneData.parts[entry.partIndex].mesh), entry.color || fallbackColor);
-    const [x, y, z] = entry.offset || [0, 0, 0];
-    mesh.position.set(x, y, z);
   } else {
     return null;
+  }
+  if (sourcePart) {
+    applyPartTransforms(mesh, sourcePart, entry.offset || [0, 0, 0]);
+  } else if (Array.isArray(entry.offset) && entry.offset.length === 3) {
+    mesh.position.set(entry.offset[0], entry.offset[1], entry.offset[2]);
   }
   return mesh;
 }
@@ -619,7 +663,7 @@ function renderMain() {
       const geometry = geometryForPart(p, `tile:${p.name || i}`);
       if (!geometry) return;
       const mesh = buildVisualFromGeometry(geometry);
-      mesh.position.x = i * 120;
+      applyPartTransforms(mesh, p, [i * 120, 0, 0]);
       group.add(mesh);
     });
   }
@@ -738,14 +782,14 @@ function buildThumb(part, idx, deferPreview = false) {
       thumbAnimations.push(stopThumbAnimation);
     };
     if (part.meshGeometry) {
-      showMesh(buildVisualFromGeometry(part.meshGeometry));
+      showMesh(applyPartTransforms(buildVisualFromGeometry(part.meshGeometry), part));
     } else if (thumbPayload) {
-      showMesh(buildVisualFromGeometry(geometryFromPayload(thumbPayload)));
+      showMesh(applyPartTransforms(buildVisualFromGeometry(geometryFromPayload(thumbPayload)), part));
     } else if (part.meshUrl && part.meshFormat === 'stl') {
       loadRemoteGeometry(part)
         .then((geometry) => {
           part.meshGeometry = geometry;
-          showMesh(buildVisualFromGeometry(geometry));
+          showMesh(applyPartTransforms(buildVisualFromGeometry(geometry), part));
         })
         .catch((error) => {
           canvas.innerHTML = `
@@ -1216,6 +1260,15 @@ workflowSelect?.addEventListener('change', async () => {
   }
 });
 
+fineOrientToggle?.addEventListener('change', async () => {
+  try {
+    await api('/api/config', { method: 'PATCH', body: JSON.stringify({ fine_orient: fineOrientToggle.checked }) });
+    toast(fineOrientToggle.checked ? 'Fine-grained orient enabled' : 'Fast axis-aligned orient enabled', 'success');
+  } catch (e) {
+    toast('Orient mode update failed', 'error');
+  }
+});
+
 axisSelect.addEventListener('change', async () => {
   try {
     await api('/api/config', { method: 'PATCH', body: JSON.stringify({ axis: axisSelect.value }) });
@@ -1244,8 +1297,13 @@ document.querySelectorAll('[data-stage]').forEach(btn => {
     const stageName = btn.textContent.trim().replace(/^\d+\s*/, '');
     setBusy(`Running: ${stageName}...`);
     showViewportLoader(`Running: ${stageName}...`);
+    startStallWatchdog(`stage:${btn.dataset.stage}`);
     try {
-      const out = await api(`/api/stage/${btn.dataset.stage}`, { method: 'POST', body: '{}' });
+      const out = await api(`/api/stage/${btn.dataset.stage}`, {
+        method: 'POST',
+        body: '{}',
+        timeoutMs: STAGE_TIMEOUT_MS[btn.dataset.stage] || 30000,
+      });
       toast(out.message || 'Stage complete', 'success');
       setIdle(out.message || 'Done');
       await refreshScene();
