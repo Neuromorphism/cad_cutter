@@ -13,6 +13,7 @@
     <h1>
       <span class="logo-icon">&#x2B21;</span>
       CAD Cutter
+      <span class="version-badge" id="webui-version" title="Running web UI version">{{ webui_version }}</span>
     </h1>
     <div class="controls">
       <button id="refresh-files" class="btn-sm" data-tooltip="Scan directory for CAD files">&#x21BB; Refresh</button>
@@ -158,6 +159,17 @@
 
   <!-- Toast container -->
   <div id="toast-container"></div>
+
+  <div id="debug-panel" class="debug-panel" aria-live="polite">
+    <div class="debug-toolbar">
+      <button id="debug-toggle" class="debug-toggle" type="button" aria-expanded="false">
+        <span>Debug Log</span>
+        <span id="debug-count" class="debug-count">0</span>
+      </button>
+      <button id="debug-copy" class="debug-copy" type="button">Copy Debug Log</button>
+    </div>
+    <div id="debug-log" class="debug-log hidden"></div>
+  </div>
 
   <!-- Directory browser overlay -->
   <div id="dir-overlay" class="modal-overlay hidden" aria-hidden="true">

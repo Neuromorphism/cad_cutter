@@ -98,3 +98,27 @@ def test_scene_reuses_cached_preview_payload_for_combined_entries(client, monkey
     second_scene = web_ui._build_scene()
     assert second_scene["combined"][0]["partIndex"] == 0
     assert second_scene["parts"][0]["mesh"]["vertices"]
+
+
+def test_debug_log_endpoint_accepts_client_entries(client):
+    client, _tmp_path = client
+
+    resp = client.post("/api/debug-log", json={
+        "entries": [
+            {"ts": 123, "kind": "api-start", "message": "GET /api/scene", "meta": {"a": 1}},
+            {"ts": 124, "kind": "stall-warning", "message": "load-selected has no new progress for 5s"},
+        ]
+    })
+
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data is not None
+    assert data["accepted"] == 2
+
+    snapshot = client.get("/api/debug-log")
+    assert snapshot.status_code == 200
+    payload = snapshot.get_json()
+    assert payload is not None
+    messages = [entry["message"] for entry in payload["entries"]]
+    assert "GET /api/scene" in messages
+    assert "load-selected has no new progress for 5s" in messages

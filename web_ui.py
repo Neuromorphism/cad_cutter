@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import gzip
 import hashlib
 import importlib.util
 import json
 import logging
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -87,6 +89,51 @@ _SHAPE_CACHE: dict[tuple[str, float, bool], tuple[Any, str]] = {}
 _MESH_PAYLOAD_CACHE: dict[tuple[str, float, int, float], dict[str, Any]] = {}
 _PREVIEW_SURROGATE_MIN_BYTES = 25 * 1024 * 1024
 _WEBUI_CACHE_DIR = Path(".webui_cache")
+_DEBUG_LOG: collections.deque[dict[str, Any]] = collections.deque(maxlen=400)
+_DEBUG_LOG_LOCK = threading.Lock()
+_DEBUG_LOG_PATH = _WEBUI_CACHE_DIR / "debug_log.jsonl"
+
+
+def _compute_webui_version() -> str:
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parent,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        dirty = subprocess.run(
+            ["git", "diff", "--quiet", "--", "web_ui.py", "static/app.js", "static/style.css", "templates/index.html"],
+            cwd=Path(__file__).resolve().parent,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode != 0
+        return f"{sha}{'-dirty' if dirty else ''}"
+    except Exception:
+        return f"mtime-{int(Path(__file__).stat().st_mtime)}"
+
+
+_WEBUI_VERSION = _compute_webui_version()
+
+
+def _record_debug_log(source: str, kind: str, message: str, meta: dict[str, Any] | None = None) -> None:
+    entry = {
+        "ts": time.time(),
+        "source": source,
+        "kind": kind,
+        "message": message,
+        "meta": meta or {},
+    }
+    with _DEBUG_LOG_LOCK:
+        _DEBUG_LOG.append(entry)
+        _DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _DEBUG_LOG_PATH.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry) + "\n")
+
+
+def _debug_log_snapshot() -> list[dict[str, Any]]:
+    with _DEBUG_LOG_LOCK:
+        return list(_DEBUG_LOG)
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +284,96 @@ def _parts_for_assembly() -> list[tuple[cq.Workplane, str]]:
     return [(wp, name) for wp, name, *_ in _parts_for_stack()]
 
 
+def _mesh_bbox(payload: dict[str, Any]) -> tuple[list[float], list[float]]:
+    verts = payload.get("vertices", [])
+    if not verts:
+        return [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]
+    xs = verts[0::3]
+    ys = verts[1::3]
+    zs = verts[2::3]
+    mins = [min(xs), min(ys), min(zs)]
+    maxs = [max(xs), max(ys), max(zs)]
+    return mins, maxs
+
+
+def _can_use_fast_mesh_scene(part_states: list[PartState]) -> bool:
+    if not part_states:
+        return False
+    for part in part_states:
+        if not part.mesh_source_path:
+            return False
+        if Path(part.mesh_source_path).suffix.lower() not in assemble.MESH_EXTENSIONS:
+            return False
+        if part.auto_oriented or part.rot_xyz != (0.0, 0.0, 0.0) or abs(part.manual_scale - 1.0) > 1e-6:
+            return False
+        tier, _levels, _segment = assemble.parse_part_name(part.name)
+        if tier is not None:
+            return False
+    return True
+
+
+def _build_fast_mesh_scene() -> dict[str, Any]:
+    axis_index = {"x": 0, "y": 1, "z": 2}.get(state.axis, 2)
+    center_axes = [idx for idx in range(3) if idx != axis_index]
+    progress.begin("Scene", len(state.parts) * 2, "Stacking mesh previews for scene...")
+
+    part_meshes = []
+    offsets: list[list[float]] = []
+    cursor = 0.0
+    for idx, part in enumerate(state.parts, start=1):
+        with _SlowProgressDetail(
+            f"Preparing preview {idx} of {len(state.parts)}: {part.name}",
+            lambda elapsed, i=idx, name=part.name:
+                f"Reading mesh preview {i} of {len(state.parts)}: {name} ({elapsed:.0f}s)",
+        ):
+            payload = _load_mesh_payload_from_cache_file(part.mesh_source_path, part.shape)
+        mins, maxs = _mesh_bbox(payload)
+        offset = [0.0, 0.0, 0.0]
+        for center_axis in center_axes:
+            offset[center_axis] = -((mins[center_axis] + maxs[center_axis]) / 2.0)
+        offset[axis_index] = cursor - mins[axis_index]
+        cursor += (maxs[axis_index] - mins[axis_index]) + state.gap
+        offsets.append(offset)
+        part_meshes.append({
+            "name": part.name,
+            "filePath": part.file_path,
+            "meshSourcePath": part.mesh_source_path,
+            "previewPath": part.preview_path,
+            "previewOnly": part.preview_only,
+            "previewLabel": (
+                f"Preview mesh: {Path(part.preview_path).name}"
+                if part.preview_only and part.preview_path
+                else None
+            ),
+            "rot": list(part.rot_xyz),
+            "scale": part.manual_scale,
+            "material": part.material,
+            "mesh": payload,
+        })
+        progress.advance(1, f"Prepared preview {idx} of {len(state.parts)}: {part.name}")
+
+    combined = []
+    for idx, (part, offset) in enumerate(zip(state.parts, offsets), start=1):
+        combined.append({
+            "name": part.name,
+            "color": list(assemble.pick_color(part.name, idx - 1)[1]),
+            "partIndex": idx - 1,
+            "offset": offset,
+        })
+        progress.advance(1, f"Prepared assembled mesh {idx} of {len(state.parts)}: {part.name}")
+
+    progress.finish("Scene ready")
+    _record_debug_log("server", "scene-fast-path", "Used mesh preview fast path", {
+        "parts": [part.name for part in state.parts],
+        "axis": state.axis,
+    })
+    _record_debug_log("server", "scene-done", "Scene payload ready", {
+        "parts": len(part_meshes),
+        "combined": len(combined),
+    })
+    return {"parts": part_meshes, "combined": combined}
+
+
 def _json_api_error(message: str, status: int = 400, **extra):
     payload = {"error": message}
     payload.update(extra)
@@ -299,6 +436,12 @@ def _build_scene() -> dict[str, Any]:
     stack_parts = _parts_for_stack()
     if not stack_parts:
         return {"parts": [], "combined": []}
+    if _can_use_fast_mesh_scene(state.parts):
+        return _build_fast_mesh_scene()
+    _record_debug_log("server", "scene-start", "Building scene payload", {
+        "parts": [p.name for p in state.parts],
+        "count": len(state.parts),
+    })
     axis_vec = assemble.AXIS_MAP.get(state.axis, assemble.AXIS_MAP["z"])
     _assy, part_info = assemble.stack_parts(_parts_for_assembly(), axis_vec, state.gap)
     progress.begin("Scene", len(state.parts) + len(part_info), "Stacking parts for scene...")
@@ -364,6 +507,10 @@ def _build_scene() -> dict[str, Any]:
         progress.advance(1, f"Prepared assembled mesh {idx} of {len(part_info)}: {name}")
 
     progress.finish("Scene ready")
+    _record_debug_log("server", "scene-done", "Scene payload ready", {
+        "parts": len(part_meshes),
+        "combined": len(combined),
+    })
     return {"parts": part_meshes, "combined": combined}
 
 
@@ -390,13 +537,44 @@ def _load_gradient_module():
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", webui_version=_WEBUI_VERSION)
 
 
 @app.route("/api/progress")
 def get_progress():
     """Return current progress state as JSON for polling."""
     return jsonify(progress.snapshot())
+
+
+@app.route("/api/version")
+def get_version():
+    return jsonify({"webui_version": _WEBUI_VERSION})
+
+
+@app.route("/api/debug-log", methods=["GET", "POST"])
+def debug_log():
+    if request.method == "GET":
+        return jsonify({"entries": _debug_log_snapshot()})
+
+    data = request.get_json(force=True)
+    entries = data.get("entries", [])
+    if not isinstance(entries, list):
+        return jsonify({"error": "entries must be a list"}), 400
+    accepted = 0
+    for raw in entries[-100:]:
+        if not isinstance(raw, dict):
+            continue
+        _record_debug_log(
+            "client",
+            str(raw.get("kind", "client")),
+            str(raw.get("message", ""))[:500],
+            {
+                "client_ts": raw.get("ts"),
+                "meta": raw.get("meta"),
+            },
+        )
+        accepted += 1
+    return jsonify({"ok": True, "accepted": accepted})
 
 
 @app.route("/api/progress/stream")
@@ -563,9 +741,11 @@ def run_wrl_gradient_capability():
 def load_parts():
     data = request.get_json(force=True)
     files = data.get("files", [])
+    include_scene = bool(data.get("include_scene"))
     if not isinstance(files, list) or not files:
         return _json_api_error("no files selected", 400)
 
+    _record_debug_log("server", "load-start", "Loading parts", {"files": files})
     loaded_parts: list[PartState] = []
     progress.begin("Loading", len(files), "Loading parts...")
     try:
@@ -593,6 +773,7 @@ def load_parts():
                     wp, name = _load_cached_part(str(load_path), require_solid=False)
             except Exception as exc:
                 app.logger.exception("Failed to load part '%s'", path)
+                _record_debug_log("server", "load-error", f"Failed to load {rel}", {"error": str(exc)})
                 progress.finish(f"Load failed: {rel}")
                 return _json_api_error(
                     f"failed to load '{rel}': {exc}",
@@ -602,6 +783,10 @@ def load_parts():
 
             face_count = _count_faces(wp.val().wrapped)
             progress.note(f"Opened {rel} ({face_count} surfaces)")
+            _record_debug_log("server", "load-opened", f"Opened {rel}", {
+                "faces": face_count,
+                "preview": str(preview_path) if preview_path else None,
+            })
             loaded_parts.append(PartState(
                 file_path=str(path), name=display_name,
                 source_ext=path.suffix.lower(), shape=wp.val().wrapped,
@@ -617,15 +802,22 @@ def load_parts():
             progress.finish("Load complete")
 
     state.parts = loaded_parts
-    return jsonify({"ok": True, "count": len(state.parts)})
+    _record_debug_log("server", "load-done", "Load complete", {"count": len(state.parts)})
+    payload: dict[str, Any] = {"ok": True, "count": len(state.parts)}
+    if include_scene:
+        _record_debug_log("server", "load-scene", "Building scene inline with load", {"count": len(state.parts)})
+        payload["scene"] = _build_scene()
+    return jsonify(payload)
 
 
 @app.route("/api/scene")
 def get_scene():
     try:
+        _record_debug_log("server", "scene-request", "Received scene request")
         return jsonify(_build_scene())
     except Exception as exc:
         app.logger.exception("Failed to build scene")
+        _record_debug_log("server", "scene-error", "Failed to build scene", {"error": str(exc)})
         return _json_api_error(f"failed to build scene: {exc}", 500)
 
 

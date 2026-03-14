@@ -31,6 +31,10 @@ const dirRootBtn     = document.getElementById('dir-root');
 const dirCloseBtn    = document.getElementById('dir-close');
 const dirCancelBtn   = document.getElementById('dir-cancel');
 const tooltipEl      = document.getElementById('ui-tooltip');
+const debugToggle    = document.getElementById('debug-toggle');
+const debugCopyBtn   = document.getElementById('debug-copy');
+const debugLogEl     = document.getElementById('debug-log');
+const debugCountEl   = document.getElementById('debug-count');
 
 const progressContainer = document.getElementById('progress-container');
 const progressFill      = document.getElementById('progress-fill');
@@ -47,6 +51,16 @@ let refreshFilesRequestId = 0;
 let progressHistory = [];
 let progressLogTimer = null;
 let progressLogCollapsed = false;
+let debugEntries = [];
+let debugPanelOpen = false;
+let activeLoaderContext = null;
+let stallWatchdog = null;
+let lastProgressEventAt = 0;
+let pendingDebugFlush = [];
+let debugFlushTimer = null;
+let debugFlushInFlight = false;
+let geometryCache = new WeakMap();
+let thumbRenderGeneration = 0;
 
 const MATERIAL_OPTIONS = [
   '', 'steel', 'aluminum', 'copper', 'brass', 'bronze', 'gold', 'titanium',
@@ -56,6 +70,7 @@ const MATERIAL_OPTIONS = [
 
 /* ── Toast notifications ── */
 function toast(message, type = 'info') {
+  addDebugLog(`toast:${type}`, message);
   const icons = { success: '\u2713', error: '\u2717', info: '\u2139', warning: '\u26A0' };
   const el = document.createElement('div');
   el.className = `toast toast-${type}`;
@@ -75,6 +90,116 @@ function setStatus(msg, busy = false) {
 
 function setBusy(msg) { setStatus(msg, true); }
 function setIdle(msg) { setStatus(msg || 'Ready'); }
+
+function addDebugLog(kind, message, meta = null) {
+  const entry = {
+    id: `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+    ts: Date.now(),
+    kind,
+    message,
+    meta,
+  };
+  debugEntries = [...debugEntries, entry].slice(-80);
+  pendingDebugFlush.push(entry);
+  renderDebugLog();
+  scheduleDebugFlush();
+  const metaText = meta ? ` ${JSON.stringify(meta)}` : '';
+  console.info(`[cad-debug] ${kind}: ${message}${metaText}`);
+}
+
+function renderDebugLog() {
+  if (!debugLogEl) return;
+  debugLogEl.innerHTML = '';
+  [...debugEntries].sort((a, b) => b.ts - a.ts).forEach((entry) => {
+    const row = document.createElement('div');
+    row.className = 'debug-entry';
+    row.innerHTML = `
+      <span class="debug-time">${new Date(entry.ts).toLocaleTimeString()}</span>
+      <span class="debug-kind">${entry.kind}</span>
+      <span class="debug-message">${entry.message}</span>`;
+    if (entry.meta) {
+      const meta = document.createElement('pre');
+      meta.className = 'debug-meta';
+      meta.textContent = JSON.stringify(entry.meta);
+      row.appendChild(meta);
+    }
+    debugLogEl.appendChild(row);
+  });
+  if (debugCountEl) debugCountEl.textContent = String(debugEntries.length);
+}
+
+function formatDebugLogText() {
+  return [...debugEntries]
+    .sort((a, b) => a.ts - b.ts)
+    .map((entry) => {
+      const time = new Date(entry.ts).toISOString();
+      const meta = entry.meta ? ` ${JSON.stringify(entry.meta)}` : '';
+      return `${time} [${entry.kind}] ${entry.message}${meta}`;
+    })
+    .join('\n');
+}
+
+function scheduleDebugFlush() {
+  if (debugFlushTimer) return;
+  debugFlushTimer = window.setTimeout(() => {
+    debugFlushTimer = null;
+    flushDebugLog();
+  }, 400);
+}
+
+async function flushDebugLog(force = false) {
+  if (debugFlushInFlight) return;
+  if (!pendingDebugFlush.length) return;
+  if (!force && document.visibilityState === 'hidden' && pendingDebugFlush.length < 5) return;
+  debugFlushInFlight = true;
+  const batch = pendingDebugFlush.splice(0, 25);
+  try {
+    await fetch('/api/debug-log', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ entries: batch }),
+      keepalive: true,
+    });
+  } catch (_) {
+    pendingDebugFlush = [...batch, ...pendingDebugFlush].slice(-100);
+  } finally {
+    debugFlushInFlight = false;
+    if (pendingDebugFlush.length) scheduleDebugFlush();
+  }
+}
+
+function updateDebugPanelState() {
+  if (!debugToggle || !debugLogEl) return;
+  debugToggle.setAttribute('aria-expanded', debugPanelOpen ? 'true' : 'false');
+  debugToggle.classList.toggle('open', debugPanelOpen);
+  debugLogEl.classList.toggle('hidden', !debugPanelOpen);
+}
+
+function startStallWatchdog(context) {
+  stopStallWatchdog();
+  activeLoaderContext = context;
+  lastProgressEventAt = Date.now();
+  stallWatchdog = window.setInterval(() => {
+    const loader = document.getElementById('viewport-loader');
+    if (!loader || !activeLoaderContext) return;
+    const idleMs = Date.now() - lastProgressEventAt;
+    if (idleMs >= 5000) {
+      const msg = document.querySelector('#viewport-loader .loader-msg')?.textContent || 'Loading parts...';
+      addDebugLog('stall-warning', `${activeLoaderContext} has no new progress for ${Math.floor(idleMs / 1000)}s`, {
+        loaderMessage: msg,
+      });
+      lastProgressEventAt = Date.now();
+    }
+  }, 1000);
+}
+
+function stopStallWatchdog() {
+  if (stallWatchdog) {
+    window.clearInterval(stallWatchdog);
+    stallWatchdog = null;
+  }
+  activeLoaderContext = null;
+}
 
 function stopMainAnimation() {
   if (mainAnimation) {
@@ -120,9 +245,34 @@ function hideTooltip() {
 
 /* ── API wrapper with error handling ── */
 async function api(path, opts = {}) {
-  const res = await fetch(path, { headers: { 'content-type': 'application/json' }, ...opts });
+  const { timeoutMs = 0, ...fetchOpts } = opts;
+  const method = fetchOpts.method || 'GET';
+  const startedAt = performance.now();
+  addDebugLog('api-start', `${method} ${path}`);
+  const controller = timeoutMs > 0 ? new AbortController() : null;
+  const timeoutId = controller ? window.setTimeout(() => controller.abort(), timeoutMs) : null;
+  let res;
+  try {
+    res = await fetch(path, {
+      headers: { 'content-type': 'application/json' },
+      ...fetchOpts,
+      signal: controller?.signal,
+    });
+  } catch (error) {
+    if (timeoutId) window.clearTimeout(timeoutId);
+    const message = error?.name === 'AbortError'
+      ? `${method} ${path} timed out after ${timeoutMs}ms`
+      : `${method} ${path} failed: ${error?.message || error}`;
+    addDebugLog('api-error', message);
+    throw new Error(message);
+  }
+  if (timeoutId) window.clearTimeout(timeoutId);
+  addDebugLog('api-done', `${method} ${path} -> ${res.status}`, {
+    elapsedMs: Math.round(performance.now() - startedAt),
+  });
   if (!res.ok) {
     const errText = await res.text();
+    addDebugLog('api-error', `${method} ${path} failed`, { status: res.status, body: errText.slice(0, 300) });
     throw new Error(errText);
   }
   return res.json();
@@ -130,6 +280,7 @@ async function api(path, opts = {}) {
 
 /* ── Loading overlay for viewport ── */
 function showViewportLoader(msg = 'Loading...') {
+  addDebugLog('loader-show', msg);
   removeViewportLoader();
   const overlay = document.createElement('div');
   overlay.className = 'loading-overlay';
@@ -173,6 +324,8 @@ function removeViewportLoader() {
   if (existing) existing.remove();
   stopProgressLogTimer();
   progressHistory = [];
+  stopStallWatchdog();
+  addDebugLog('loader-hide', 'Viewport loader removed');
 }
 
 function startProgressLogTimer() {
@@ -272,11 +425,20 @@ function buildRenderer(container) {
   return { renderer, scene, camera, controls, grid };
 }
 
-function meshFromPayload(payload, color = [0.6, 0.7, 0.8]) {
+function geometryFromPayload(payload) {
+  const cached = geometryCache.get(payload);
+  if (cached) return cached;
+
   const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.Float32BufferAttribute(payload.vertices, 3));
-  geo.setIndex(payload.indices);
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(payload.vertices), 3));
+  geo.setIndex(new Uint32Array(payload.indices));
   geo.computeVertexNormals();
+  geometryCache.set(payload, geo);
+  return geo;
+}
+
+function meshFromPayload(payload, color = [0.6, 0.7, 0.8]) {
+  const geo = geometryFromPayload(payload);
   const mat = new THREE.MeshStandardMaterial({
     color: new THREE.Color(...color),
     metalness: 0.35,
@@ -284,6 +446,11 @@ function meshFromPayload(payload, color = [0.6, 0.7, 0.8]) {
     envMapIntensity: 0.5,
   });
   return new THREE.Mesh(geo, mat);
+}
+
+function isLargeThumbPayload(payload) {
+  const vertexCount = Array.isArray(payload?.vertices) ? payload.vertices.length / 3 : 0;
+  return vertexCount > 250000;
 }
 
 function meshFromSceneEntry(entry, fallbackColor = [0.6, 0.7, 0.8]) {
@@ -373,6 +540,10 @@ function renderMain() {
   mainCtx.scene.add(group);
   fitCamera(mainCtx.camera, mainCtx.controls, group);
   removeViewportLoader();
+  addDebugLog('render-ready', `Rendered ${tileView ? 'tile' : 'combined'} view`, {
+    parts: sceneData.parts?.length || 0,
+    combined: sceneData.combined?.length || 0,
+  });
 }
 
 /* ── Physics simulation ── */
@@ -430,7 +601,7 @@ function startPhysicsSim() {
 }
 
 /* ── Thumbnails ── */
-function buildThumb(part, idx) {
+function buildThumb(part, idx, deferPreview = false) {
   const wrap = document.createElement('div');
   wrap.className = 'thumb';
 
@@ -451,14 +622,32 @@ function buildThumb(part, idx) {
       <label class="material-field"><span class="ctrl-label">Mat</span> <select data-k="material"></select></label>
     </div>`;
 
+  thumbs.appendChild(wrap);
+
   const canvas = wrap.querySelector('.thumb-canvas');
-  const ctx = buildRenderer(canvas);
-  if (ctx.grid) ctx.scene.remove(ctx.grid);
-  const mesh = meshFromPayload(part.mesh);
-  ctx.scene.add(mesh);
-  fitCamera(ctx.camera, ctx.controls, mesh);
-  const stopThumbAnimation = animate(ctx);
-  thumbAnimations.push(stopThumbAnimation);
+  const renderPreview = () => {
+    if (isLargeThumbPayload(part.mesh)) {
+      canvas.innerHTML = `
+        <div class="thumb-placeholder">
+          <span class="thumb-placeholder-title">Large mesh</span>
+          <span class="thumb-placeholder-copy">3D thumbnail skipped to keep the viewport responsive.</span>
+        </div>`;
+      return;
+    }
+    const ctx = buildRenderer(canvas);
+    if (ctx.grid) ctx.scene.remove(ctx.grid);
+    const mesh = meshFromPayload(part.mesh);
+    ctx.scene.add(mesh);
+    fitCamera(ctx.camera, ctx.controls, mesh);
+    const stopThumbAnimation = animate(ctx);
+    thumbAnimations.push(stopThumbAnimation);
+  };
+
+  if (deferPreview) {
+    window.setTimeout(renderPreview, 0);
+  } else {
+    renderPreview();
+  }
 
   const materialSelect = wrap.querySelector('select[data-k="material"]');
   MATERIAL_OPTIONS.forEach(m => {
@@ -493,8 +682,6 @@ function buildThumb(part, idx) {
     updateViewButtons();
     renderMain();
   });
-
-  thumbs.appendChild(wrap);
 }
 
 function renderThumbs() {
@@ -505,7 +692,18 @@ function renderThumbs() {
     return;
   }
   partCountEl.textContent = `${sceneData.parts.length} part${sceneData.parts.length !== 1 ? 's' : ''}`;
-  sceneData.parts.forEach(buildThumb);
+  const generation = ++thumbRenderGeneration;
+  const queue = sceneData.parts.map((part, idx) => ({ part, idx }));
+  const renderNext = () => {
+    if (generation !== thumbRenderGeneration) return;
+    const next = queue.shift();
+    if (!next) return;
+    buildThumb(next.part, next.idx, true);
+    if (queue.length) {
+      window.setTimeout(renderNext, 0);
+    }
+  };
+  window.setTimeout(renderNext, 0);
 }
 
 /* ── View button state ── */
@@ -517,11 +715,22 @@ function updateViewButtons() {
 /* ── Data refresh ── */
 async function refreshScene() {
   try {
-    sceneData = await api('/api/scene');
+    if (progressSSE) {
+      addDebugLog('progress-stream', 'Closing progress stream before scene fetch');
+      progressSSE.close();
+      progressSSE = null;
+    }
+    addDebugLog('scene-refresh', 'Requesting scene payload');
+    sceneData = await api('/api/scene', { timeoutMs: 15000 });
+    addDebugLog('scene-refresh', 'Scene payload received', {
+      parts: sceneData.parts?.length || 0,
+      combined: sceneData.combined?.length || 0,
+    });
     renderMain();
     renderThumbs();
   } catch (e) {
-    toast('Failed to load scene: ' + e.message, 'error');
+    addDebugLog('scene-error', e.message);
+    throw e;
   }
 }
 
@@ -686,6 +895,7 @@ async function refreshGradientFiles() {
 
 /* ── Progress bar helpers ── */
 function showProgress(current, total, message, history = []) {
+  lastProgressEventAt = Date.now();
   progressContainer.style.display = 'flex';
   if (total > 0) {
     const pct = Math.round((current / total) * 100);
@@ -741,15 +951,21 @@ function hideProgress() {
 
 function startProgressStream() {
   if (progressSSE) progressSSE.close();
+  addDebugLog('progress-stream', 'Opening progress stream');
   progressSSE = new EventSource('/api/progress/stream');
   progressSSE.onmessage = (e) => {
     try {
       const data = JSON.parse(e.data);
+      addDebugLog('progress-event', data.message || 'Working', {
+        current: data.current,
+        total: data.total,
+      });
       showProgress(data.current, data.total, data.message, data.history || []);
       setStatus(data.message || 'Working...', true);
     } catch (_) {}
   };
   progressSSE.onerror = () => {
+    addDebugLog('progress-stream', 'Progress stream error/closed');
     if (progressSSE) progressSSE.close();
     progressSSE = null;
   };
@@ -760,6 +976,7 @@ function stopProgressStream() {
     progressSSE.close();
     progressSSE = null;
   }
+  addDebugLog('progress-stream', 'Closing progress stream');
   setTimeout(hideProgress, 600);
 }
 
@@ -819,15 +1036,34 @@ document.getElementById('load-selected').addEventListener('click', withLoading(
       toast('Select at least one file to load', 'warning');
       return;
     }
+    addDebugLog('load-click', 'Load selected triggered', { files });
     setBusy('Loading parts...');
     showViewportLoader('Loading parts...');
+    startStallWatchdog('load-selected');
     try {
-      await api('/api/load', { method: 'POST', body: JSON.stringify({ files }) });
+      const loadResult = await api('/api/load', {
+        method: 'POST',
+        body: JSON.stringify({ files, include_scene: true }),
+        timeoutMs: 30000,
+      });
+      addDebugLog('load-click', 'Load API complete', { files });
       toast(`Loaded ${files.length} part${files.length !== 1 ? 's' : ''}`, 'success');
       setIdle(`${files.length} part${files.length !== 1 ? 's' : ''} loaded`);
-      await refreshScene();
+      if (loadResult?.scene) {
+        addDebugLog('scene-refresh', 'Using scene payload returned from load', {
+          parts: loadResult.scene.parts?.length || 0,
+          combined: loadResult.scene.combined?.length || 0,
+        });
+        sceneData = loadResult.scene;
+        renderMain();
+        renderThumbs();
+      } else {
+        await refreshScene();
+      }
     } catch (e) {
+      addDebugLog('load-error', e.message, { files });
       removeViewportLoader();
+      stopProgressStream();
       setIdle();
       toast('Failed to load parts: ' + e.message, 'error');
     }
@@ -870,6 +1106,7 @@ document.querySelectorAll('[data-stage]').forEach(btn => {
       await refreshScene();
     } catch (e) {
       removeViewportLoader();
+      stopProgressStream();
       setIdle();
       toast('Stage failed: ' + e.message, 'error');
     }
@@ -904,6 +1141,37 @@ document.querySelectorAll('[data-tooltip]').forEach((el) => {
   el.addEventListener('mouseleave', hideTooltip);
   el.addEventListener('blur', hideTooltip);
   el.addEventListener('mousemove', () => positionTooltip(el));
+});
+
+debugToggle?.addEventListener('click', () => {
+  debugPanelOpen = !debugPanelOpen;
+  updateDebugPanelState();
+});
+
+debugCopyBtn?.addEventListener('click', async () => {
+  const text = formatDebugLogText();
+  if (!text) {
+    toast('Debug log is empty', 'warning');
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+    addDebugLog('debug-copy', 'Copied debug log to clipboard', { lines: debugEntries.length });
+    toast('Copied debug log', 'success');
+  } catch (e) {
+    addDebugLog('debug-copy-error', e?.message || 'Clipboard write failed');
+    toast('Failed to copy debug log', 'error');
+  }
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') {
+    flushDebugLog(true);
+  }
+});
+
+window.addEventListener('beforeunload', () => {
+  flushDebugLog(true);
 });
 
 // Gradient capability
@@ -953,3 +1221,6 @@ document.addEventListener('keydown', e => {
 /* ── Init ── */
 refreshFiles();
 refreshGradientFiles();
+renderDebugLog();
+updateDebugPanelState();
+addDebugLog('app-init', 'Web UI initialized');
