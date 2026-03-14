@@ -10,6 +10,7 @@ import hashlib
 import importlib.util
 import json
 import logging
+import math
 import queue
 import subprocess
 import sys
@@ -20,19 +21,24 @@ from pathlib import Path
 from typing import Any
 
 import cadquery as cq
+import numpy as np
 import trimesh
 from flask import Flask, Response, jsonify, render_template, request, send_file
 from werkzeug.exceptions import HTTPException
-from OCP.BRepBuilderAPI import BRepBuilderAPI_GTransform
+from OCP.BRepBuilderAPI import BRepBuilderAPI_GTransform, BRepBuilderAPI_Transform
 from OCP.TopAbs import TopAbs_FACE
 from OCP.TopExp import TopExp_Explorer
-from OCP.gp import gp_GTrsf
+from OCP.gp import gp_Ax1, gp_Dir, gp_GTrsf, gp_Pnt, gp_Trsf
 
 import assemble
 from assemble import progress
 
 SUPPORTED_EXT = assemble.ALL_EXTENSIONS
 GRADIENT_EXT = {".wrl", ".vrml", ".stl", ".3mf"}
+SUPPORTED_WORKFLOWS = {
+    "cylinder": "Cylinder",
+    "generic": "Generic Stack",
+}
 
 
 def _safe_resolve(user_path: str) -> Path:
@@ -74,6 +80,7 @@ class PartState:
     preview_only: bool = False
     material: str | None = None
     auto_oriented: bool = False
+    orientation_steps: list[tuple[tuple[float, float, float], float]] = field(default_factory=list)
     rot_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
     manual_scale: float = 1.0
 
@@ -84,6 +91,7 @@ class SessionState:
     parts_dir: Path = field(default_factory=lambda: Path.cwd().resolve())
     gap: float = 0.0
     axis: str = "z"
+    workflow: str = "cylinder"
     cut_angle: float = 90.0
     section_number: int | None = None
 
@@ -94,11 +102,15 @@ app.logger.setLevel(logging.INFO)
 
 _SHAPE_CACHE: dict[tuple[str, float, bool], tuple[Any, str]] = {}
 _MESH_PAYLOAD_CACHE: dict[tuple[str, float, int, float], dict[str, Any]] = {}
+_DECIMATED_PAYLOAD_CACHE: dict[tuple[str, float, int, float, int], dict[str, Any]] = {}
 _PREVIEW_SURROGATE_MIN_BYTES = 25 * 1024 * 1024
 _WEBUI_CACHE_DIR = Path(".webui_cache")
 _DEBUG_LOG: collections.deque[dict[str, Any]] = collections.deque(maxlen=400)
 _DEBUG_LOG_LOCK = threading.Lock()
 _DEBUG_LOG_PATH = _WEBUI_CACHE_DIR / "debug_log.jsonl"
+_THUMB_TRIANGLE_TARGET = 2500
+_ORIENT_TRIANGLE_TARGET = 4000
+_ORIENT_VERTEX_LIMIT = 12000
 
 
 def _compute_webui_version() -> str:
@@ -167,6 +179,91 @@ def _payload_cache_path(path: Path, tolerance: float = 0.5) -> Path:
     ))
     digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
     return _WEBUI_CACHE_DIR / "mesh_payloads" / f"{digest}.json.gz"
+
+
+def _decimated_payload_cache_path(path: Path, tolerance: float, target_triangles: int) -> Path:
+    stat = path.stat()
+    key = "|".join((
+        "mesh-decimated-v1",
+        str(path.resolve()),
+        str(stat.st_mtime_ns),
+        str(stat.st_size),
+        f"{tolerance:.6f}",
+        str(target_triangles),
+    ))
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
+    return _WEBUI_CACHE_DIR / "mesh_payloads" / f"{digest}.json.gz"
+
+
+def _payload_arrays(payload: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
+    vertices = np.asarray(payload.get("vertices", []), dtype=np.float32).reshape(-1, 3)
+    indices = np.asarray(payload.get("indices", []), dtype=np.int64).reshape(-1, 3)
+    return vertices, indices
+
+
+def _payload_from_arrays(vertices: np.ndarray, faces: np.ndarray) -> dict[str, Any]:
+    return {
+        "vertices": np.asarray(vertices, dtype=np.float32).reshape(-1).tolist(),
+        "indices": np.asarray(faces, dtype=np.int64).reshape(-1).tolist(),
+    }
+
+
+def _decimate_payload(payload: dict[str, Any], target_triangles: int) -> dict[str, Any]:
+    vertices, faces = _payload_arrays(payload)
+    if len(faces) <= target_triangles or len(vertices) == 0:
+        return payload
+
+    mesh = None
+    try:
+        mesh = trimesh.Trimesh(vertices=np.asarray(vertices, dtype=float), faces=np.asarray(faces, dtype=np.int64), process=False)
+        simplify = getattr(mesh, "simplify_quadric_decimation", None) or getattr(mesh, "simplify_quadratic_decimation", None)
+        if callable(simplify):
+            try:
+                mesh = simplify(target_triangles)
+            except TypeError:
+                mesh = simplify(face_count=target_triangles)
+    except Exception:
+        mesh = None
+
+    if mesh is None or len(getattr(mesh, "faces", [])) == 0 or len(mesh.faces) >= len(faces):
+        step = max(1, math.ceil(len(faces) / target_triangles))
+        mesh = trimesh.Trimesh(vertices=np.asarray(vertices, dtype=float), faces=np.asarray(faces[::step], dtype=np.int64), process=False)
+
+    mesh.remove_unreferenced_vertices()
+    return _payload_from_arrays(np.asarray(mesh.vertices), np.asarray(mesh.faces))
+
+
+def _load_decimated_mesh_payload(
+    source_path: str | None,
+    shape,
+    *,
+    tolerance: float = 0.5,
+    target_triangles: int = _THUMB_TRIANGLE_TARGET,
+) -> dict[str, Any]:
+    if not source_path:
+        return _decimate_payload(_mesh_payload(shape, tolerance=tolerance), target_triangles)
+
+    path = Path(source_path).resolve()
+    stat = path.stat()
+    key = (str(path), stat.st_mtime_ns, stat.st_size, tolerance, target_triangles)
+    cached = _DECIMATED_PAYLOAD_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    cache_path = _decimated_payload_cache_path(path, tolerance, target_triangles)
+    if cache_path.exists():
+        with gzip.open(cache_path, "rt", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        _DECIMATED_PAYLOAD_CACHE[key] = payload
+        return payload
+
+    full_payload = _load_mesh_payload_from_cache_file(source_path, shape, tolerance=tolerance)
+    payload = _decimate_payload(full_payload, target_triangles)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(cache_path, "wt", encoding="utf-8") as fh:
+        json.dump(payload, fh, separators=(",", ":"))
+    _DECIMATED_PAYLOAD_CACHE[key] = payload
+    return payload
 
 
 def _load_mesh_payload_from_cache_file(
@@ -259,6 +356,19 @@ def _rotate_shape(shape, rx: float, ry: float, rz: float):
     return wp.val().wrapped
 
 
+def _axis_angle_transform(shape, axis: tuple[float, float, float], angle_rad: float):
+    if abs(angle_rad) < 1e-9:
+        return shape
+    ax = np.asarray(axis, dtype=float)
+    norm = float(np.linalg.norm(ax))
+    if norm < 1e-9:
+        return shape
+    ax = ax / norm
+    trsf = gp_Trsf()
+    trsf.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(*ax.tolist())), angle_rad)
+    return BRepBuilderAPI_Transform(shape, trsf, True).Shape()
+
+
 def _scale_shape(shape, factor: float):
     g = gp_GTrsf()
     g.SetValue(1, 1, factor)
@@ -269,11 +379,21 @@ def _scale_shape(shape, factor: float):
 
 def _apply_manual_transforms(part: PartState):
     shape = part.shape
+    for axis, angle_rad in part.orientation_steps:
+        shape = _axis_angle_transform(shape, axis, angle_rad)
     rx, ry, rz = part.rot_xyz
     shape = _rotate_shape(shape, rx, ry, rz)
     if abs(part.manual_scale - 1.0) > 1e-6:
         shape = _scale_shape(shape, part.manual_scale)
     return shape
+
+
+def _part_has_runtime_transform(part: PartState) -> bool:
+    return (
+        bool(part.orientation_steps)
+        or part.rot_xyz != (0.0, 0.0, 0.0)
+        or abs(part.manual_scale - 1.0) > 1e-6
+    )
 
 
 def _parts_for_stack() -> list[tuple[cq.Workplane, str, str, bool]]:
@@ -303,6 +423,89 @@ def _mesh_bbox(payload: dict[str, Any]) -> tuple[list[float], list[float]]:
     return mins, maxs
 
 
+def _axis_vector(axis_name: str) -> np.ndarray:
+    axis = assemble.AXIS_MAP.get(axis_name, assemble.AXIS_MAP["z"])
+    if hasattr(axis, "toTuple"):
+        axis = axis.toTuple()
+    elif hasattr(axis, "x") and hasattr(axis, "y") and hasattr(axis, "z"):
+        axis = (axis.x, axis.y, axis.z)
+    return np.asarray(axis, dtype=float)
+
+
+def _perpendicular_axis(target: np.ndarray) -> np.ndarray:
+    fallback = np.array([1.0, 0.0, 0.0], dtype=float)
+    if abs(float(np.dot(target, fallback))) > 0.9:
+        fallback = np.array([0.0, 1.0, 0.0], dtype=float)
+    perp = np.cross(target, fallback)
+    norm = float(np.linalg.norm(perp))
+    if norm < 1e-9:
+        return np.array([0.0, 0.0, 1.0], dtype=float)
+    return perp / norm
+
+
+def _rotation_steps_to_axis(principal: np.ndarray, target: np.ndarray, conic_flip: bool) -> list[tuple[tuple[float, float, float], float]]:
+    principal = principal / np.linalg.norm(principal)
+    target = target / np.linalg.norm(target)
+    dot = float(np.clip(np.dot(principal, target), -1.0, 1.0))
+    steps: list[tuple[tuple[float, float, float], float]] = []
+
+    if dot < 1.0 - 1e-6:
+        if dot <= -1.0 + 1e-6:
+            rot_axis = _perpendicular_axis(target)
+        else:
+            rot_axis = np.cross(principal, target)
+            rot_axis = rot_axis / np.linalg.norm(rot_axis)
+        steps.append((tuple(rot_axis.tolist()), math.acos(dot)))
+
+    if conic_flip:
+        steps.append((tuple(_perpendicular_axis(target).tolist()), math.pi))
+
+    return steps
+
+
+def _apply_steps_to_vertices(vertices: np.ndarray, steps: list[tuple[tuple[float, float, float], float]]) -> np.ndarray:
+    if len(vertices) == 0 or not steps:
+        return vertices
+    out = np.asarray(vertices, dtype=float)
+    for axis, angle in steps:
+        ax = np.asarray(axis, dtype=float)
+        norm = float(np.linalg.norm(ax))
+        if norm < 1e-9 or abs(angle) < 1e-9:
+            continue
+        ax = ax / norm
+        x, y, z = ax.tolist()
+        c = math.cos(angle)
+        s = math.sin(angle)
+        t = 1.0 - c
+        rot = np.array([
+            [t*x*x + c,     t*x*y - s*z, t*x*z + s*y],
+            [t*x*y + s*z,   t*y*y + c,   t*y*z - s*x],
+            [t*x*z - s*y,   t*y*z + s*x, t*z*z + c],
+        ], dtype=float)
+        out = out @ rot.T
+    return out
+
+
+def _sample_vertices(payload: dict[str, Any], limit: int = _ORIENT_VERTEX_LIMIT) -> np.ndarray:
+    vertices, _faces = _payload_arrays(payload)
+    if len(vertices) <= limit:
+        return vertices
+    step = max(1, math.ceil(len(vertices) / limit))
+    return vertices[::step]
+
+
+def _orientation_payload_for_part(part: PartState, target_triangles: int = _ORIENT_TRIANGLE_TARGET) -> dict[str, Any]:
+    if not _part_has_runtime_transform(part) and part.mesh_source_path:
+        return _load_decimated_mesh_payload(
+            part.mesh_source_path,
+            part.shape,
+            tolerance=0.8,
+            target_triangles=target_triangles,
+        )
+    effective_shape = _apply_manual_transforms(part)
+    return _decimate_payload(_mesh_payload(effective_shape, tolerance=0.8), target_triangles)
+
+
 def _can_use_fast_mesh_scene(part_states: list[PartState]) -> bool:
     if not part_states:
         return False
@@ -311,7 +514,7 @@ def _can_use_fast_mesh_scene(part_states: list[PartState]) -> bool:
             return False
         if Path(part.mesh_source_path).suffix.lower() not in assemble.MESH_EXTENSIONS:
             return False
-        if part.auto_oriented or part.rot_xyz != (0.0, 0.0, 0.0) or abs(part.manual_scale - 1.0) > 1e-6:
+        if _part_has_runtime_transform(part):
             return False
         tier, _levels, _segment = assemble.parse_part_name(part.name)
         if tier is not None:
@@ -339,6 +542,12 @@ def _build_fast_mesh_scene() -> dict[str, Any]:
             payload = None if use_mesh_url else _load_mesh_payload_from_cache_file(part.mesh_source_path, part.shape)
         if payload is None:
             payload = _load_mesh_payload_from_cache_file(part.mesh_source_path, part.shape)
+        thumb_payload = None if use_mesh_url else _load_decimated_mesh_payload(
+            part.mesh_source_path,
+            part.shape,
+            tolerance=0.8,
+            target_triangles=_THUMB_TRIANGLE_TARGET,
+        )
         mins, maxs = _mesh_bbox(payload)
         offset = [0.0, 0.0, 0.0]
         for center_axis in center_axes:
@@ -361,6 +570,7 @@ def _build_fast_mesh_scene() -> dict[str, Any]:
             "scale": part.manual_scale,
             "material": part.material,
             "mesh": None if use_mesh_url else payload,
+            "thumbMesh": thumb_payload,
             "meshUrl": _mesh_file_url(part.mesh_source_path) if use_mesh_url else None,
             "meshFormat": "stl" if use_mesh_url else None,
         })
@@ -446,6 +656,69 @@ def _ensure_all_real_geometry() -> None:
         _ensure_real_geometry(part)
 
 
+def _solve_orientation_steps(workflow: str) -> list[tuple[tuple[float, float, float], float]]:
+    clouds: list[np.ndarray] = []
+    progress.begin("Auto-orient", len(state.parts) + 2, "Sampling preview meshes for orientation...")
+    for idx, part in enumerate(state.parts, start=1):
+        payload = _orientation_payload_for_part(part)
+        vertices, faces = _payload_arrays(payload)
+        if len(vertices):
+            try:
+                if len(faces):
+                    mesh = trimesh.Trimesh(vertices=np.asarray(vertices, dtype=float), faces=np.asarray(faces, dtype=np.int64), process=False)
+                    trimesh.smoothing.filter_taubin(mesh, lamb=0.5, nu=-0.53, iterations=20)
+                    vertices = np.asarray(mesh.vertices)
+            except Exception:
+                pass
+            clouds.append(_sample_vertices(_payload_from_arrays(vertices, faces)))
+        progress.advance(1, f"Sampled orientation proxy {idx} of {len(state.parts)}: {part.name}")
+
+    if not clouds:
+        progress.finish("Auto-orient skipped")
+        return []
+
+    all_vertices = np.vstack(clouds)
+    principal = assemble.pca_principal_axis(all_vertices) if assemble.gpu_enabled() else None
+    if principal is None:
+        centered = all_vertices - all_vertices.mean(axis=0)
+        cov = (centered.T @ centered) / max(1, len(centered))
+        eigenvalues, eigenvectors = np.linalg.eigh(cov)
+        principal = eigenvectors[:, np.argmax(eigenvalues)]
+
+    target = _axis_vector(state.axis)
+    if float(np.dot(principal, target)) < 0:
+        principal = -principal
+
+    progress.advance(1, "Solved principal axis from preview meshes")
+
+    steps = _rotation_steps_to_axis(principal, target, False)
+    if workflow == "cylinder":
+        rotated = _apply_steps_to_vertices(all_vertices, steps)
+        axis_index = {"x": 0, "y": 1, "z": 2}.get(state.axis, 2)
+        other_axes = [idx for idx in range(3) if idx != axis_index]
+        coords = rotated[:, axis_index]
+        mid = float((coords.min() + coords.max()) / 2.0)
+        bottom = rotated[coords < mid]
+        top = rotated[coords >= mid]
+        if len(bottom) and len(top):
+            r_bottom = float(np.mean(np.linalg.norm(bottom[:, other_axes], axis=1)))
+            r_top = float(np.mean(np.linalg.norm(top[:, other_axes], axis=1)))
+            if r_top > r_bottom * 1.001:
+                steps = _rotation_steps_to_axis(principal, target, True)
+    progress.advance(1, "Resolved cylinder orientation")
+    progress.finish("Auto-orient complete")
+    return steps
+
+
+def _centroid_along_stack_axis(part: PartState) -> float:
+    shape = _apply_manual_transforms(part)
+    xmin, ymin, zmin, xmax, ymax, zmax = assemble.get_tight_bounding_box(shape)
+    mins = [xmin, ymin, zmin]
+    maxs = [xmax, ymax, zmax]
+    axis_index = {"x": 0, "y": 1, "z": 2}.get(state.axis, 2)
+    return (mins[axis_index] + maxs[axis_index]) / 2.0
+
+
 def _build_scene() -> dict[str, Any]:
     stack_parts = _parts_for_stack()
     if not stack_parts:
@@ -466,9 +739,7 @@ def _build_scene() -> dict[str, Any]:
     for idx, (entry, part_state) in enumerate(zip(stack_parts, state.parts), start=1):
         can_reuse_cached_mesh = (
             bool(part_state.mesh_source_path)
-            and not part_state.auto_oriented
-            and part_state.rot_xyz == (0.0, 0.0, 0.0)
-            and abs(part_state.manual_scale - 1.0) < 1e-6
+            and not _part_has_runtime_transform(part_state)
         )
         with _SlowProgressDetail(
             f"Preparing preview {idx} of {len(state.parts)}: {part_state.name}",
@@ -497,6 +768,16 @@ def _build_scene() -> dict[str, Any]:
             "scale": part_state.manual_scale,
             "material": part_state.material,
             "mesh": mesh,
+            "thumbMesh": (
+                _load_decimated_mesh_payload(
+                    part_state.mesh_source_path,
+                    entry[0].val().wrapped,
+                    tolerance=0.8,
+                    target_triangles=_THUMB_TRIANGLE_TARGET,
+                )
+                if can_reuse_cached_mesh
+                else _decimate_payload(mesh, _THUMB_TRIANGLE_TARGET)
+            ),
         })
         progress.advance(1, f"Prepared preview {idx} of {len(state.parts)}: {part_state.name}")
 
@@ -551,7 +832,12 @@ def _load_gradient_module():
 
 @app.route("/")
 def index():
-    return render_template("index.html", webui_version=_WEBUI_VERSION)
+    return render_template(
+        "index.html",
+        webui_version=_WEBUI_VERSION,
+        workflows=SUPPORTED_WORKFLOWS,
+        current_workflow=state.workflow,
+    )
 
 
 @app.route("/api/progress")
@@ -875,31 +1161,39 @@ def update_part(idx: int):
 @app.route("/api/stage/<name>", methods=["POST"])
 def run_stage(name: str):
     try:
-        _ensure_all_real_geometry()
         if name == "auto_orient":
-            progress.begin("Auto-orient", len(state.parts), "Orienting parts...")
-            entries = [(cq.Workplane("XY").newObject([cq.Shape(p.shape)]), p.name) for p in state.parts]
-            oriented = assemble.orient_to_cylinder(entries, gap=0.0)
-            for i, (wp, _name) in enumerate(oriented):
-                state.parts[i].shape = wp.val().wrapped
-                state.parts[i].rot_xyz = (0.0, 0.0, 0.0)
-                state.parts[i].auto_oriented = True
-                progress.advance(1, f"Oriented {state.parts[i].name}")
-            progress.finish("Auto-orient complete")
-            return jsonify({"ok": True, "message": "Auto-orient complete"})
+            steps = _solve_orientation_steps(state.workflow)
+            for part in state.parts:
+                part.orientation_steps = list(steps)
+                part.auto_oriented = bool(steps)
+            return jsonify({"ok": True, "message": "Auto-orient complete using decimated preview meshes"})
+
+        if name == "auto_stack":
+            progress.begin("Auto-stack", len(state.parts), "Ordering parts for stacking...")
+            ranked = []
+            for idx, part in enumerate(state.parts, start=1):
+                ranked.append((_centroid_along_stack_axis(part), idx, part))
+                progress.advance(1, f"Ranked {part.name} for stacking")
+            state.parts = [part for _centroid, _idx, part in sorted(ranked, key=lambda item: (item[0], item[1]))]
+            progress.finish("Auto-stack complete")
+            return jsonify({"ok": True, "message": "Auto-stack complete"})
 
         if name == "auto_scale":
+            _ensure_all_real_geometry()
             progress.begin("Auto-scale", len(state.parts), "Scaling parts...")
-            entries = [(cq.Workplane("XY").newObject([cq.Shape(p.shape)]), p.name) for p in state.parts]
+            entries = [(cq.Workplane("XY").newObject([cq.Shape(_apply_manual_transforms(p))]), p.name) for p in state.parts]
             scaled = assemble.autoscale_parts(entries)
             for i, (wp, _name) in enumerate(scaled):
                 state.parts[i].shape = wp.val().wrapped
+                state.parts[i].orientation_steps = []
                 state.parts[i].manual_scale = 1.0
+                state.parts[i].rot_xyz = (0.0, 0.0, 0.0)
                 progress.advance(1, f"Scaled {state.parts[i].name}")
             progress.finish("Auto-scale complete")
             return jsonify({"ok": True, "message": "Auto-scale complete"})
 
         if name == "cut_inner_from_mid":
+            _ensure_all_real_geometry()
             progress.begin("Cutting", 2, "Preparing cut...")
             axis_vec = assemble.AXIS_MAP.get(state.axis, assemble.AXIS_MAP["z"])
             _assy, part_info = assemble.stack_parts(_parts_for_assembly(), axis_vec, state.gap)
@@ -909,12 +1203,14 @@ def run_stage(name: str):
             return jsonify({"ok": True, "message": f"Cut complete ({len(out)} parts)"})
 
         if name == "export_parts":
+            _ensure_all_real_geometry()
             progress.begin("Exporting", 1, "Exporting parts...")
             assemble.export_transformed_parts(_parts_for_stack(), "parts")
             progress.finish("Parts exported")
             return jsonify({"ok": True, "message": "Exported transformed parts to ./parts"})
 
         if name == "render_whole":
+            _ensure_all_real_geometry()
             axis_vec = assemble.AXIS_MAP.get(state.axis, assemble.AXIS_MAP["z"])
             _assy, part_info = assemble.stack_parts(_parts_for_assembly(), axis_vec, state.gap)
             data = [(name, shape, loc, rgb) for name, shape, loc, rgb, *_ in part_info]
@@ -923,6 +1219,7 @@ def run_stage(name: str):
             return jsonify({"ok": True, "message": f"Rendered {out}"})
 
         if name == "export_whole":
+            _ensure_all_real_geometry()
             progress.begin("Exporting", 1, "Exporting assembly...")
             axis_vec = assemble.AXIS_MAP.get(state.axis, assemble.AXIS_MAP["z"])
             assy, _part_info = assemble.stack_parts(_parts_for_assembly(), axis_vec, state.gap)
@@ -943,6 +1240,8 @@ def set_config():
     data = request.get_json(force=True)
     if "axis" in data and data["axis"] in assemble.AXIS_MAP:
         state.axis = data["axis"]
+    if "workflow" in data and data["workflow"] in SUPPORTED_WORKFLOWS:
+        state.workflow = data["workflow"]
     if "gap" in data:
         state.gap = float(data["gap"])
     if "cut_angle" in data:

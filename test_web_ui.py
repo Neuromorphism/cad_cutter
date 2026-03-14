@@ -11,12 +11,16 @@ import web_ui
 def client(tmp_path):
     original_parts = list(web_ui.state.parts)
     original_dir = web_ui.state.parts_dir
+    original_workflow = web_ui.state.workflow
     original_cache_dir = web_ui._WEBUI_CACHE_DIR
     original_mesh_cache = dict(web_ui._MESH_PAYLOAD_CACHE)
+    original_decimated_cache = dict(web_ui._DECIMATED_PAYLOAD_CACHE)
     web_ui.state.parts = []
     web_ui.state.parts_dir = tmp_path
+    web_ui.state.workflow = "cylinder"
     web_ui._WEBUI_CACHE_DIR = tmp_path / ".webui_cache"
     web_ui._MESH_PAYLOAD_CACHE.clear()
+    web_ui._DECIMATED_PAYLOAD_CACHE.clear()
     web_ui.app.config["TESTING"] = True
     try:
         with web_ui.app.test_client() as client:
@@ -24,9 +28,12 @@ def client(tmp_path):
     finally:
         web_ui.state.parts = original_parts
         web_ui.state.parts_dir = original_dir
+        web_ui.state.workflow = original_workflow
         web_ui._WEBUI_CACHE_DIR = original_cache_dir
         web_ui._MESH_PAYLOAD_CACHE.clear()
         web_ui._MESH_PAYLOAD_CACHE.update(original_mesh_cache)
+        web_ui._DECIMATED_PAYLOAD_CACHE.clear()
+        web_ui._DECIMATED_PAYLOAD_CACHE.update(original_decimated_cache)
 
 
 def test_load_invalid_step_returns_json_error_and_preserves_state(client):
@@ -122,3 +129,21 @@ def test_debug_log_endpoint_accepts_client_entries(client):
     messages = [entry["message"] for entry in payload["entries"]]
     assert "GET /api/scene" in messages
     assert "load-selected has no new progress for 5s" in messages
+
+
+def test_auto_orient_stage_uses_decimated_preview_meshes(client):
+    client, tmp_path = client
+
+    step_path = tmp_path / "outer_1.step"
+    cq.exporters.export(cq.Workplane("XY").cylinder(20, 8), str(step_path))
+
+    load_resp = client.post("/api/load", json={"files": ["outer_1.step"], "include_scene": True})
+    assert load_resp.status_code == 200
+
+    resp = client.post("/api/stage/auto_orient", json={})
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data is not None
+    assert "decimated preview meshes" in data["message"]
+    assert web_ui.state.parts[0].auto_oriented is True
+    assert web_ui.state.parts[0].orientation_steps

@@ -25,6 +25,13 @@
       <span id="parts-dir-label" title="Current parts directory">Dir: .</span>
       <span class="divider"></span>
       <div class="control-group">
+        <label>Workflow
+          <select id="workflow-select">
+            {% for workflow_id, workflow_label in workflows.items() %}
+            <option value="{{ workflow_id }}" {% if workflow_id == current_workflow %}selected{% endif %}>{{ workflow_label }}</option>
+            {% endfor %}
+          </select>
+        </label>
         <label>Axis
           <select id="axis-select">
             <option value="x">X</option>
@@ -67,12 +74,14 @@
           <span class="icon">&#x2699;</span> Pipeline Stages
         </div>
         <div class="stages">
-          <button data-stage="auto_orient"><span class="stage-num">1</span> Auto-orient parts</button>
-          <button data-stage="auto_scale"><span class="stage-num">2</span> Auto-scale parts</button>
-          <button data-stage="cut_inner_from_mid"><span class="stage-num">3</span> Cut inner from mid</button>
-          <button data-stage="export_parts"><span class="stage-num">4</span> Export parts</button>
-          <button data-stage="render_whole"><span class="stage-num">5</span> Render assembly</button>
-          <button data-stage="export_whole"><span class="stage-num">6</span> Export assembly</button>
+          <button data-stage="auto_orient" data-workflows="cylinder,generic"><span class="stage-num">1</span> Auto-orient parts</button>
+          <button data-stage="auto_stack" data-workflows="cylinder,generic"><span class="stage-num">2</span> Auto-stack parts</button>
+          <button data-stage="auto_scale" data-workflows="cylinder,generic"><span class="stage-num">3</span> Auto-scale parts</button>
+          <button data-client-stage="auto_drop" data-workflows="cylinder,generic"><span class="stage-num">4</span> Autodrop</button>
+          <button data-stage="cut_inner_from_mid" data-workflows="cylinder"><span class="stage-num">5</span> Cut inner from mid</button>
+          <button data-stage="export_parts" data-workflows="cylinder,generic"><span class="stage-num">6</span> Export parts</button>
+          <button data-stage="render_whole" data-workflows="cylinder,generic"><span class="stage-num">7</span> Render assembly</button>
+          <button data-stage="export_whole" data-workflows="cylinder,generic"><span class="stage-num">8</span> Export assembly</button>
         </div>
       </div>
 
@@ -122,8 +131,6 @@
         <span class="view-label">View</span>
         <button id="combined-view" class="active" data-tooltip="Show assembled model">Combined</button>
         <button id="tile-view" data-tooltip="Show parts side by side">Tile</button>
-        <span class="spacer"></span>
-        <button id="start-sim" data-tooltip="Drop parts with physics">Start Physics Sim</button>
       </div>
 
       <!-- 3D viewport -->
