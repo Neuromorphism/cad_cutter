@@ -15,6 +15,13 @@ let mainAnimation = null;
 
 function setStatus(msg) { statusEl.textContent = msg; }
 
+function stopMainAnimation() {
+  if (mainAnimation) {
+    mainAnimation();
+    mainAnimation = null;
+  }
+}
+
 async function api(path, opts = {}) {
   const res = await fetch(path, { headers: {'content-type':'application/json'}, ...opts });
   if (!res.ok) throw new Error(await res.text());
@@ -88,7 +95,7 @@ function renderMain() {
   }
   ctx.scene.add(group);
   fitCamera(ctx.camera, ctx.controls, group);
-  if (mainAnimation) mainAnimation();
+  stopMainAnimation();
   mainAnimation = animate(ctx);
 }
 
@@ -116,7 +123,7 @@ function startPhysicsSim() {
 
   const gravity = -260;
   let simDone = false;
-  if (mainAnimation) mainAnimation();
+  stopMainAnimation();
   mainAnimation = animate(ctx, (dt) => {
     let settledCount = 0;
     for (const body of bodies) {
@@ -217,6 +224,8 @@ document.querySelectorAll('[data-stage]').forEach((btn)=>btn.addEventListener('c
 
 document.getElementById('combined-view').addEventListener('click', ()=>{tileView=false; renderMain();});
 document.getElementById('tile-view').addEventListener('click', ()=>{tileView=true; renderMain();});
-startSimBtn.addEventListener('click', startPhysicsSim);
+if (startSimBtn) {
+  startSimBtn.addEventListener('click', startPhysicsSim);
+}
 
 refreshFiles();
