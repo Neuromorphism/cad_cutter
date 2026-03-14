@@ -27,6 +27,35 @@ async function switchToRepoRoot(page) {
   await expect(page.locator('#parts-dir-label')).toContainText('/home/me/gits/cad_cutter');
 }
 
+async function loadParts(page, fileNames) {
+  for (const fileName of fileNames) {
+    await page.locator('#file-list .file-row', { hasText: fileName }).click();
+  }
+  await page.getByRole('button', { name: /load selected/i }).click();
+  await expect(page.locator('#part-count')).toContainText(`${fileNames.length} part`);
+  await expect(page.locator('#status')).toContainText(/loaded|scene ready/i);
+}
+
+async function runStage(page, buttonName, { timeout = 20000 } = {}) {
+  await page.request.delete('/api/debug-log');
+  const button = page.getByRole('button', { name: new RegExp(buttonName, 'i') });
+  await expect(button).toBeVisible();
+  await button.click();
+  await expect(button).toBeEnabled({ timeout });
+  await expect(page.locator('#viewport-loader')).toHaveCount(0, { timeout });
+  await expect(page.locator('.toast-error')).toHaveCount(0);
+  await expect(page.locator('#status')).toContainText(/scene ready|complete|exported|rendered|done/i, { timeout });
+
+  const debugLog = await page.request.get('/api/debug-log');
+  const payload = await debugLog.json();
+  const messages = (payload.entries || []).map((entry) => `${entry.kind}: ${entry.message}`);
+  const logText = messages.join('\n');
+  expect(logText).not.toContain('stall-warning');
+  expect(logText).not.toContain('scene-error');
+  expect(logText).not.toContain('load-error');
+  expect(logText).not.toContain('api-error');
+}
+
 test.describe('CAD Cutter web UI', () => {
   test('loads the shell and keeps header tooltip visible in viewport', async ({ page }) => {
     await page.goto('/');
@@ -36,6 +65,7 @@ test.describe('CAD Cutter web UI', () => {
     await expect(page.locator('#webui-version')).toBeVisible();
     await expect(page.locator('#webui-version')).not.toHaveText('');
     await expect(page.locator('#workflow-select')).toBeVisible();
+    await expect(page.locator('#fine-orient-toggle')).toBeVisible();
     await expect(page.getByRole('button', { name: /autodrop/i })).toBeVisible();
 
     const button = page.getByRole('button', { name: /change dir/i });
@@ -108,5 +138,34 @@ test.describe('CAD Cutter web UI', () => {
     await expect(page.locator('#status')).toContainText(/loaded|scene ready/i);
     await expect(page.locator('#thumbnails .thumb')).toHaveCount(2);
     await expect(page.locator('.toast-error')).toHaveCount(0);
+  });
+
+  test('auto-orients outer STEP sections through the browser without hanging', async ({ page }) => {
+    await page.goto('/');
+    await switchToRepoRoot(page);
+    await loadParts(page, ['outer_1.STEP', 'outer_2.STEP']);
+
+    await runStage(page, 'Auto-orient parts');
+
+    await page.locator('#debug-toggle').click();
+    await expect(page.locator('#debug-log')).toContainText('Auto-orient complete using axis-aligned six-way heuristic');
+    await expect(page.locator('#debug-log')).toContainText('Rendered combined view');
+  });
+
+  test('runs the remaining pipeline stages through the browser without hanging', async ({ page }) => {
+    await page.goto('/');
+    await openModelDirectory(page);
+    await loadParts(page, ['outer_1.step', 'mid_1.step', 'inner_1.step']);
+
+    await runStage(page, 'Auto-stack parts');
+    await runStage(page, 'Auto-scale parts');
+    await runStage(page, 'Autodrop', { timeout: 25000 });
+    await runStage(page, 'Cut inner from mid', { timeout: 25000 });
+    await runStage(page, 'Export parts', { timeout: 25000 });
+    await runStage(page, 'Render assembly', { timeout: 25000 });
+    await runStage(page, 'Export assembly', { timeout: 25000 });
+
+    await page.locator('#debug-toggle').click();
+    await expect(page.locator('#debug-log')).toContainText('Exported web_assembly.step');
   });
 });

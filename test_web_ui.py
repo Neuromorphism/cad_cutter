@@ -4,6 +4,7 @@
 import cadquery as cq
 import pytest
 
+import assemble
 import web_ui
 
 
@@ -12,12 +13,14 @@ def client(tmp_path):
     original_parts = list(web_ui.state.parts)
     original_dir = web_ui.state.parts_dir
     original_workflow = web_ui.state.workflow
+    original_fine_orient = web_ui.state.fine_orient
     original_cache_dir = web_ui._WEBUI_CACHE_DIR
     original_mesh_cache = dict(web_ui._MESH_PAYLOAD_CACHE)
     original_decimated_cache = dict(web_ui._DECIMATED_PAYLOAD_CACHE)
     web_ui.state.parts = []
     web_ui.state.parts_dir = tmp_path
     web_ui.state.workflow = "cylinder"
+    web_ui.state.fine_orient = False
     web_ui._WEBUI_CACHE_DIR = tmp_path / ".webui_cache"
     web_ui._MESH_PAYLOAD_CACHE.clear()
     web_ui._DECIMATED_PAYLOAD_CACHE.clear()
@@ -29,6 +32,7 @@ def client(tmp_path):
         web_ui.state.parts = original_parts
         web_ui.state.parts_dir = original_dir
         web_ui.state.workflow = original_workflow
+        web_ui.state.fine_orient = original_fine_orient
         web_ui._WEBUI_CACHE_DIR = original_cache_dir
         web_ui._MESH_PAYLOAD_CACHE.clear()
         web_ui._MESH_PAYLOAD_CACHE.update(original_mesh_cache)
@@ -144,9 +148,67 @@ def test_auto_orient_stage_uses_decimated_preview_meshes(client):
     assert resp.status_code == 200
     data = resp.get_json()
     assert data is not None
-    assert "decimated preview meshes" in data["message"]
+    assert "axis-aligned six-way heuristic" in data["message"]
     assert web_ui.state.parts[0].auto_oriented is True
-    assert web_ui.state.parts[0].orientation_steps
+
+
+def test_auto_orient_axis_aligned_mode_reorients_simple_rotated_tube(client):
+    client, tmp_path = client
+
+    step_path = tmp_path / "outer_1.step"
+    shape = cq.Workplane("XY").cylinder(30, 8).rotate((0, 0, 0), (0, 1, 0), 90)
+    cq.exporters.export(shape, str(step_path))
+
+    load_resp = client.post("/api/load", json={"files": ["outer_1.step"], "include_scene": True})
+    assert load_resp.status_code == 200
+
+    resp = client.post("/api/stage/auto_orient", json={})
+    assert resp.status_code == 200
+
+    oriented = web_ui._apply_manual_transforms(web_ui.state.parts[0])
+    xmin, ymin, zmin, xmax, ymax, zmax = assemble.get_tight_bounding_box(oriented)
+    extents = [xmax - xmin, ymax - ymin, zmax - zmin]
+    assert extents[2] == pytest.approx(max(extents), rel=1e-3)
+
+
+def test_auto_orient_fine_mode_can_be_enabled_via_config(client):
+    client, tmp_path = client
+
+    step_path = tmp_path / "outer_1.step"
+    cq.exporters.export(cq.Workplane("XY").cylinder(20, 8), str(step_path))
+    load_resp = client.post("/api/load", json={"files": ["outer_1.step"], "include_scene": True})
+    assert load_resp.status_code == 200
+
+    config_resp = client.patch("/api/config", json={"fine_orient": True})
+    assert config_resp.status_code == 200
+    assert web_ui.state.fine_orient is True
+
+    resp = client.post("/api/stage/auto_orient", json={})
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data is not None
+    assert "fine-grained preview solve" in data["message"]
+
+
+def test_scene_reuses_cached_preview_mesh_after_auto_orient(client, monkeypatch):
+    client, tmp_path = client
+
+    step_path = tmp_path / "outer_1.step"
+    rotated = cq.Workplane("XY").cylinder(30, 8).rotate((0, 0, 0), (0, 1, 0), 90)
+    cq.exporters.export(rotated, str(step_path))
+
+    load_resp = client.post("/api/load", json={"files": ["outer_1.step"], "include_scene": True})
+    assert load_resp.status_code == 200
+    orient_resp = client.post("/api/stage/auto_orient", json={})
+    assert orient_resp.status_code == 200
+
+    def fail_mesh_payload(_shape, tolerance=0.5):
+        raise AssertionError(f"unexpected tessellation at tolerance {tolerance}")
+
+    monkeypatch.setattr(web_ui, "_mesh_payload", fail_mesh_payload)
+    scene = web_ui._build_scene()
+    assert len(scene["parts"]) == 1
+    assert scene["parts"][0]["orientationSteps"]
 
 
 def test_auto_drop_stage_returns_timing_metrics_and_persists_offsets(client):
