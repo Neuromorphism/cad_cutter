@@ -44,6 +44,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import threading
 import time
+from itertools import count
 
 import numpy as np
 
@@ -69,6 +70,8 @@ class ProgressTracker:
         self._total = 0
         self._message = ""
         self._cli_enabled = True
+        self._history = []
+        self._event_ids = count(1)
 
     @classmethod
     def get(cls):
@@ -91,6 +94,8 @@ class ProgressTracker:
         self._current = 0
         self._total = total
         self._message = message or stage
+        self._history = []
+        self._record_event(self._message)
         self._notify()
         self._print_bar()
 
@@ -98,6 +103,16 @@ class ProgressTracker:
         self._current = min(self._current + step, self._total)
         if message:
             self._message = message
+            self._record_event(message)
+        self._notify()
+        self._print_bar()
+
+    def note(self, message: str):
+        """Update progress text without advancing the counter."""
+        if not message:
+            return
+        self._message = message
+        self._record_event(message)
         self._notify()
         self._print_bar()
 
@@ -105,8 +120,23 @@ class ProgressTracker:
         self._current = self._total
         if message:
             self._message = message
+            self._record_event(message)
         self._notify()
         self._print_bar(final=True)
+
+    def _record_event(self, message: str):
+        if not message:
+            return
+        event = {
+            "id": next(self._event_ids),
+            "stage": self._stage,
+            "current": self._current,
+            "total": self._total,
+            "message": message,
+            "ts": time.time(),
+        }
+        self._history.append(event)
+        self._history = self._history[-24:]
 
     def _notify(self):
         for fn in self._listeners:
@@ -140,6 +170,7 @@ class ProgressTracker:
             "current": self._current,
             "total": self._total,
             "message": self._message,
+            "history": list(self._history),
         }
 
 

@@ -1,0 +1,27 @@
+{
+  "name": "cad_cutter",
+  "version": "1.0.0",
+  "description": "A Python pipeline for assembling, cutting, and rendering multi-part CAD models. Takes individual CAD or mesh files, stacks them concentrically by naming convention, applies configurable radial wedge cuts, and exports the result as STEP files with optional photorealistic PNG renders.",
+  "main": "index.js",
+  "scripts": {
+    "test": "playwright test",
+    "test:webui": "playwright test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Neuromorphism/cad_cutter.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/Neuromorphism/cad_cutter/issues"
+  },
+  "homepage": "https://github.com/Neuromorphism/cad_cutter#readme",
+  "devDependencies": {
+    "@playwright/test": "^1.58.2"
+  },
+  "dependencies": {
+    "three": "^0.183.2"
+  }
+}

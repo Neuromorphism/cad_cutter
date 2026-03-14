@@ -159,6 +159,33 @@
   <!-- Toast container -->
   <div id="toast-container"></div>
 
+  <!-- Directory browser overlay -->
+  <div id="dir-overlay" class="modal-overlay hidden" aria-hidden="true">
+    <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="dir-modal-title">
+      <div class="modal-header">
+        <div>
+          <div class="modal-kicker">Workspace Navigation</div>
+          <h2 id="dir-modal-title">Choose Parts Directory</h2>
+        </div>
+        <button id="dir-close" class="btn-sm" type="button" aria-label="Close directory browser">&#x2715;</button>
+      </div>
+      <div class="modal-body">
+        <div class="dir-toolbar">
+          <button id="dir-up" class="btn-sm" type="button">&#x2191; Up</button>
+          <button id="dir-root" class="btn-sm" type="button">&#x2302; Root</button>
+          <span id="dir-current" class="dir-current"></span>
+        </div>
+        <div id="dir-list" class="dir-list" aria-live="polite"></div>
+      </div>
+      <div class="modal-footer">
+        <button id="dir-cancel" class="btn-sm" type="button">Cancel</button>
+        <button id="dir-select" class="btn-primary btn-sm" type="button">Use This Directory</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="ui-tooltip" class="ui-tooltip hidden" role="tooltip"></div>
+
 <script type="module" src="/static/app.js"></script>
 </body>
 </html>

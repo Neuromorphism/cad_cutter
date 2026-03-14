@@ -1,5 +1,5 @@
-import * as THREE from 'https://unpkg.com/three@0.161.0/build/three.module.js';
-import { OrbitControls } from 'https://unpkg.com/three@0.161.0/examples/jsm/controls/OrbitControls.js';
+import * as THREE from '/static/vendor/three.module.js';
+import { OrbitControls } from '/static/vendor/OrbitControls.js';
 
 /* ── DOM refs ── */
 const fileList       = document.getElementById('file-list');
@@ -22,6 +22,15 @@ const toastContainer = document.getElementById('toast-container');
 const combinedBtn    = document.getElementById('combined-view');
 const tileBtn        = document.getElementById('tile-view');
 const startSimBtn    = document.getElementById('start-sim');
+const dirOverlay     = document.getElementById('dir-overlay');
+const dirList        = document.getElementById('dir-list');
+const dirCurrent     = document.getElementById('dir-current');
+const dirSelectBtn   = document.getElementById('dir-select');
+const dirUpBtn       = document.getElementById('dir-up');
+const dirRootBtn     = document.getElementById('dir-root');
+const dirCloseBtn    = document.getElementById('dir-close');
+const dirCancelBtn   = document.getElementById('dir-cancel');
+const tooltipEl      = document.getElementById('ui-tooltip');
 
 const progressContainer = document.getElementById('progress-container');
 const progressFill      = document.getElementById('progress-fill');
@@ -33,6 +42,11 @@ let mainCtx   = null;
 let progressSSE = null;
 let mainAnimation = null;
 let thumbAnimations = [];
+let dirBrowseState = { root: '.', current: '.', parent: null, directories: [], selected: '.' };
+let refreshFilesRequestId = 0;
+let progressHistory = [];
+let progressLogTimer = null;
+let progressLogCollapsed = false;
 
 const MATERIAL_OPTIONS = [
   '', 'steel', 'aluminum', 'copper', 'brass', 'bronze', 'gold', 'titanium',
@@ -74,6 +88,36 @@ function stopThumbAnimations() {
   thumbAnimations = [];
 }
 
+function showTooltip(target) {
+  if (!tooltipEl || !target?.dataset?.tooltip) return;
+  tooltipEl.textContent = target.dataset.tooltip;
+  tooltipEl.classList.remove('hidden');
+  tooltipEl.classList.add('visible');
+  positionTooltip(target);
+}
+
+function positionTooltip(target) {
+  if (!tooltipEl || tooltipEl.classList.contains('hidden')) return;
+  const rect = target.getBoundingClientRect();
+  const tooltipRect = tooltipEl.getBoundingClientRect();
+  const margin = 10;
+  let left = rect.left + (rect.width - tooltipRect.width) / 2;
+  left = Math.min(window.innerWidth - tooltipRect.width - margin, Math.max(margin, left));
+  let top = rect.bottom + 8;
+  if (top + tooltipRect.height > window.innerHeight - margin) {
+    top = rect.top - tooltipRect.height - 8;
+  }
+  top = Math.max(margin, top);
+  tooltipEl.style.left = `${left}px`;
+  tooltipEl.style.top = `${top}px`;
+}
+
+function hideTooltip() {
+  if (!tooltipEl) return;
+  tooltipEl.classList.remove('visible');
+  tooltipEl.classList.add('hidden');
+}
+
 /* ── API wrapper with error handling ── */
 async function api(path, opts = {}) {
   const res = await fetch(path, { headers: { 'content-type': 'application/json' }, ...opts });
@@ -91,20 +135,92 @@ function showViewportLoader(msg = 'Loading...') {
   overlay.className = 'loading-overlay';
   overlay.id = 'viewport-loader';
   overlay.innerHTML = `
-    <div class="spinner"></div>
-    <p class="loader-msg">${msg}</p>
-    <div class="viewport-progress">
-      <div class="progress-bar">
-        <div class="progress-fill" id="viewport-progress-fill"></div>
+    <div class="loader-shell">
+      <div class="spinner"></div>
+      <div class="loader-headline">
+        <p class="loader-msg">${msg}</p>
+        <span class="loader-elapsed" id="viewport-progress-elapsed">0s</span>
       </div>
-      <span class="progress-text" id="viewport-progress-text"></span>
+      <div class="viewport-progress">
+        <div class="progress-bar">
+          <div class="progress-fill" id="viewport-progress-fill"></div>
+        </div>
+        <span class="progress-text" id="viewport-progress-text"></span>
+      </div>
+    </div>
+    <div class="progress-log-shell">
+      <button type="button" class="progress-log-toggle" id="viewport-progress-toggle" aria-expanded="${progressLogCollapsed ? 'false' : 'true'}">
+        <span>Recent activity</span>
+        <span class="progress-log-toggle-meta" id="viewport-progress-toggle-meta">0 messages</span>
+      </button>
+      <div class="progress-log ${progressLogCollapsed ? 'collapsed' : ''}" id="viewport-progress-log" aria-live="polite"></div>
     </div>`;
   mainCanvas.appendChild(overlay);
+  const toggle = document.getElementById('viewport-progress-toggle');
+  if (toggle) {
+    toggle.addEventListener('click', () => {
+      progressLogCollapsed = !progressLogCollapsed;
+      updateProgressLogCollapsedState();
+    });
+  }
+  startProgressLogTimer();
+  updateProgressLogCollapsedState();
+  renderProgressHistory();
 }
 
 function removeViewportLoader() {
   const existing = document.getElementById('viewport-loader');
   if (existing) existing.remove();
+  stopProgressLogTimer();
+  progressHistory = [];
+}
+
+function startProgressLogTimer() {
+  if (progressLogTimer) return;
+  progressLogTimer = window.setInterval(renderProgressHistory, 500);
+}
+
+function stopProgressLogTimer() {
+  if (progressLogTimer) {
+    window.clearInterval(progressLogTimer);
+    progressLogTimer = null;
+  }
+}
+
+function renderProgressHistory() {
+  const list = document.getElementById('viewport-progress-log');
+  const toggleMeta = document.getElementById('viewport-progress-toggle-meta');
+  if (!list) return;
+  const now = Date.now();
+  const entries = [...progressHistory]
+    .sort((a, b) => b.ts - a.ts)
+    .slice(0, 8);
+  if (toggleMeta) {
+    toggleMeta.textContent = `${entries.length} message${entries.length !== 1 ? 's' : ''}`;
+  }
+
+  list.innerHTML = '';
+  entries.forEach((entry, index) => {
+    const ageSec = (now - entry.ts) / 1000;
+    const item = document.createElement('div');
+    item.className = 'progress-log-item';
+    if (index >= 5 || ageSec > 5) item.classList.add('is-fading');
+    const opacity = Math.max(0.15, 1 - Math.max(0, ageSec - 2) * 0.14 - Math.max(0, index - 2) * 0.12);
+    item.style.opacity = opacity.toFixed(2);
+    item.innerHTML = `
+      <span class="progress-log-time">${Math.max(0, Math.floor(ageSec))}s</span>
+      <span class="progress-log-message">${entry.message}</span>`;
+    list.appendChild(item);
+  });
+}
+
+function updateProgressLogCollapsedState() {
+  const list = document.getElementById('viewport-progress-log');
+  const toggle = document.getElementById('viewport-progress-toggle');
+  if (!list || !toggle) return;
+  list.classList.toggle('collapsed', progressLogCollapsed);
+  toggle.setAttribute('aria-expanded', progressLogCollapsed ? 'false' : 'true');
+  toggle.classList.toggle('collapsed', progressLogCollapsed);
 }
 
 /* ── Three.js helpers ── */
@@ -170,6 +286,20 @@ function meshFromPayload(payload, color = [0.6, 0.7, 0.8]) {
   return new THREE.Mesh(geo, mat);
 }
 
+function meshFromSceneEntry(entry, fallbackColor = [0.6, 0.7, 0.8]) {
+  let mesh;
+  if (entry.mesh) {
+    mesh = meshFromPayload(entry.mesh, entry.color || fallbackColor);
+  } else if (typeof entry.partIndex === 'number' && sceneData?.parts?.[entry.partIndex]?.mesh) {
+    mesh = meshFromPayload(sceneData.parts[entry.partIndex].mesh, entry.color || fallbackColor);
+    const [x, y, z] = entry.offset || [0, 0, 0];
+    mesh.position.set(x, y, z);
+  } else {
+    return null;
+  }
+  return mesh;
+}
+
 function fitCamera(camera, controls, group) {
   const box = new THREE.Box3().setFromObject(group);
   const size = box.getSize(new THREE.Vector3()).length() || 1;
@@ -228,7 +358,10 @@ function renderMain() {
   const group = new THREE.Group();
 
   if (!tileView) {
-    sceneData.combined.forEach(p => group.add(meshFromPayload(p.mesh, p.color)));
+    sceneData.combined.forEach((p) => {
+      const mesh = meshFromSceneEntry(p, p.color);
+      if (mesh) group.add(mesh);
+    });
   } else {
     sceneData.parts.forEach((p, i) => {
       const mesh = meshFromPayload(p.mesh);
@@ -254,7 +387,8 @@ function startPhysicsSim() {
   const bodies = [];
 
   sceneData.combined.forEach((p, i) => {
-    const mesh = meshFromPayload(p.mesh, p.color);
+    const mesh = meshFromSceneEntry(p, p.color);
+    if (!mesh) return;
     const dropHeight = 100 + (i * 20);
     mesh.position.y += dropHeight;
     group.add(mesh);
@@ -302,7 +436,10 @@ function buildThumb(part, idx) {
 
   wrap.innerHTML = `
     <div class="thumb-header">
-      <span class="part-name">${part.name}</span>
+      <div class="thumb-title">
+        <span class="part-name">${part.name}</span>
+        ${part.previewLabel ? `<span class="preview-badge" title="${part.previewLabel}">${part.previewLabel}</span>` : ''}
+      </div>
       <button data-act="focus" class="btn-sm" data-tooltip="Focus in viewport">&#x1F50D;</button>
     </div>
     <div class="thumb-canvas"></div>
@@ -389,9 +526,11 @@ async function refreshScene() {
 }
 
 async function refreshFiles() {
+  const requestId = ++refreshFilesRequestId;
   setBusy('Scanning for files...');
   try {
     const data = await api('/api/files');
+    if (requestId !== refreshFilesRequestId) return;
     if (partsDirLabel) {
       partsDirLabel.textContent = `Dir: ${data.parts_dir}`;
     }
@@ -416,17 +555,79 @@ async function refreshFiles() {
     setIdle(`Found ${data.files.length} file${data.files.length !== 1 ? 's' : ''}`);
     toast(`Found ${data.files.length} CAD file${data.files.length !== 1 ? 's' : ''}`, 'info');
   } catch (e) {
+    if (requestId !== refreshFilesRequestId) return;
     setIdle();
     toast('Failed to scan files: ' + e.message, 'error');
   }
 }
 
 async function changePartsDir() {
-  const raw = prompt('Enter parts directory (relative to current working directory):', '.');
-  if (raw === null) return;
-  const path = raw.trim();
-  if (!path) return;
+  openDirOverlay();
+}
 
+async function fetchDirectoryListing(path = '.') {
+  return api(`/api/directories?path=${encodeURIComponent(path)}`);
+}
+
+function renderDirectoryList() {
+  if (!dirList || !dirCurrent || !dirSelectBtn) return;
+  dirCurrent.textContent = dirBrowseState.current;
+  dirList.innerHTML = '';
+
+  if (!dirBrowseState.directories.length) {
+    dirList.innerHTML = '<div class="empty-state"><span class="empty-icon">&#x1F4C1;</span><p>No subdirectories here</p></div>';
+  } else {
+    dirBrowseState.directories.forEach((entry) => {
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'dir-entry';
+      if (entry.path === dirBrowseState.selected) row.classList.add('active');
+      row.innerHTML = `
+        <span class="dir-icon">&#x1F4C1;</span>
+        <span class="dir-name">${entry.name}</span>
+        <span class="dir-meta">${entry.file_count} file${entry.file_count !== 1 ? 's' : ''}</span>`;
+      row.addEventListener('click', () => {
+        dirBrowseState.selected = entry.path;
+        renderDirectoryList();
+      });
+      row.addEventListener('dblclick', async () => {
+        await browseDirectory(entry.path);
+      });
+      dirList.appendChild(row);
+    });
+  }
+
+  dirUpBtn.disabled = !dirBrowseState.parent;
+  dirSelectBtn.disabled = !dirBrowseState.selected;
+}
+
+async function browseDirectory(path = '.') {
+  setBusy('Updating parts directory...');
+  try {
+    dirBrowseState = await fetchDirectoryListing(path);
+    dirBrowseState.selected = dirBrowseState.current;
+    renderDirectoryList();
+    setIdle('Browse to a directory and confirm');
+  } catch (e) {
+    setIdle();
+    toast('Failed to browse directories: ' + e.message, 'error');
+  }
+}
+
+function openDirOverlay() {
+  if (!dirOverlay) return;
+  dirOverlay.classList.remove('hidden');
+  dirOverlay.setAttribute('aria-hidden', 'false');
+  browseDirectory(partsDirLabel?.textContent.replace(/^Dir:\s*/, '') || '.');
+}
+
+function closeDirOverlay() {
+  if (!dirOverlay) return;
+  dirOverlay.classList.add('hidden');
+  dirOverlay.setAttribute('aria-hidden', 'true');
+}
+
+async function applyPartsDir(path) {
   setBusy('Updating parts directory...');
   try {
     const data = await api('/api/parts-dir', {
@@ -436,6 +637,7 @@ async function changePartsDir() {
     if (partsDirLabel) {
       partsDirLabel.textContent = `Dir: ${data.parts_dir}`;
     }
+    closeDirOverlay();
     toast(`Parts directory set to ${data.parts_dir}`, 'success');
     await refreshFiles();
   } catch (e) {
@@ -483,7 +685,7 @@ async function refreshGradientFiles() {
 }
 
 /* ── Progress bar helpers ── */
-function showProgress(current, total, message) {
+function showProgress(current, total, message, history = []) {
   progressContainer.style.display = 'flex';
   if (total > 0) {
     const pct = Math.round((current / total) * 100);
@@ -494,6 +696,38 @@ function showProgress(current, total, message) {
     progressFill.classList.add('indeterminate');
     progressText.textContent = message || '';
   }
+
+  if (Array.isArray(history) && history.length) {
+    progressHistory = history.map((entry) => ({
+      ...entry,
+      ts: Math.round((entry.ts || Date.now() / 1000) * 1000),
+    }));
+  }
+  const vpFill = document.getElementById('viewport-progress-fill');
+  const vpText = document.getElementById('viewport-progress-text');
+  const vpMsg = document.querySelector('#viewport-loader .loader-msg');
+  const vpElapsed = document.getElementById('viewport-progress-elapsed');
+  const latestEvent = progressHistory.length ? [...progressHistory].sort((a, b) => b.ts - a.ts)[0] : null;
+  if (vpFill) {
+    if (total > 0) {
+      vpFill.style.width = Math.round((current / total) * 100) + '%';
+      vpFill.classList.remove('indeterminate');
+    } else {
+      vpFill.classList.add('indeterminate');
+      vpFill.style.width = '30%';
+    }
+  }
+  if (vpText) {
+    vpText.textContent = total > 0 ? `${current}/${total}` : 'Working';
+  }
+  if (vpMsg && message) {
+    vpMsg.textContent = message;
+  }
+  if (vpElapsed && latestEvent) {
+    const ageSec = Math.max(0, Math.floor((Date.now() - latestEvent.ts) / 1000));
+    vpElapsed.textContent = `${ageSec}s`;
+  }
+  renderProgressHistory();
 }
 
 function hideProgress() {
@@ -501,6 +735,8 @@ function hideProgress() {
   progressFill.style.width = '0%';
   progressFill.classList.remove('indeterminate');
   progressText.textContent = '';
+  progressHistory = [];
+  renderProgressHistory();
 }
 
 function startProgressStream() {
@@ -509,16 +745,8 @@ function startProgressStream() {
   progressSSE.onmessage = (e) => {
     try {
       const data = JSON.parse(e.data);
-      if (data.total > 0) {
-        showProgress(data.current, data.total, data.message);
-        setStatus(data.message, true);
-        const vpFill = document.getElementById('viewport-progress-fill');
-        const vpText = document.getElementById('viewport-progress-text');
-        const vpMsg = document.querySelector('#viewport-loader .loader-msg');
-        if (vpFill) vpFill.style.width = Math.round((data.current / data.total) * 100) + '%';
-        if (vpText) vpText.textContent = `${data.current}/${data.total}`;
-        if (vpMsg) vpMsg.textContent = data.message;
-      }
+      showProgress(data.current, data.total, data.message, data.history || []);
+      setStatus(data.message || 'Working...', true);
     } catch (_) {}
   };
   progressSSE.onerror = () => {
@@ -655,6 +883,29 @@ if (startSimBtn) {
   startSimBtn.addEventListener('click', startPhysicsSim);
 }
 
+dirSelectBtn?.addEventListener('click', withLoading(dirSelectBtn, async () => {
+  await applyPartsDir(dirBrowseState.selected || dirBrowseState.current);
+}));
+dirUpBtn?.addEventListener('click', async () => {
+  if (dirBrowseState.parent) await browseDirectory(dirBrowseState.parent);
+});
+dirRootBtn?.addEventListener('click', async () => {
+  await browseDirectory(dirBrowseState.root || '.');
+});
+dirCloseBtn?.addEventListener('click', closeDirOverlay);
+dirCancelBtn?.addEventListener('click', closeDirOverlay);
+dirOverlay?.addEventListener('click', (event) => {
+  if (event.target === dirOverlay) closeDirOverlay();
+});
+
+document.querySelectorAll('[data-tooltip]').forEach((el) => {
+  el.addEventListener('mouseenter', () => showTooltip(el));
+  el.addEventListener('focus', () => showTooltip(el));
+  el.addEventListener('mouseleave', hideTooltip);
+  el.addEventListener('blur', hideTooltip);
+  el.addEventListener('mousemove', () => positionTooltip(el));
+});
+
 // Gradient capability
 document.getElementById('refresh-gradient-files').addEventListener('click', refreshGradientFiles);
 document.getElementById('run-gradient-capability').addEventListener('click', withLoading(
@@ -688,6 +939,11 @@ document.getElementById('run-gradient-capability').addEventListener('click', wit
 
 /* ── Keyboard shortcut: Ctrl+L = load ── */
 document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && dirOverlay && !dirOverlay.classList.contains('hidden')) {
+    closeDirOverlay();
+    hideTooltip();
+    return;
+  }
   if (e.ctrlKey && e.key === 'l') {
     e.preventDefault();
     document.getElementById('load-selected').click();
