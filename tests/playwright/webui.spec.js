@@ -1,4 +1,39 @@
 const { test, expect } = require('@playwright/test');
+const { execFileSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+
+const ARTIFACT_DIR = path.resolve('.webui_cache', 'playwright_artifacts');
+const ROOT_OUTER_STEP_SCREENSHOT = path.join(ARTIFACT_DIR, 'root-outer-step-visible.png');
+
+function ensureArtifactDirs() {
+  fs.mkdirSync(ARTIFACT_DIR, { recursive: true });
+}
+
+async function expectViewportToShowModel(page, screenshotPath) {
+  ensureArtifactDirs();
+  await page.locator('#main-canvas').screenshot({ path: screenshotPath });
+  const metrics = JSON.parse(execFileSync('.venv/bin/python', ['-c', `
+import json, math, sys
+from PIL import Image
+
+img = Image.open(sys.argv[1]).convert("RGB")
+w, h = img.size
+bg = img.getpixel((min(8, w - 1), min(8, h - 1)))
+changed = 0
+total = 0
+stride = 2
+for y in range(0, h, stride):
+    for x in range(0, w, stride):
+        total += 1
+        px = img.getpixel((x, y))
+        dist = math.sqrt(sum((px[i] - bg[i]) ** 2 for i in range(3)))
+        if dist > 18:
+            changed += 1
+print(json.dumps({"changed": changed, "total": total}))
+  `, screenshotPath], { encoding: 'utf8' }).trim());
+  expect(metrics.changed / metrics.total).toBeGreaterThan(0.005);
+}
 
 async function openModelDirectory(page) {
   await page.getByRole('button', { name: /change dir/i }).click();
@@ -138,6 +173,10 @@ test.describe('CAD Cutter web UI', () => {
     await expect(page.locator('#status')).toContainText(/loaded|scene ready/i);
     await expect(page.locator('#thumbnails .thumb')).toHaveCount(2);
     await expect(page.locator('.toast-error')).toHaveCount(0);
+    await expectViewportToShowModel(page, ROOT_OUTER_STEP_SCREENSHOT);
+    await page.locator('#debug-toggle').click();
+    await expect(page.locator('#debug-log')).toContainText('Using scene payload returned from load');
+    await expect(page.locator('#debug-log')).not.toContainText('/api/mesh-payload?path=outer_1.STEP');
   });
 
   test('auto-orients outer STEP sections through the browser without hanging', async ({ page }) => {

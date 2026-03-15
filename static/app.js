@@ -47,7 +47,6 @@ let tileView  = false;
 let mainCtx   = null;
 let progressSSE = null;
 let mainAnimation = null;
-let thumbAnimations = [];
 let dirBrowseState = { root: '.', current: '.', parent: null, directories: [], selected: '.' };
 let refreshFilesRequestId = 0;
 let progressHistory = [];
@@ -64,6 +63,7 @@ let debugFlushInFlight = false;
 let geometryCache = new WeakMap();
 let remoteGeometryCache = new Map();
 let thumbRenderGeneration = 0;
+const MAX_WEBGL_THUMBNAILS = 8;
 const stlLoader = new STLLoader();
 const STAGE_TIMEOUT_MS = {
   auto_orient: 15000,
@@ -223,8 +223,8 @@ function stopMainAnimation() {
 }
 
 function stopThumbAnimations() {
-  thumbAnimations.forEach((stop) => stop());
-  thumbAnimations = [];
+  // Thumbnails are rendered as static snapshots so they do not keep live WebGL
+  // contexts around and starve the main viewport on large assemblies.
 }
 
 function showTooltip(target) {
@@ -400,8 +400,12 @@ function updateProgressLogCollapsedState() {
 }
 
 /* ── Three.js helpers ── */
-function buildRenderer(container) {
-  const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+function buildRenderer(container, options = {}) {
+  const renderer = new THREE.WebGLRenderer({
+    antialias: true,
+    alpha: false,
+    preserveDrawingBuffer: !!options.preserveDrawingBuffer,
+  });
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.setSize(container.clientWidth, container.clientHeight);
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -413,7 +417,7 @@ function buildRenderer(container) {
 
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x111821);
-  scene.fog = new THREE.FogExp2(0x111821, 0.00055);
+  scene.fog = new THREE.FogExp2(0x111821, 0.00008);
 
   const camera = new THREE.PerspectiveCamera(
     45, container.clientWidth / container.clientHeight, 0.1, 10000
@@ -449,6 +453,30 @@ function buildRenderer(container) {
   scene.add(grid);
 
   return { renderer, scene, camera, controls, grid };
+}
+
+function disposeRenderer(ctx) {
+  if (!ctx) return;
+  try {
+    ctx.controls?.dispose?.();
+  } catch (_) {
+    // noop
+  }
+  try {
+    ctx.renderer?.dispose?.();
+  } catch (_) {
+    // noop
+  }
+  try {
+    ctx.renderer?.forceContextLoss?.();
+  } catch (_) {
+    // noop
+  }
+  try {
+    ctx.renderer?.domElement?.remove?.();
+  } catch (_) {
+    // noop
+  }
 }
 
 function geometryFromPayload(payload) {
@@ -536,11 +564,18 @@ function thumbPayloadForPart(part) {
 }
 
 async function loadRemoteGeometry(part) {
-  if (!part?.meshUrl || part.meshFormat !== 'stl') return null;
+  if (!part?.meshUrl) return null;
   const cached = remoteGeometryCache.get(part.meshUrl);
   if (cached) return cached;
-  const geometry = await stlLoader.loadAsync(part.meshUrl);
-  geometry.computeVertexNormals();
+  let geometry = null;
+  if (part.meshFormat === 'stl') {
+    geometry = await stlLoader.loadAsync(part.meshUrl);
+    geometry.computeVertexNormals();
+  } else if (part.meshFormat === 'payload') {
+    const payload = await api(part.meshUrl, { timeoutMs: 30000 });
+    geometry = geometryFromPayload(payload);
+  }
+  if (!geometry) return null;
   remoteGeometryCache.set(part.meshUrl, geometry);
   return geometry;
 }
@@ -594,15 +629,52 @@ function geometryForPart(part, context) {
 }
 
 function fitCamera(camera, controls, group) {
+  const fallbackCenter = new THREE.Vector3(0, 0, 0);
+  const fallbackDistance = 240;
+  group.updateMatrixWorld(true);
+
   const box = new THREE.Box3().setFromObject(group);
-  const size = box.getSize(new THREE.Vector3()).length() || 1;
-  const center = box.getCenter(new THREE.Vector3());
-  controls.target.copy(center);
-  camera.position.copy(center.clone().add(new THREE.Vector3(size * 0.9, size * 0.7, size * 0.9)));
-  camera.near = Math.max(0.1, size / 1000);
-  camera.far = Math.max(5000, size * 10);
+  const center = box.isEmpty() ? fallbackCenter.clone() : box.getCenter(new THREE.Vector3());
+  const sizeVec = box.isEmpty() ? new THREE.Vector3(1, 1, 1) : box.getSize(new THREE.Vector3());
+  const size = sizeVec.length() || 1;
+  const sphere = box.isEmpty() ? { radius: 1 } : box.getBoundingSphere(new THREE.Sphere());
+  const radius = Math.max(sphere.radius || 1, 1);
+  const fovRad = THREE.MathUtils.degToRad(camera.fov || 45);
+  const aspect = Math.max(camera.aspect || 1, 1e-3);
+  const fitHeight = radius / Math.sin(Math.max(1e-3, fovRad / 2));
+  const horizontalFov = 2 * Math.atan(Math.tan(fovRad / 2) * aspect);
+  const fitWidth = radius / Math.sin(Math.max(1e-3, horizontalFov / 2));
+  const distance = Math.max(
+    fallbackDistance,
+    fitHeight * 1.15,
+    fitWidth * 1.15,
+  );
+  const direction = new THREE.Vector3(1, 0.72, 1).normalize();
+  const nextPosition = center.clone().addScaledVector(direction, distance);
+
+  if (!Number.isFinite(center.x) || !Number.isFinite(center.y) || !Number.isFinite(center.z)) {
+    controls.target.copy(fallbackCenter);
+    camera.position.set(fallbackDistance, fallbackDistance * 0.72, fallbackDistance);
+  } else if (!Number.isFinite(nextPosition.x) || !Number.isFinite(nextPosition.y) || !Number.isFinite(nextPosition.z)) {
+    controls.target.copy(center);
+    camera.position.set(center.x + fallbackDistance, center.y + (fallbackDistance * 0.72), center.z + fallbackDistance);
+  } else {
+    controls.target.copy(center);
+    camera.position.copy(nextPosition);
+  }
+
+  camera.near = Math.max(0.1, distance / 500);
+  camera.far = Math.max(5000, distance * 12, size * 8);
   camera.updateProjectionMatrix();
   controls.update();
+}
+
+function updateSceneAtmosphere(ctx, group) {
+  if (!ctx?.scene?.fog || !group) return;
+  group.updateMatrixWorld(true);
+  const box = new THREE.Box3().setFromObject(group);
+  const sceneSize = box.isEmpty() ? 1 : (box.getSize(new THREE.Vector3()).length() || 1);
+  ctx.scene.fog.density = Math.min(0.00018, Math.max(0.00001, 1 / (sceneSize * 18)));
 }
 
 function animate(ctx, frameHook = null) {
@@ -670,6 +742,7 @@ function renderMain() {
 
   mainCtx.scene.add(group);
   fitCamera(mainCtx.camera, mainCtx.controls, group);
+  updateSceneAtmosphere(mainCtx, group);
   mainCtx.renderer.render(mainCtx.scene, mainCtx.camera);
   removeViewportLoader();
   addDebugLog('render-ready', `Rendered ${tileView ? 'tile' : 'combined'} view`, {
@@ -705,6 +778,7 @@ function startPhysicsSim() {
 
   ctx.scene.add(group);
   fitCamera(ctx.camera, ctx.controls, group);
+  updateSceneAtmosphere(ctx, group);
   setBusy('Physics sim running...');
 
   const gravity = -260;
@@ -738,7 +812,7 @@ function startPhysicsSim() {
 }
 
 /* ── Thumbnails ── */
-function buildThumb(part, idx, deferPreview = false) {
+function buildThumb(part, idx, deferPreview = false, skipPreview = false) {
   const wrap = document.createElement('div');
   wrap.className = 'thumb';
 
@@ -763,6 +837,14 @@ function buildThumb(part, idx, deferPreview = false) {
 
   const canvas = wrap.querySelector('.thumb-canvas');
   const renderPreview = () => {
+    if (skipPreview) {
+      canvas.innerHTML = `
+        <div class="thumb-placeholder">
+          <span class="thumb-placeholder-title">Assembly mode</span>
+          <span class="thumb-placeholder-copy">3D thumbnails are skipped on large assemblies to protect the main viewport.</span>
+        </div>`;
+      return;
+    }
     const thumbPayload = thumbPayloadForPart(part);
     if (isLargeThumbPayload(thumbPayload)) {
       canvas.innerHTML = `
@@ -772,26 +854,32 @@ function buildThumb(part, idx, deferPreview = false) {
         </div>`;
       return;
     }
-    const ctx = buildRenderer(canvas);
+    const ctx = buildRenderer(canvas, { preserveDrawingBuffer: true });
     if (ctx.grid) ctx.scene.remove(ctx.grid);
     const showMesh = (mesh) => {
       ctx.scene.add(mesh);
       fitCamera(ctx.camera, ctx.controls, mesh);
       ctx.renderer.render(ctx.scene, ctx.camera);
-      const stopThumbAnimation = animate(ctx);
-      thumbAnimations.push(stopThumbAnimation);
+      const image = document.createElement('img');
+      image.className = 'thumb-image';
+      image.alt = `${part.name} preview`;
+      image.src = ctx.renderer.domElement.toDataURL('image/png');
+      canvas.innerHTML = '';
+      canvas.appendChild(image);
+      disposeRenderer(ctx);
     };
     if (part.meshGeometry) {
       showMesh(applyPartTransforms(buildVisualFromGeometry(part.meshGeometry), part));
     } else if (thumbPayload) {
       showMesh(applyPartTransforms(buildVisualFromGeometry(geometryFromPayload(thumbPayload)), part));
-    } else if (part.meshUrl && part.meshFormat === 'stl') {
+    } else if (part.meshUrl) {
       loadRemoteGeometry(part)
         .then((geometry) => {
           part.meshGeometry = geometry;
           showMesh(applyPartTransforms(buildVisualFromGeometry(geometry), part));
         })
         .catch((error) => {
+          disposeRenderer(ctx);
           canvas.innerHTML = `
             <div class="thumb-placeholder">
               <span class="thumb-placeholder-title">Preview failed</span>
@@ -799,6 +887,7 @@ function buildThumb(part, idx, deferPreview = false) {
             </div>`;
         });
     } else {
+      disposeRenderer(ctx);
       canvas.innerHTML = `
         <div class="thumb-placeholder">
           <span class="thumb-placeholder-title">No preview mesh</span>
@@ -857,12 +946,13 @@ function renderThumbs() {
   }
   partCountEl.textContent = `${sceneData.parts.length} part${sceneData.parts.length !== 1 ? 's' : ''}`;
   const generation = ++thumbRenderGeneration;
+  const skipPreview = sceneData.parts.length > MAX_WEBGL_THUMBNAILS;
   const queue = sceneData.parts.map((part, idx) => ({ part, idx }));
   const renderNext = () => {
     if (generation !== thumbRenderGeneration) return;
     const next = queue.shift();
     if (!next) return;
-    buildThumb(next.part, next.idx, true);
+    buildThumb(next.part, next.idx, true, skipPreview);
     if (queue.length) {
       window.setTimeout(renderNext, 0);
     }
@@ -950,6 +1040,46 @@ async function refreshFiles() {
 
 async function changePartsDir() {
   openDirOverlay();
+}
+
+async function loadSelectedParts(explicitFiles = null) {
+  const files = Array.isArray(explicitFiles) ? explicitFiles : [...fileList.querySelectorAll('input:checked')].map(x => x.value);
+  if (files.length === 0) {
+    toast('Select at least one file to load', 'warning');
+    return;
+  }
+  addDebugLog('load-click', 'Load selected triggered', { files });
+  setBusy('Loading parts...');
+  showViewportLoader('Loading parts...');
+  startStallWatchdog('load-selected');
+  try {
+    const loadResult = await api('/api/load', {
+      method: 'POST',
+      body: JSON.stringify({ files, include_scene: true }),
+      timeoutMs: 30000,
+    });
+    addDebugLog('load-click', 'Load API complete', { files });
+    toast(`Loaded ${files.length} part${files.length !== 1 ? 's' : ''}`, 'success');
+    setIdle(`${files.length} part${files.length !== 1 ? 's' : ''} loaded`);
+    if (loadResult?.scene) {
+      addDebugLog('scene-refresh', 'Using scene payload returned from load', {
+        parts: loadResult.scene.parts?.length || 0,
+        combined: loadResult.scene.combined?.length || 0,
+      });
+      sceneData = loadResult.scene;
+      await ensureSceneMeshes(sceneData, 'load-inline');
+      renderMain();
+      renderThumbs();
+    } else {
+      await refreshScene();
+    }
+  } catch (e) {
+    addDebugLog('load-error', e.message, { files });
+    removeViewportLoader();
+    stopProgressStream();
+    setIdle();
+    toast('Failed to load parts: ' + e.message, 'error');
+  }
 }
 
 async function fetchDirectoryListing(path = '.') {
@@ -1197,7 +1327,7 @@ browsePartInput.addEventListener('change', withLoading(
       await refreshFiles();
       const checkbox = [...fileList.querySelectorAll('input')].find((el) => el.value === file.name);
       if (checkbox) checkbox.checked = true;
-      document.getElementById('load-selected').click();
+      await loadSelectedParts([file.name]);
     } catch (e) {
       setIdle();
       toast('Upload failed: ' + e.message, 'error');
@@ -1209,43 +1339,7 @@ browsePartInput.addEventListener('change', withLoading(
 document.getElementById('load-selected').addEventListener('click', withLoading(
   document.getElementById('load-selected'),
   async () => {
-    const files = [...fileList.querySelectorAll('input:checked')].map(x => x.value);
-    if (files.length === 0) {
-      toast('Select at least one file to load', 'warning');
-      return;
-    }
-    addDebugLog('load-click', 'Load selected triggered', { files });
-    setBusy('Loading parts...');
-    showViewportLoader('Loading parts...');
-    startStallWatchdog('load-selected');
-    try {
-      const loadResult = await api('/api/load', {
-        method: 'POST',
-        body: JSON.stringify({ files, include_scene: true }),
-        timeoutMs: 30000,
-      });
-      addDebugLog('load-click', 'Load API complete', { files });
-      toast(`Loaded ${files.length} part${files.length !== 1 ? 's' : ''}`, 'success');
-      setIdle(`${files.length} part${files.length !== 1 ? 's' : ''} loaded`);
-      if (loadResult?.scene) {
-        addDebugLog('scene-refresh', 'Using scene payload returned from load', {
-          parts: loadResult.scene.parts?.length || 0,
-          combined: loadResult.scene.combined?.length || 0,
-        });
-        sceneData = loadResult.scene;
-        await ensureSceneMeshes(sceneData, 'load-inline');
-        renderMain();
-        renderThumbs();
-      } else {
-        await refreshScene();
-      }
-    } catch (e) {
-      addDebugLog('load-error', e.message, { files });
-      removeViewportLoader();
-      stopProgressStream();
-      setIdle();
-      toast('Failed to load parts: ' + e.message, 'error');
-    }
+    await loadSelectedParts();
   }
 ));
 
