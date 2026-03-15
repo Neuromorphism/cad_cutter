@@ -1,11 +1,28 @@
 #!/usr/bin/env python3
 """Regression tests for the Flask web UI error handling."""
 
+import math
+from pathlib import Path
+
 import cadquery as cq
 import pytest
 
 import assemble
 import web_ui
+
+
+TEST_MODEL_DIR = Path(__file__).resolve().parent / "test_models" / "conic_capsule_topopt_8"
+
+
+def _world_bbox(entry):
+    shape = entry[1]
+    loc = entry[2]
+    tx, ty, tz = loc.toTuple()[0]
+    xmin, ymin, zmin, xmax, ymax, zmax = assemble.get_tight_bounding_box(shape)
+    return (
+        xmin + tx, ymin + ty, zmin + tz,
+        xmax + tx, ymax + ty, zmax + tz,
+    )
 
 
 @pytest.fixture
@@ -211,6 +228,29 @@ def test_scene_reuses_cached_preview_mesh_after_auto_orient(client, monkeypatch)
     assert scene["parts"][0]["orientationSteps"]
 
 
+def test_orientation_payload_reuses_preview_mesh_after_runtime_transform(client, monkeypatch):
+    client, tmp_path = client
+
+    step_path = tmp_path / "outer_1.step"
+    cq.exporters.export(cq.Workplane("XY").cylinder(30, 8), str(step_path))
+
+    load_resp = client.post("/api/load", json={"files": ["outer_1.step"], "include_scene": True})
+    assert load_resp.status_code == 200
+
+    part = web_ui.state.parts[0]
+    part.orientation_steps = [((0.0, 1.0, 0.0), math.pi / 2.0)]
+    part.rot_xyz = (0.0, 0.0, 15.0)
+    part.manual_scale = 1.1
+
+    def fail_mesh_payload(_shape, tolerance=0.5):
+        raise AssertionError(f"unexpected tessellation at tolerance {tolerance}")
+
+    monkeypatch.setattr(web_ui, "_mesh_payload", fail_mesh_payload)
+    payload = web_ui._orientation_payload_for_part(part)
+    vertices, _faces = web_ui._payload_arrays(payload)
+    assert len(vertices) > 0
+
+
 def test_auto_drop_stage_returns_timing_metrics_and_persists_offsets(client):
     client, tmp_path = client
 
@@ -232,3 +272,122 @@ def test_auto_drop_stage_returns_timing_metrics_and_persists_offsets(client):
 
     scene = web_ui._build_scene()
     assert len(scene["combined"]) == 2
+
+
+def _load_test_model_dir():
+    return (Path(__file__).resolve().parent / "test_models" / "conic_capsule_topopt_8").resolve()
+
+
+def _bbox_after_location(shape, loc):
+    moved = assemble.apply_location(shape, loc)
+    return assemble.get_tight_bounding_box(moved)
+
+
+def _bbox_contains(outer_bbox, inner_bbox, tol=1.0):
+    return (
+        inner_bbox[0] >= outer_bbox[0] - tol
+        and inner_bbox[1] >= outer_bbox[1] - tol
+        and inner_bbox[2] >= outer_bbox[2] - tol
+        and inner_bbox[3] <= outer_bbox[3] + tol
+        and inner_bbox[4] <= outer_bbox[4] + tol
+        and inner_bbox[5] <= outer_bbox[5] + tol
+    )
+
+
+def _bbox_center(bbox):
+    return (
+        (bbox[0] + bbox[3]) / 2.0,
+        (bbox[1] + bbox[4]) / 2.0,
+        (bbox[2] + bbox[5]) / 2.0,
+    )
+
+
+def test_test_models_two_outer_sections_stack_vertically(client):
+    client, _tmp_path = client
+    web_ui.state.parts_dir = _load_test_model_dir()
+
+    load_resp = client.post("/api/load", json={"files": ["outer_1.step", "outer_2.step"], "include_scene": True})
+    assert load_resp.status_code == 200
+
+    stack_resp = client.post("/api/stage/auto_stack", json={})
+    assert stack_resp.status_code == 200
+
+    scene = client.get("/api/scene").get_json()
+    offsets = {entry["name"]: entry["offset"] for entry in scene["combined"]}
+    assert offsets["outer_1"][2] == pytest.approx(250.0, abs=1.0)
+    assert offsets["outer_2"][2] == pytest.approx(750.0, abs=1.0)
+    assert offsets["outer_2"][2] > offsets["outer_1"][2]
+
+
+def test_test_models_full_load_uses_deferred_mesh_payloads(client):
+    client, _tmp_path = client
+    web_ui.state.parts_dir = _load_test_model_dir()
+
+    files = [
+        *(f"outer_{i}.step" for i in range(1, 9)),
+        *(f"mid_{i}.step" for i in range(1, 7)),
+        *(f"inner_{i}.step" for i in range(1, 7)),
+    ]
+    load_resp = client.post("/api/load", json={"files": files, "include_scene": True})
+    assert load_resp.status_code == 200
+
+    data = load_resp.get_json()
+    assert data is not None
+    scene = data["scene"]
+    assert len(scene["parts"]) == 20
+    assert len(scene["combined"]) == 20
+    assert all(part["mesh"] is None for part in scene["parts"])
+    assert all(part["meshUrl"] for part in scene["parts"])
+    assert all(part["meshFormat"] == "payload" for part in scene["parts"])
+    assert len(load_resp.data) < 3_000_000
+
+
+def test_repo_outer_step_pair_uses_inline_proxy_meshes(client):
+    client, _tmp_path = client
+    web_ui.state.parts_dir = Path(__file__).resolve().parent
+
+    load_resp = client.post("/api/load", json={"files": ["outer_1.STEP", "outer_2.STEP"], "include_scene": True})
+    assert load_resp.status_code == 200
+
+    data = load_resp.get_json()
+    assert data is not None
+    scene = data["scene"]
+    assert len(scene["parts"]) == 2
+    assert all(part["mesh"] for part in scene["parts"])
+    assert all(part["meshUrl"] is None for part in scene["parts"])
+    assert len(load_resp.data) < 5_000_000
+
+
+def test_test_models_full_backend_stack_nests_outer_mid_inner(client):
+    client, _tmp_path = client
+    web_ui.state.parts_dir = _load_test_model_dir()
+
+    files = [*(f"outer_{i}.step" for i in range(1, 9)), *(f"mid_{i}.step" for i in range(1, 7)), *(f"inner_{i}.step" for i in range(1, 7))]
+    load_resp = client.post("/api/load", json={"files": files, "include_scene": True})
+    assert load_resp.status_code == 200
+
+    axis_vec = assemble.AXIS_MAP["z"]
+    _assy, part_info = assemble.stack_parts(web_ui._parts_for_assembly(), axis_vec, web_ui.state.gap)
+    by_name = {name: (shape, loc) for name, shape, loc, *_rest in part_info}
+
+    outer_z = []
+    for level in range(1, 9):
+        name = f"outer_{level}"
+        bbox = _bbox_after_location(*by_name[name])
+        z_center = (bbox[2] + bbox[5]) / 2.0
+        outer_z.append(z_center)
+    assert outer_z == sorted(outer_z)
+    for lower, upper in zip(outer_z, outer_z[1:]):
+        assert 480.0 <= (upper - lower) <= 520.0
+
+    for level in range(1, 7):
+        outer_bbox = _bbox_after_location(*by_name[f"outer_{level}"])
+        mid_bbox = _bbox_after_location(*by_name[f"mid_{level}"])
+        inner_bbox = _bbox_after_location(*by_name[f"inner_{level}"])
+        assert _bbox_contains(outer_bbox, mid_bbox, tol=2.0)
+        assert _bbox_contains(outer_bbox, inner_bbox, tol=2.0)
+        mid_center = _bbox_center(mid_bbox)
+        inner_center = _bbox_center(inner_bbox)
+        assert mid_center[0] == pytest.approx(inner_center[0], abs=25.0)
+        assert mid_center[1] == pytest.approx(inner_center[1], abs=25.0)
+        assert mid_center[2] == pytest.approx(inner_center[2], abs=60.0)

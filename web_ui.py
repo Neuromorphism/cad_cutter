@@ -39,6 +39,8 @@ SUPPORTED_WORKFLOWS = {
     "cylinder": "Cylinder",
     "generic": "Generic Stack",
 }
+_INLINE_PROXY_PART_LIMIT = 4
+_INLINE_PROXY_NUMBER_LIMIT = 150_000
 
 
 def _safe_resolve(user_path: str) -> Path:
@@ -71,6 +73,25 @@ def _mesh_file_url(path: str | None) -> str | None:
     return f"/api/mesh-file?path={rel}"
 
 
+def _mesh_payload_url(path: str | None) -> str | None:
+    if not path:
+        return None
+    try:
+        rel = _relative_to_cwd(Path(path))
+    except Exception:
+        return None
+    return f"/api/mesh-payload?path={rel}"
+
+
+def _remote_mesh_reference(path: str | None) -> tuple[str | None, str | None]:
+    if not path:
+        return None, None
+    suffix = Path(path).suffix.lower()
+    if suffix == ".stl":
+        return _mesh_file_url(path), "stl"
+    return _mesh_payload_url(path), "payload"
+
+
 def _preview_source_path_for_part(part: "PartState") -> str | None:
     return part.preview_path or part.mesh_source_path or part.file_path
 
@@ -81,6 +102,8 @@ class PartState:
     name: str
     source_ext: str
     shape: Any
+    # The web UI is proxy-first: interactive viewport work uses mesh payloads
+    # derived from these paths, while exact CAD operations run on `shape`.
     mesh_source_path: str | None = None
     preview_path: str | None = None
     preview_ext: str | None = None
@@ -215,6 +238,14 @@ def _payload_from_arrays(vertices: np.ndarray, faces: np.ndarray) -> dict[str, A
         "vertices": np.asarray(vertices, dtype=np.float32).reshape(-1).tolist(),
         "indices": np.asarray(faces, dtype=np.int64).reshape(-1).tolist(),
     }
+
+
+def _transform_payload(payload: dict[str, Any], matrix: np.ndarray) -> dict[str, Any]:
+    vertices, faces = _payload_arrays(payload)
+    if len(vertices) == 0:
+        return payload
+    transformed = np.asarray(vertices, dtype=np.float32) @ np.asarray(matrix, dtype=np.float32).T
+    return _payload_from_arrays(transformed, faces)
 
 
 def _decimate_payload(payload: dict[str, Any], target_triangles: int) -> dict[str, Any]:
@@ -673,14 +704,22 @@ def _sample_vertices(payload: dict[str, Any], limit: int = _ORIENT_VERTEX_LIMIT)
 
 
 def _orientation_payload_for_part(part: PartState, target_triangles: int = _ORIENT_TRIANGLE_TARGET) -> dict[str, Any]:
+    # Orientation is solved on the display proxy, not exact CAD. If the user
+    # has already rotated or scaled the part, apply that transform directly to
+    # the decimated proxy mesh instead of re-tessellating the underlying shape.
     source_path = _preview_source_path_for_part(part)
-    if not _part_has_runtime_transform(part) and source_path:
-        return _load_decimated_mesh_payload(
+    if source_path:
+        payload = _load_decimated_mesh_payload(
             source_path,
             part.shape,
             tolerance=0.8,
             target_triangles=target_triangles,
         )
+        if _part_has_runtime_transform(part):
+            return _transform_payload(payload, _part_linear_transform_matrix(part))
+        return payload
+    if not _part_has_runtime_transform(part):
+        return _decimate_payload(_mesh_payload(part.shape, tolerance=0.8), target_triangles)
     effective_shape = _apply_manual_transforms(part)
     return _decimate_payload(_mesh_payload(effective_shape, tolerance=0.8), target_triangles)
 
@@ -828,6 +867,17 @@ def _preview_part_info(records: list[dict[str, Any]], offsets: list[list[float]]
     return part_info, mesh_payloads
 
 
+def _proxy_payload_number_count(payload: dict[str, Any]) -> int:
+    return len(payload.get("vertices", [])) + len(payload.get("indices", []))
+
+
+def _should_inline_proxy_payloads(records: list[dict[str, Any]]) -> bool:
+    if not records or len(records) > _INLINE_PROXY_PART_LIMIT:
+        return False
+    total_numbers = sum(_proxy_payload_number_count(record["payload"]) for record in records)
+    return total_numbers <= _INLINE_PROXY_NUMBER_LIMIT
+
+
 def _render_preview_assembly_fast(output_path: str, resolution: int = 900, target_triangles: int = 12000) -> None:
     import pyvista as pv
 
@@ -906,6 +956,8 @@ def _export_preview_assembly_mesh(output_path: str) -> None:
 
 
 def _build_fast_mesh_scene() -> dict[str, Any]:
+    # Interactive scenes are proxy-only. The browser receives display meshes and
+    # transform metadata, never exact CAD tessellation generated just for view.
     progress.begin("Scene", len(state.parts) * 2, "Stacking preview meshes for scene...")
     records = []
     for idx, part in enumerate(state.parts, start=1):
@@ -919,12 +971,13 @@ def _build_fast_mesh_scene() -> dict[str, Any]:
         progress.advance(1, f"Prepared preview {idx} of {len(state.parts)}: {part.name}")
 
     offsets = _preview_stack_offsets(records)
+    inline_payloads = _should_inline_proxy_payloads(records)
     combined = []
     part_meshes = []
     for idx, (record, offset) in enumerate(zip(records, offsets), start=1):
         part = record["part"]
-        mesh_url = _mesh_file_url(record["source_path"]) if record["mesh_ext"] == ".stl" else None
-        use_mesh_url = bool(mesh_url)
+        mesh_url, mesh_format = _remote_mesh_reference(record["source_path"])
+        use_mesh_url = bool(mesh_url) and not (inline_payloads and mesh_format == "payload")
         part_meshes.append({
             "name": part.name,
             "filePath": part.file_path,
@@ -942,8 +995,8 @@ def _build_fast_mesh_scene() -> dict[str, Any]:
             "material": part.material,
             "mesh": None if use_mesh_url else record["payload"],
             "thumbMesh": _preview_thumb_payload_for_part(part),
-            "meshUrl": mesh_url,
-            "meshFormat": "stl" if use_mesh_url else None,
+            "meshUrl": mesh_url if use_mesh_url else None,
+            "meshFormat": mesh_format if use_mesh_url else None,
         })
         settle = np.asarray(part.settle_offset, dtype=float)
         combined.append({
@@ -958,6 +1011,7 @@ def _build_fast_mesh_scene() -> dict[str, Any]:
     _record_debug_log("server", "scene-fast-path", "Used preview mesh fast path", {
         "parts": [part.name for part in state.parts],
         "axis": state.axis,
+        "inlinePayloads": inline_payloads,
     })
     _record_debug_log("server", "scene-done", "Scene payload ready", {
         "parts": len(part_meshes),
@@ -1251,6 +1305,9 @@ def _build_scene() -> dict[str, Any]:
     stack_parts = _parts_for_stack()
     if not stack_parts:
         return {"parts": [], "combined": []}
+    # Normal browser rendering should stay on the proxy mesh path. The slow path
+    # exists only as a fallback for synthetic states that lack file-backed
+    # meshes, not for ordinary user-loaded models.
     if _can_use_fast_mesh_scene(state.parts):
         return _build_fast_mesh_scene()
     _record_debug_log("server", "scene-start", "Building scene payload", {
@@ -1267,12 +1324,16 @@ def _build_scene() -> dict[str, Any]:
     part_index_by_name = {entry[1]: entry[4] for entry in stack_parts}
     for idx, (entry, part_state) in enumerate(zip(stack_parts, state.parts), start=1):
         can_reuse_cached_mesh = bool(part_state.mesh_source_path)
+        mesh_url, mesh_format = _remote_mesh_reference(part_state.mesh_source_path)
+        use_mesh_url = can_reuse_cached_mesh and bool(mesh_url)
         with _SlowProgressDetail(
             f"Preparing preview {idx} of {len(state.parts)}: {part_state.name}",
             lambda elapsed, i=idx, name=part_state.name:
                 f"Tessellating preview {i} of {len(state.parts)}: {name} ({elapsed:.0f}s)",
         ):
-            if can_reuse_cached_mesh:
+            if use_mesh_url:
+                mesh = None
+            elif can_reuse_cached_mesh:
                 mesh = _load_mesh_payload_from_cache_file(
                     part_state.mesh_source_path,
                     entry[0].val().wrapped,
@@ -1295,6 +1356,8 @@ def _build_scene() -> dict[str, Any]:
             "scale": part_state.manual_scale,
             "material": part_state.material,
             "mesh": mesh,
+            "meshUrl": mesh_url if use_mesh_url else None,
+            "meshFormat": mesh_format if use_mesh_url else None,
             "thumbMesh": (
                 _load_decimated_mesh_payload(
                     part_state.mesh_source_path,
@@ -1427,6 +1490,33 @@ def mesh_file():
     if path.suffix.lower() not in assemble.MESH_EXTENSIONS:
         return jsonify({"error": f"unsupported mesh extension: {path.suffix}"}), 400
     return send_file(path, conditional=True)
+
+
+@app.route("/api/mesh-payload")
+def mesh_payload():
+    raw_path = request.args.get("path", "")
+    if not raw_path:
+        return jsonify({"error": "missing path"}), 400
+    _record_debug_log("server", "mesh-payload-start", "Building proxy mesh payload", {"path": raw_path})
+    try:
+        path = _safe_resolve(raw_path)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 403
+    if not path.exists() or not path.is_file():
+        return jsonify({"error": f"file not found: {raw_path}"}), 404
+    if path.suffix.lower() not in assemble.ALL_EXTENSIONS:
+        return jsonify({"error": f"unsupported geometry extension: {path.suffix}"}), 400
+    try:
+        wp, _name = _load_cached_part(str(path), require_solid=False)
+        payload = _load_mesh_payload_from_cache_file(str(path), wp.val().wrapped)
+    except Exception as exc:
+        app.logger.exception("Failed to build mesh payload for '%s'", path)
+        return jsonify({"error": f"failed to build mesh payload: {exc}"}), 400
+    _record_debug_log("server", "mesh-payload-done", "Proxy mesh payload ready", {
+        "path": raw_path,
+        "numbers": _proxy_payload_number_count(payload),
+    })
+    return jsonify(payload)
 
 
 @app.route("/api/progress/stream")
