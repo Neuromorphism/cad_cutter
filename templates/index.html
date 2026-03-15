@@ -43,7 +43,7 @@
             <option value="z" selected>Z</option>
           </select>
         </label>
-        <label>Gap
+        <label title="Positive gap leaves clearance; negative gap allows a slight interference fit during autodrop">Gap
           <input id="gap-input" type="number" step="0.1" value="0" />
         </label>
         <label>Section
@@ -60,7 +60,7 @@
     <aside>
 
       <!-- File browser -->
-      <div class="sidebar-section">
+      <div class="sidebar-section" data-workflows="cylinder">
         <div class="section-header">
           <span class="icon">&#x1F4C2;</span> Available Parts
         </div>
@@ -87,6 +87,23 @@
           <button data-stage="render_whole" data-workflows="cylinder,generic"><span class="stage-num">7</span> Render assembly</button>
           <button data-stage="export_whole" data-workflows="cylinder,generic"><span class="stage-num">8</span> Export assembly</button>
         </div>
+      </div>
+
+      <div class="sidebar-section">
+        <div class="section-header">
+          <span class="icon">&#x1F9EC;</span> Midlayer Design
+        </div>
+        <p class="section-copy">
+          Requires matching <code>outer_*</code> and <code>inner_*</code> section pairs. The web UI builds a proxy design volume between them and runs the selected solver scaffold.
+        </p>
+        <div class="stages">
+          <button data-stage="design_midlayer_dl4to" data-workflows="cylinder"><span class="stage-num">M1</span> Design midlayer (DL4TO)</button>
+          <button data-stage="design_midlayer_pymoto" data-workflows="cylinder"><span class="stage-num">M2</span> Design midlayer (pyMOTO)</button>
+        </div>
+        <details id="midlayer-config-panel" class="config-panel">
+          <summary>Midlayer Design Configuration</summary>
+          <div id="midlayer-config-forms" class="config-panel-body"></div>
+        </details>
       </div>
 
       <!-- Gradient capability -->
@@ -208,6 +225,8 @@
   </div>
 
   <div id="ui-tooltip" class="ui-tooltip hidden" role="tooltip"></div>
+
+<script id="midlayer-solver-data" type="application/json">{{ {"solvers": midlayer_solvers, "configs": midlayer_configs}|tojson }}</script>
 
 <script type="module" src="/static/app.js"></script>
 </body>

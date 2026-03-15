@@ -207,4 +207,19 @@ test.describe('CAD Cutter web UI', () => {
     await page.locator('#debug-toggle').click();
     await expect(page.locator('#debug-log')).toContainText('Exported web_assembly.step');
   });
+
+  test('designs midlayers through both solver buttons without hanging', async ({ page }) => {
+    await page.goto('/');
+    await openModelDirectory(page);
+    await loadParts(page, ['outer_1.step', 'inner_1.step']);
+
+    await expect(page.getByText('Midlayer Design Configuration')).toBeVisible();
+    await runStage(page, 'Design midlayer \\(DL4TO\\)', { timeout: 45000 });
+    await expect(page.locator('#part-count')).toContainText('3 parts');
+    await expect(page.locator('#thumbnails')).toContainText('mid_1_dl4to');
+
+    await runStage(page, 'Design midlayer \\(pyMOTO\\)', { timeout: 45000 });
+    await expect(page.locator('#part-count')).toContainText('3 parts');
+    await expect(page.locator('#thumbnails')).toContainText('mid_1_pymoto');
+  });
 });

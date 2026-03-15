@@ -211,6 +211,17 @@ aside {
   opacity: .7;
 }
 
+.section-copy {
+  color: var(--text-muted);
+  font-size: .76rem;
+  margin-bottom: 10px;
+}
+
+.section-copy code {
+  font-size: .74rem;
+  color: #b6d6ff;
+}
+
 /* ── File list ── */
 #file-list {
   max-height: 220px;
@@ -315,6 +326,95 @@ aside {
   background: var(--accent);
   border-color: var(--accent);
   color: #fff;
+}
+
+.config-panel {
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: rgba(13, 17, 23, 0.55);
+  overflow: hidden;
+}
+
+.config-panel summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 9px 10px;
+  font-size: .8rem;
+  font-weight: 600;
+  color: var(--text);
+  background: var(--bg-raised);
+}
+
+.config-panel summary::-webkit-details-marker {
+  display: none;
+}
+
+.config-panel-body {
+  display: grid;
+  gap: 12px;
+  padding: 10px;
+}
+
+.solver-config {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(22, 27, 34, 0.92);
+  padding: 10px;
+}
+
+.solver-config-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.solver-config-header h4 {
+  font-size: .84rem;
+  margin-bottom: 2px;
+}
+
+.solver-config-header p {
+  color: var(--text-muted);
+  font-size: .72rem;
+}
+
+.solver-chip {
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: .68rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  white-space: nowrap;
+}
+
+.solver-chip.ok {
+  color: #9fe0ae;
+  background: rgba(63, 185, 80, 0.16);
+  border: 1px solid rgba(63, 185, 80, 0.28);
+}
+
+.solver-chip.fallback {
+  color: #f1d78a;
+  background: rgba(210, 153, 34, 0.16);
+  border: 1px solid rgba(210, 153, 34, 0.28);
+}
+
+.solver-config-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.solver-config-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--text-muted);
+  font-size: .73rem;
 }
 
 /* ── Gradient section ── */
