@@ -28,10 +28,13 @@ from werkzeug.exceptions import HTTPException
 from OCP.BRepBuilderAPI import BRepBuilderAPI_GTransform, BRepBuilderAPI_Transform
 from OCP.TopAbs import TopAbs_FACE
 from OCP.TopExp import TopExp_Explorer
-from OCP.gp import gp_Ax1, gp_Dir, gp_GTrsf, gp_Pnt, gp_Trsf
+from OCP.gp import gp_Ax1, gp_Dir, gp_GTrsf, gp_Pnt, gp_Trsf, gp_Vec
 
 import assemble
 from assemble import progress
+from topopt_midlayer import get_adapter as get_topopt_adapter
+from topopt_midlayer import get_solver_defaults as get_topopt_solver_defaults
+from topopt_midlayer import MidlayerSectionInput
 
 SUPPORTED_EXT = assemble.ALL_EXTENSIONS
 GRADIENT_EXT = {".wrl", ".vrml", ".stl", ".3mf"}
@@ -41,6 +44,8 @@ SUPPORTED_WORKFLOWS = {
 }
 _INLINE_PROXY_PART_LIMIT = 4
 _INLINE_PROXY_NUMBER_LIMIT = 150_000
+_FULL_SCENE_PROXY_PART_LIMIT = 2
+_FULL_SCENE_PROXY_NUMBER_LIMIT = 140_000
 
 
 def _safe_resolve(user_path: str) -> Path:
@@ -112,6 +117,7 @@ class PartState:
     auto_oriented: bool = False
     orientation_steps: list[tuple[tuple[float, float, float], float]] = field(default_factory=list)
     settle_offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    manual_translate: tuple[float, float, float] = (0.0, 0.0, 0.0)
     rot_xyz: tuple[float, float, float] = (0.0, 0.0, 0.0)
     manual_scale: float = 1.0
 
@@ -126,6 +132,12 @@ class SessionState:
     fine_orient: bool = False
     cut_angle: float = 90.0
     section_number: int | None = None
+    midlayer_configs: dict[str, dict[str, Any]] = field(
+        default_factory=lambda: {
+            solver_id: dict(data["defaults"])
+            for solver_id, data in get_topopt_solver_defaults().items()
+        }
+    )
 
 
 state = SessionState()
@@ -140,9 +152,18 @@ _WEBUI_CACHE_DIR = Path(".webui_cache")
 _DEBUG_LOG: collections.deque[dict[str, Any]] = collections.deque(maxlen=400)
 _DEBUG_LOG_LOCK = threading.Lock()
 _DEBUG_LOG_PATH = _WEBUI_CACHE_DIR / "debug_log.jsonl"
+_SCENE_TRIANGLE_TARGET = 1500
 _THUMB_TRIANGLE_TARGET = 2500
 _ORIENT_TRIANGLE_TARGET = 4000
 _ORIENT_VERTEX_LIMIT = 12000
+_MIDLAYER_TRIANGLE_TARGET = 8000
+
+
+def _default_midlayer_configs() -> dict[str, dict[str, Any]]:
+    return {
+        solver_id: dict(data["defaults"])
+        for solver_id, data in get_topopt_solver_defaults().items()
+    }
 
 
 def _compute_webui_version() -> str:
@@ -238,6 +259,15 @@ def _payload_from_arrays(vertices: np.ndarray, faces: np.ndarray) -> dict[str, A
         "vertices": np.asarray(vertices, dtype=np.float32).reshape(-1).tolist(),
         "indices": np.asarray(faces, dtype=np.int64).reshape(-1).tolist(),
     }
+
+
+def _payload_to_trimesh(payload: dict[str, Any]) -> trimesh.Trimesh:
+    vertices, faces = _payload_arrays(payload)
+    return trimesh.Trimesh(
+        vertices=np.asarray(vertices, dtype=float),
+        faces=np.asarray(faces, dtype=np.int64),
+        process=False,
+    )
 
 
 def _transform_payload(payload: dict[str, Any], matrix: np.ndarray) -> dict[str, Any]:
@@ -417,6 +447,14 @@ def _scale_shape(shape, factor: float):
     return BRepBuilderAPI_GTransform(shape, g, True).Shape()
 
 
+def _translate_shape(shape, tx: float, ty: float, tz: float):
+    if max(abs(tx), abs(ty), abs(tz)) < 1e-9:
+        return shape
+    trsf = gp_Trsf()
+    trsf.SetTranslation(gp_Vec(float(tx), float(ty), float(tz)))
+    return BRepBuilderAPI_Transform(shape, trsf, True).Shape()
+
+
 def _apply_manual_transforms(part: PartState):
     shape = part.shape
     for axis, angle_rad in part.orientation_steps:
@@ -436,6 +474,17 @@ def _part_has_runtime_transform(part: PartState) -> bool:
     )
 
 
+def _manual_translate_vector(part: PartState) -> np.ndarray:
+    return np.asarray(part.manual_translate, dtype=float)
+
+
+def _runtime_offset_vector(part: PartState, *, include_settle: bool = True) -> np.ndarray:
+    offset = _manual_translate_vector(part)
+    if include_settle:
+        offset = offset + np.asarray(part.settle_offset, dtype=float)
+    return offset
+
+
 def _serialize_orientation_steps(steps: list[tuple[tuple[float, float, float], float]]) -> list[dict[str, Any]]:
     return [
         {"axis": [float(axis[0]), float(axis[1]), float(axis[2])], "angle": float(angle_rad)}
@@ -453,18 +502,18 @@ def _location_to_offset(loc) -> tuple[float, float, float]:
 
 
 def _apply_settle_offsets(part_info):
-    offsets_by_name: dict[str, list[tuple[float, float, float]]] = {}
+    offsets_by_name: dict[str, list[np.ndarray]] = {}
     for part in state.parts:
-        offsets_by_name.setdefault(_part_display_name(part), []).append(part.settle_offset)
+        offsets_by_name.setdefault(_part_display_name(part), []).append(_runtime_offset_vector(part))
 
     adjusted = []
     for entry in part_info:
         name, shape, loc, rgb = entry[:4]
         rest = entry[4:]
         offsets = offsets_by_name.get(name)
-        settle = offsets.pop(0) if offsets else (0.0, 0.0, 0.0)
-        if any(abs(v) > 1e-9 for v in settle):
-            loc = assemble.Location(assemble.Vector(*settle)) * loc
+        runtime_offset = offsets.pop(0) if offsets else np.zeros(3, dtype=float)
+        if np.max(np.abs(runtime_offset)) > 1e-9:
+            loc = assemble.Location(assemble.Vector(*runtime_offset.tolist())) * loc
         adjusted.append((name, shape, loc, rgb, *rest))
     return adjusted
 
@@ -616,6 +665,117 @@ def _preview_payload_for_part(part: PartState) -> dict[str, Any]:
     return _load_mesh_payload_from_cache_file(source_path, part.shape)
 
 
+def _payload_to_trimesh(payload: dict[str, Any]) -> trimesh.Trimesh:
+    vertices, faces = _payload_arrays(payload)
+    return trimesh.Trimesh(
+        vertices=np.asarray(vertices, dtype=float),
+        faces=np.asarray(faces, dtype=np.int64),
+        process=False,
+    )
+
+
+def _part_world_proxy_mesh(part: PartState, stack_offset: np.ndarray, *, use_full: bool = True) -> trimesh.Trimesh:
+    payload = _scene_proxy_payload_for_part(part, use_full=use_full)
+    mesh = _payload_to_trimesh(payload)
+    mesh.apply_transform(_part_transform_matrix_4x4(part))
+    mesh.apply_translation(np.asarray(stack_offset, dtype=float) + _runtime_offset_vector(part))
+    return mesh
+
+
+def _combine_world_meshes(parts: list[PartState], offsets: list[np.ndarray], *, use_full: bool = True) -> trimesh.Trimesh:
+    meshes = [
+        _part_world_proxy_mesh(part, offset, use_full=use_full)
+        for part, offset in zip(parts, offsets)
+    ]
+    if not meshes:
+        raise ValueError("no meshes to combine")
+    combined = trimesh.util.concatenate(meshes) if len(meshes) > 1 else meshes[0]
+    combined.remove_unreferenced_vertices()
+    combined.merge_vertices()
+    return combined
+
+
+def _matched_midlayer_sections() -> list[MidlayerSectionInput]:
+    records = _preview_records(use_full=True)
+    offsets = [np.asarray(offset, dtype=float) for offset in _preview_stack_offsets(records)]
+
+    by_level: dict[int, dict[str, list[tuple[PartState, np.ndarray]]]] = {}
+    for record, offset in zip(records, offsets):
+        part = record["part"]
+        tier, levels, _segment = assemble.parse_part_name(part.name)
+        if tier not in {"outer", "inner"} or not levels:
+            continue
+        for level in levels:
+            by_level.setdefault(level, {}).setdefault(tier, []).append((part, offset))
+
+    sections: list[MidlayerSectionInput] = []
+    axis_name = _effective_stack_axis_name()
+    for level in sorted(by_level):
+        tier_map = by_level[level]
+        if "outer" not in tier_map or "inner" not in tier_map:
+            continue
+        outer_parts = [item[0] for item in tier_map["outer"]]
+        outer_offsets = [item[1] for item in tier_map["outer"]]
+        inner_parts = [item[0] for item in tier_map["inner"]]
+        inner_offsets = [item[1] for item in tier_map["inner"]]
+        sections.append(MidlayerSectionInput(
+            level=level,
+            outer_name=outer_parts[0].name,
+            inner_name=inner_parts[0].name,
+            outer_mesh=_combine_world_meshes(outer_parts, outer_offsets, use_full=True),
+            inner_mesh=_combine_world_meshes(inner_parts, inner_offsets, use_full=True),
+            axis=axis_name,
+            metadata={
+                "outerCount": len(outer_parts),
+                "innerCount": len(inner_parts),
+            },
+        ))
+    return sections
+
+
+def _insert_generated_mid_parts(artifact_paths: list[Path]) -> list[str]:
+    generated_names: list[str] = []
+    generated_levels = {
+        level
+        for path in artifact_paths
+        for _tier, levels, _segment in [assemble.parse_part_name(path.stem)]
+        for level in (levels or [])
+    }
+
+    preserved_parts: list[PartState] = []
+    for part in state.parts:
+        tier, levels, _segment = assemble.parse_part_name(part.name)
+        if tier == "mid" and levels and any(level in generated_levels for level in levels):
+            continue
+        preserved_parts.append(part)
+
+    for path in artifact_paths:
+        wp, display_name = _load_cached_part(str(path), require_solid=False)
+        generated_names.append(display_name)
+        preserved_parts.append(PartState(
+            file_path=str(path),
+            name=display_name,
+            source_ext=path.suffix.lower(),
+            shape=wp.val().wrapped,
+            mesh_source_path=str(path),
+        ))
+
+    state.parts = preserved_parts
+    return generated_names
+
+
+def _scene_proxy_payload_for_part(part: PartState, *, use_full: bool = False) -> dict[str, Any]:
+    if use_full:
+        return _preview_payload_for_part(part)
+    source_path = _preview_source_path_for_part(part)
+    return _load_decimated_mesh_payload(
+        source_path,
+        part.shape,
+        tolerance=0.8,
+        target_triangles=_SCENE_TRIANGLE_TARGET,
+    )
+
+
 def _preview_thumb_payload_for_part(part: PartState, target_triangles: int = _THUMB_TRIANGLE_TARGET) -> dict[str, Any]:
     source_path = _preview_source_path_for_part(part)
     return _load_decimated_mesh_payload(
@@ -627,7 +787,7 @@ def _preview_thumb_payload_for_part(part: PartState, target_triangles: int = _TH
 
 
 def _preview_bounds_for_part(part: PartState) -> tuple[np.ndarray, np.ndarray]:
-    payload = _preview_payload_for_part(part)
+    payload = _scene_proxy_payload_for_part(part)
     mins, maxs = _mesh_bbox(payload)
     return _transformed_bbox(mins, maxs, part)
 
@@ -709,12 +869,7 @@ def _orientation_payload_for_part(part: PartState, target_triangles: int = _ORIE
     # the decimated proxy mesh instead of re-tessellating the underlying shape.
     source_path = _preview_source_path_for_part(part)
     if source_path:
-        payload = _load_decimated_mesh_payload(
-            source_path,
-            part.shape,
-            tolerance=0.8,
-            target_triangles=target_triangles,
-        )
+        payload = _decimate_payload(_preview_payload_for_part(part), target_triangles)
         if _part_has_runtime_transform(part):
             return _transform_payload(payload, _part_linear_transform_matrix(part))
         return payload
@@ -750,7 +905,8 @@ def _can_use_fast_mesh_scene(part_states: list[PartState]) -> bool:
 
 
 def _preview_stack_offsets(records: list[dict[str, Any]]) -> list[list[float]]:
-    axis_index = {"x": 0, "y": 1, "z": 2}.get(state.axis, 2)
+    axis_name = _effective_stack_axis_name()
+    axis_index = _axis_index(axis_name)
     center_axes = [idx for idx in range(3) if idx != axis_index]
     offsets: list[list[float]] = [[0.0, 0.0, 0.0] for _ in records]
     auto_level = 1
@@ -828,12 +984,12 @@ def _preview_stack_offsets(records: list[dict[str, Any]]) -> list[list[float]]:
     return offsets
 
 
-def _preview_records() -> list[dict[str, Any]]:
-    return [_preview_record_for_part(idx, part) for idx, part in enumerate(state.parts)]
+def _preview_records(*, use_full: bool = False) -> list[dict[str, Any]]:
+    return [_preview_record_for_part(idx, part, use_full=use_full) for idx, part in enumerate(state.parts)]
 
 
-def _preview_record_for_part(index: int, part: PartState) -> dict[str, Any]:
-    payload = _preview_payload_for_part(part)
+def _preview_record_for_part(index: int, part: PartState, *, use_full: bool = False) -> dict[str, Any]:
+    payload = _scene_proxy_payload_for_part(part, use_full=use_full)
     raw_mins, raw_maxs = _mesh_bbox(payload)
     mins, maxs = _transformed_bbox(raw_mins, raw_maxs, part)
     source_path = _preview_source_path_for_part(part)
@@ -851,14 +1007,27 @@ def _preview_record_for_part(index: int, part: PartState) -> dict[str, Any]:
     }
 
 
+def _should_use_full_scene_proxies() -> bool:
+    if len(state.parts) == 0 or len(state.parts) > _FULL_SCENE_PROXY_PART_LIMIT:
+        return False
+    total_numbers = 0
+    for part in state.parts:
+        payload = _preview_payload_for_part(part)
+        total_numbers += _proxy_payload_number_count(payload)
+        if total_numbers > _FULL_SCENE_PROXY_NUMBER_LIMIT:
+            return False
+    return True
+
+
 def _preview_part_info(records: list[dict[str, Any]], offsets: list[list[float]]):
     part_info = []
     mesh_payloads = []
     for record, offset in zip(records, offsets):
+        loc_offset = np.asarray(offset, dtype=float) + _manual_translate_vector(record["part"])
         part_info.append((
             record["display_name"],
             None,
-            assemble.Location(assemble.Vector(*offset)),
+            assemble.Location(assemble.Vector(*loc_offset.tolist())),
             tuple(record["color"]),
             record["segment"],
             record["mesh_ext"] in assemble.MESH_EXTENSIONS,
@@ -897,7 +1066,7 @@ def _render_preview_assembly_fast(output_path: str, resolution: int = 900, targe
             continue
 
         transformed = vertices @ _part_linear_transform_matrix(part).T
-        transformed = transformed + np.asarray(offset, dtype=float) + np.asarray(part.settle_offset, dtype=float)
+        transformed = transformed + np.asarray(offset, dtype=float) + _runtime_offset_vector(part)
         face_data = np.concatenate(
             [np.full((len(faces), 1), 3, dtype=np.int64), np.asarray(faces, dtype=np.int64)],
             axis=1,
@@ -943,7 +1112,7 @@ def _export_preview_assembly_mesh(output_path: str) -> None:
             process=False,
         )
         mesh.apply_transform(_part_transform_matrix_4x4(part))
-        mesh.apply_translation(np.asarray(offset, dtype=float) + np.asarray(part.settle_offset, dtype=float))
+        mesh.apply_translation(np.asarray(offset, dtype=float) + _runtime_offset_vector(part))
         meshes.append(mesh)
         progress.advance(1, f"Prepared assembly mesh {idx} of {len(records)}: {part.name}")
 
@@ -959,21 +1128,29 @@ def _build_fast_mesh_scene() -> dict[str, Any]:
     # Interactive scenes are proxy-only. The browser receives display meshes and
     # transform metadata, never exact CAD tessellation generated just for view.
     progress.begin("Scene", len(state.parts) * 2, "Stacking preview meshes for scene...")
+    scene_started_at = time.perf_counter()
+    use_full_scene_proxies = _should_use_full_scene_proxies()
     records = []
+    records_started_at = time.perf_counter()
     for idx, part in enumerate(state.parts, start=1):
         with _SlowProgressDetail(
             f"Preparing preview {idx} of {len(state.parts)}: {part.name}",
             lambda elapsed, i=idx, name=part.name:
                 f"Reading preview mesh {i} of {len(state.parts)}: {name} ({elapsed:.0f}s)",
         ):
-            record = _preview_record_for_part(idx - 1, part)
+            record = _preview_record_for_part(idx - 1, part, use_full=use_full_scene_proxies)
         records.append(record)
         progress.advance(1, f"Prepared preview {idx} of {len(state.parts)}: {part.name}")
+    records_ms = (time.perf_counter() - records_started_at) * 1000.0
 
+    stack_started_at = time.perf_counter()
+    axis_name = _effective_stack_axis_name()
     offsets = _preview_stack_offsets(records)
+    stack_ms = (time.perf_counter() - stack_started_at) * 1000.0
     inline_payloads = _should_inline_proxy_payloads(records)
     combined = []
     part_meshes = []
+    serialize_started_at = time.perf_counter()
     for idx, (record, offset) in enumerate(zip(records, offsets), start=1):
         part = record["part"]
         mesh_url, mesh_format = _remote_mesh_reference(record["source_path"])
@@ -991,10 +1168,11 @@ def _build_fast_mesh_scene() -> dict[str, Any]:
             ),
             "orientationSteps": _serialize_orientation_steps(part.orientation_steps),
             "rot": list(part.rot_xyz),
+            "translate": list(part.manual_translate),
             "scale": part.manual_scale,
             "material": part.material,
             "mesh": None if use_mesh_url else record["payload"],
-            "thumbMesh": _preview_thumb_payload_for_part(part),
+            "thumbMesh": None,
             "meshUrl": mesh_url if use_mesh_url else None,
             "meshFormat": mesh_format if use_mesh_url else None,
         })
@@ -1006,12 +1184,18 @@ def _build_fast_mesh_scene() -> dict[str, Any]:
             "offset": (np.asarray(offset, dtype=float) + settle).tolist(),
         })
         progress.advance(1, f"Prepared assembled mesh {idx} of {len(state.parts)}: {part.name}")
+    serialize_ms = (time.perf_counter() - serialize_started_at) * 1000.0
 
     progress.finish("Scene ready")
     _record_debug_log("server", "scene-fast-path", "Used preview mesh fast path", {
         "parts": [part.name for part in state.parts],
-        "axis": state.axis,
+        "axis": axis_name,
         "inlinePayloads": inline_payloads,
+        "fullSceneProxies": use_full_scene_proxies,
+        "recordsMs": round(records_ms, 3),
+        "stackMs": round(stack_ms, 3),
+        "serializeMs": round(serialize_ms, 3),
+        "sceneMs": round((time.perf_counter() - scene_started_at) * 1000.0, 3),
     })
     _record_debug_log("server", "scene-done", "Scene payload ready", {
         "parts": len(part_meshes),
@@ -1078,12 +1262,16 @@ def _ensure_all_real_geometry() -> None:
         _ensure_real_geometry(part)
 
 
-def _orientation_axis_index() -> int:
-    return {"x": 0, "y": 1, "z": 2}.get(state.axis, 2)
+def _axis_index(axis_name: str | None = None) -> int:
+    return {"x": 0, "y": 1, "z": 2}.get(axis_name or state.axis, 2)
 
 
-def _orientation_slice_metrics(rotated: np.ndarray) -> tuple[float, float, int, float]:
-    axis_index = _orientation_axis_index()
+def _orientation_axis_index(axis_name: str | None = None) -> int:
+    return _axis_index(axis_name)
+
+
+def _orientation_slice_metrics(rotated: np.ndarray, axis_name: str | None = None) -> tuple[float, float, int, float]:
+    axis_index = _orientation_axis_index(axis_name)
     other_axes = [idx for idx in range(3) if idx != axis_index]
     coords = rotated[:, axis_index]
     span = float(coords.max() - coords.min())
@@ -1119,8 +1307,8 @@ def _orientation_slice_metrics(rotated: np.ndarray) -> tuple[float, float, int, 
     return float(np.mean(center_drifts)), float(np.mean(radius_cvs)), used, radial_balance
 
 
-def _cylinder_taper_penalty(rotated: np.ndarray) -> float:
-    axis_index = _orientation_axis_index()
+def _cylinder_taper_penalty(rotated: np.ndarray, axis_name: str | None = None) -> float:
+    axis_index = _orientation_axis_index(axis_name)
     other_axes = [idx for idx in range(3) if idx != axis_index]
     coords = rotated[:, axis_index]
     mid = float((coords.min() + coords.max()) / 2.0)
@@ -1240,15 +1428,49 @@ def _solve_orientation_steps(workflow: str) -> tuple[list[tuple[tuple[float, flo
     return _solve_orientation_steps_axis_aligned(workflow), "axis-aligned six-way heuristic"
 
 
+def _infer_current_cylinder_axis_name() -> str:
+    clouds: list[np.ndarray] = []
+    for part in state.parts:
+        payload = _orientation_payload_for_part(part)
+        sampled = _sample_vertices(payload)
+        if len(sampled):
+            clouds.append(sampled)
+
+    if not clouds:
+        return state.axis
+
+    all_vertices = np.vstack(clouds)
+    target = _axis_vector(state.axis)
+    ranked: list[tuple[float, str]] = []
+    for label, steps in _axis_alignment_candidates(target):
+        rotated = _apply_steps_to_vertices(all_vertices, steps)
+        center_drift, radius_cv, slice_count, radial_balance = _orientation_slice_metrics(rotated, state.axis)
+        taper_penalty = _cylinder_taper_penalty(rotated, state.axis)
+        coverage_penalty = 0.35 * max(0, 4 - slice_count)
+        score = (center_drift * 4.0) + (radius_cv * 8.0) + (radial_balance * 2.0) + coverage_penalty + (taper_penalty * 3.0)
+        ranked.append((score, label))
+    ranked.sort(key=lambda item: item[0])
+    return ranked[0][1][-1]
+
+
+def _effective_stack_axis_name() -> str:
+    if state.workflow != "cylinder" or not state.parts:
+        return state.axis
+    try:
+        return _infer_current_cylinder_axis_name()
+    except Exception:
+        return state.axis
+
+
 def _centroid_along_stack_axis(part: PartState) -> float:
     mins, maxs = _preview_bounds_for_part(part)
-    axis_index = {"x": 0, "y": 1, "z": 2}.get(state.axis, 2)
+    axis_index = _axis_index(_effective_stack_axis_name())
     return (mins[axis_index] + maxs[axis_index]) / 2.0
 
 
 def _preview_cross_section_diameter(part: PartState) -> float:
     mins, maxs = _preview_bounds_for_part(part)
-    axis_index = {"x": 0, "y": 1, "z": 2}.get(state.axis, 2)
+    axis_index = _axis_index(_effective_stack_axis_name())
     other_axes = [idx for idx in range(3) if idx != axis_index]
     return max(float(maxs[idx] - mins[idx]) for idx in other_axes)
 
@@ -1308,8 +1530,6 @@ def _autoscale_preview_parts() -> list[tuple[PartState, float]]:
                 if factor is not None and abs(factor - 1.0) > 0.01:
                     scaled.append((part, factor))
     return scaled
-
-
 def _build_scene() -> dict[str, Any]:
     stack_parts = _parts_for_stack()
     if not stack_parts:
@@ -1323,8 +1543,11 @@ def _build_scene() -> dict[str, Any]:
         "parts": [p.name for p in state.parts],
         "count": len(state.parts),
     })
-    axis_vec = assemble.AXIS_MAP.get(state.axis, assemble.AXIS_MAP["z"])
+    scene_started_at = time.perf_counter()
+    axis_vec = assemble.AXIS_MAP.get(_effective_stack_axis_name(), assemble.AXIS_MAP["z"])
+    stack_started_at = time.perf_counter()
     _assy, part_info = assemble.stack_parts(_parts_for_assembly(), axis_vec, state.gap)
+    stack_ms = (time.perf_counter() - stack_started_at) * 1000.0
     part_info = _apply_settle_offsets(part_info)
     progress.begin("Scene", len(state.parts) + len(part_info), "Stacking parts for scene...")
 
@@ -1343,12 +1566,17 @@ def _build_scene() -> dict[str, Any]:
             if use_mesh_url:
                 mesh = None
             elif can_reuse_cached_mesh:
-                mesh = _load_mesh_payload_from_cache_file(
+                mesh = _load_decimated_mesh_payload(
                     part_state.mesh_source_path,
                     entry[0].val().wrapped,
+                    tolerance=0.8,
+                    target_triangles=_SCENE_TRIANGLE_TARGET,
                 )
             else:
-                mesh = _mesh_payload(entry[0].val().wrapped)
+                mesh = _decimate_payload(
+                    _mesh_payload(entry[0].val().wrapped, tolerance=0.8),
+                    _SCENE_TRIANGLE_TARGET,
+                )
         part_meshes.append({
             "name": part_state.name,
             "filePath": part_state.file_path,
@@ -1362,21 +1590,13 @@ def _build_scene() -> dict[str, Any]:
             ),
             "orientationSteps": _serialize_orientation_steps(part_state.orientation_steps),
             "rot": list(part_state.rot_xyz),
+            "translate": list(part_state.manual_translate),
             "scale": part_state.manual_scale,
             "material": part_state.material,
             "mesh": mesh,
             "meshUrl": mesh_url if use_mesh_url else None,
             "meshFormat": mesh_format if use_mesh_url else None,
-            "thumbMesh": (
-                _load_decimated_mesh_payload(
-                    part_state.mesh_source_path,
-                    entry[0].val().wrapped,
-                    tolerance=0.8,
-                    target_triangles=_THUMB_TRIANGLE_TARGET,
-                )
-                if can_reuse_cached_mesh
-                else _decimate_payload(mesh, _THUMB_TRIANGLE_TARGET)
-            ),
+            "thumbMesh": None,
         })
         progress.advance(1, f"Prepared preview {idx} of {len(state.parts)}: {part_state.name}")
 
@@ -1406,6 +1626,8 @@ def _build_scene() -> dict[str, Any]:
     _record_debug_log("server", "scene-done", "Scene payload ready", {
         "parts": len(part_meshes),
         "combined": len(combined),
+        "stackMs": round(stack_ms, 3),
+        "sceneMs": round((time.perf_counter() - scene_started_at) * 1000.0, 3),
     })
     return {"parts": part_meshes, "combined": combined}
 
@@ -1439,6 +1661,8 @@ def index():
         workflows=SUPPORTED_WORKFLOWS,
         current_workflow=state.workflow,
         fine_orient=state.fine_orient,
+        midlayer_solvers=get_topopt_solver_defaults(),
+        midlayer_configs=state.midlayer_configs,
     )
 
 
@@ -1451,6 +1675,14 @@ def get_progress():
 @app.route("/api/version")
 def get_version():
     return jsonify({"webui_version": _WEBUI_VERSION})
+
+
+@app.route("/api/midlayer-solvers")
+def get_midlayer_solvers():
+    return jsonify({
+        "solvers": get_topopt_solver_defaults(),
+        "configs": state.midlayer_configs,
+    })
 
 
 @app.route("/api/debug-log", methods=["GET", "POST", "DELETE"])
@@ -1517,7 +1749,12 @@ def mesh_payload():
         return jsonify({"error": f"unsupported geometry extension: {path.suffix}"}), 400
     try:
         wp, _name = _load_cached_part(str(path), require_solid=False)
-        payload = _load_mesh_payload_from_cache_file(str(path), wp.val().wrapped)
+        payload = _load_decimated_mesh_payload(
+            str(path),
+            wp.val().wrapped,
+            tolerance=0.8,
+            target_triangles=_SCENE_TRIANGLE_TARGET,
+        )
     except Exception as exc:
         app.logger.exception("Failed to build mesh payload for '%s'", path)
         return jsonify({"error": f"failed to build mesh payload: {exc}"}), 400
@@ -1785,6 +2022,13 @@ def update_part(idx: int):
             float(rot.get("y", p.rot_xyz[1])),
             float(rot.get("z", p.rot_xyz[2])),
         )
+    if "translation" in data:
+        translate = data["translation"]
+        p.manual_translate = (
+            float(translate.get("x", p.manual_translate[0])),
+            float(translate.get("y", p.manual_translate[1])),
+            float(translate.get("z", p.manual_translate[2])),
+        )
     if "scale" in data:
         p.manual_scale = max(0.01, float(data["scale"]))
     if "material" in data:
@@ -1795,16 +2039,28 @@ def update_part(idx: int):
 
 @app.route("/api/stage/<name>", methods=["POST"])
 def run_stage(name: str):
+    _record_debug_log("server", "stage-start", f"Starting stage {name}", {
+        "stage": name,
+        "parts": [part.name for part in state.parts],
+        "count": len(state.parts),
+    })
     try:
         if name == "auto_orient":
+            stage_started_at = time.perf_counter()
             steps, mode_label = _solve_orientation_steps(state.workflow)
             for part in state.parts:
                 part.orientation_steps = list(steps)
                 part.auto_oriented = True
                 part.settle_offset = (0.0, 0.0, 0.0)
-            return jsonify({"ok": True, "message": f"Auto-orient complete using {mode_label}"})
+            message = f"Auto-orient complete using {mode_label}"
+            _record_debug_log("server", "stage-done", message, {
+                "stage": name,
+                "durationMs": round((time.perf_counter() - stage_started_at) * 1000.0, 3),
+            })
+            return jsonify({"ok": True, "message": message})
 
         if name == "auto_stack":
+            stage_started_at = time.perf_counter()
             progress.begin("Auto-stack", len(state.parts), "Ordering parts for stacking...")
             ranked = []
             for idx, part in enumerate(state.parts, start=1):
@@ -1814,9 +2070,20 @@ def run_stage(name: str):
             for part in state.parts:
                 part.settle_offset = (0.0, 0.0, 0.0)
             progress.finish("Auto-stack complete")
-            return jsonify({"ok": True, "message": "Auto-stack complete"})
+            duration_ms = (time.perf_counter() - stage_started_at) * 1000.0
+            _record_debug_log("server", "stage-done", "Auto-stack complete", {
+                "stage": name,
+                "durationMs": round(duration_ms, 3),
+                "order": [part.name for part in state.parts],
+            })
+            return jsonify({
+                "ok": True,
+                "message": f"Auto-stack complete ({duration_ms:.3f} ms)",
+                "timings": {"durationMs": duration_ms},
+            })
 
         if name == "auto_scale":
+            stage_started_at = time.perf_counter()
             progress.begin("Auto-scale", len(state.parts), "Scaling parts...")
             scaled_parts = {id(part): factor for part, factor in _autoscale_preview_parts()}
             for part in state.parts:
@@ -1828,10 +2095,62 @@ def run_stage(name: str):
                 else:
                     progress.advance(1, f"Left {part.name} unchanged")
             progress.finish("Auto-scale complete")
+            _record_debug_log("server", "stage-done", "Auto-scale complete", {
+                "stage": name,
+                "durationMs": round((time.perf_counter() - stage_started_at) * 1000.0, 3),
+            })
             return jsonify({"ok": True, "message": "Auto-scale complete"})
 
+        if name in {"design_midlayer_dl4to", "design_midlayer_pymoto"}:
+            solver_id = "dl4to" if name.endswith("dl4to") else "pymoto"
+            sections = _matched_midlayer_sections()
+            if not sections:
+                return _json_api_error(
+                    "midlayer design requires matching outer_* and inner_* sections to be loaded",
+                    400,
+                    stage=name,
+                )
+
+            adapter = get_topopt_adapter(solver_id)
+            stage_started_at = time.perf_counter()
+            progress.begin("Midlayer design", (len(sections) * 3) + 1, f"Preparing {adapter.label} design domain...")
+            for idx, section in enumerate(sections, start=1):
+                progress.advance(1, f"Matched section {idx} of {len(sections)}: outer_{section.level} / inner_{section.level}")
+
+            output_dir = _WEBUI_CACHE_DIR / "midlayer_design" / solver_id
+            with _SlowProgressDetail(
+                f"Running {adapter.label} scaffold solve...",
+                lambda elapsed, label=adapter.label:
+                    f"Running {label} scaffold solve ({elapsed:.0f}s)",
+            ):
+                result = adapter.run(sections, state.midlayer_configs.get(solver_id, {}), output_dir=output_dir)
+            for idx, artifact in enumerate(result.artifacts, start=1):
+                progress.advance(1, f"Generated {adapter.label} scaffold {idx} of {len(result.artifacts)}: {artifact.name}")
+            generated_names = _insert_generated_mid_parts([
+                artifact.output_path for artifact in result.artifacts if artifact.output_path is not None
+            ])
+            progress.advance(1, "Loaded generated midlayer parts")
+            progress.finish(f"{adapter.label} midlayer design complete")
+
+            message = (
+                f"{adapter.label} midlayer design complete for {len(result.artifacts)} section(s) "
+                f"using {result.mode} mode"
+            )
+            _record_debug_log("server", "stage-done", message, {
+                "stage": name,
+                "durationMs": round((time.perf_counter() - stage_started_at) * 1000.0, 3),
+                "generated": generated_names,
+                "notes": result.notes,
+            })
+            return jsonify({
+                "ok": True,
+                "message": message,
+                "solver": result.to_dict(),
+                "generated": generated_names,
+            })
+
         if name == "auto_drop":
-            axis_vec = assemble.AXIS_MAP.get(state.axis, assemble.AXIS_MAP["z"])
+            axis_vec = assemble.AXIS_MAP.get(_effective_stack_axis_name(), assemble.AXIS_MAP["z"])
             preview_records = _preview_records()
             preview_offsets = _preview_stack_offsets(preview_records)
             base_part_info, mesh_payloads = _preview_part_info(preview_records, preview_offsets)
@@ -1851,6 +2170,7 @@ def run_stage(name: str):
                 f"local_only={local_metrics['elapsed_s']:.3f}s, "
                 f"proxy_then_local={proxy_metrics['elapsed_s']:.3f}s)"
             )
+            _record_debug_log("server", "stage-done", message, {"stage": name})
             return jsonify({
                 "ok": True,
                 "message": message,
@@ -1864,19 +2184,23 @@ def run_stage(name: str):
         if name == "cut_inner_from_mid":
             _ensure_all_real_geometry()
             progress.begin("Cutting", 2, "Preparing cut...")
-            axis_vec = assemble.AXIS_MAP.get(state.axis, assemble.AXIS_MAP["z"])
+            axis_vec = assemble.AXIS_MAP.get(_effective_stack_axis_name(), assemble.AXIS_MAP["z"])
             _assy, part_info = assemble.stack_parts(_parts_for_assembly(), axis_vec, state.gap)
             part_info = _apply_settle_offsets(part_info)
             progress.advance(1, "Cutting inner from mid...")
             out = assemble.mid_cut_parts(part_info, output_dir="parts", clearance=0.02, debug=True, section_number=state.section_number)
             progress.finish(f"Cut complete ({len(out)} parts)")
-            return jsonify({"ok": True, "message": f"Cut complete ({len(out)} parts)"})
+            message = f"Cut complete ({len(out)} parts)"
+            _record_debug_log("server", "stage-done", message, {"stage": name})
+            return jsonify({"ok": True, "message": message})
 
         if name == "export_parts":
             progress.begin("Exporting", 1, "Exporting parts...")
             _export_parts_fast("parts")
             progress.finish("Parts exported")
-            return jsonify({"ok": True, "message": "Exported transformed parts to ./parts"})
+            message = "Exported transformed parts to ./parts"
+            _record_debug_log("server", "stage-done", message, {"stage": name})
+            return jsonify({"ok": True, "message": message})
 
         if name == "render_whole":
             out = "web_render.png"
@@ -1884,12 +2208,14 @@ def run_stage(name: str):
                 _render_preview_assembly_fast(out, resolution=900)
             else:
                 _ensure_all_real_geometry()
-                axis_vec = assemble.AXIS_MAP.get(state.axis, assemble.AXIS_MAP["z"])
+                axis_vec = assemble.AXIS_MAP.get(_effective_stack_axis_name(), assemble.AXIS_MAP["z"])
                 _assy, part_info = assemble.stack_parts(_parts_for_assembly(), axis_vec, state.gap)
                 part_info = _apply_settle_offsets(part_info)
                 data = [(name, shape, loc, rgb) for name, shape, loc, rgb, *_ in part_info]
                 assemble.render_assembly(data, out, resolution=1200)
-            return jsonify({"ok": True, "message": f"Rendered {out}"})
+            message = f"Rendered {out}"
+            _record_debug_log("server", "stage-done", message, {"stage": name})
+            return jsonify({"ok": True, "message": message})
 
         if name == "export_whole":
             if state.parts and all(assemble.is_mesh_file(part.file_path) for part in state.parts):
@@ -1898,7 +2224,7 @@ def run_stage(name: str):
             else:
                 _ensure_all_real_geometry()
                 progress.begin("Exporting", 1, "Exporting assembly...")
-                axis_vec = assemble.AXIS_MAP.get(state.axis, assemble.AXIS_MAP["z"])
+                axis_vec = assemble.AXIS_MAP.get(_effective_stack_axis_name(), assemble.AXIS_MAP["z"])
                 assy, _part_info = assemble.stack_parts(_parts_for_assembly(), axis_vec, state.gap)
                 adjusted_info = _apply_settle_offsets(_part_info)
                 assy = assemble.Assembly()
@@ -1910,11 +2236,18 @@ def run_stage(name: str):
                 out = "web_assembly.step"
                 assemble.export_assembly_step(assy, out)
                 progress.finish("Assembly exported")
-            return jsonify({"ok": True, "message": f"Exported {out}"})
+            message = f"Exported {out}"
+            _record_debug_log("server", "stage-done", message, {"stage": name})
+            return jsonify({"ok": True, "message": message})
 
+        _record_debug_log("server", "stage-error", f"Unknown stage {name}", {"stage": name})
         return _json_api_error(f"unknown stage '{name}'", 400)
     except Exception as exc:
         app.logger.exception("Stage '%s' failed", name)
+        _record_debug_log("server", "stage-error", f"Stage {name} failed", {
+            "stage": name,
+            "error": str(exc),
+        })
         progress.finish(f"{name} failed")
         return _json_api_error(f"stage '{name}' failed: {exc}", 500)
 
@@ -1935,6 +2268,14 @@ def set_config():
     if "section_number" in data:
         sec = data["section_number"]
         state.section_number = None if sec in (None, "") else int(sec)
+    if "midlayer_configs" in data and isinstance(data["midlayer_configs"], dict):
+        defaults = _default_midlayer_configs()
+        for solver_id, values in data["midlayer_configs"].items():
+            if solver_id not in defaults or not isinstance(values, dict):
+                continue
+            merged = dict(state.midlayer_configs.get(solver_id, defaults[solver_id]))
+            merged.update(values)
+            state.midlayer_configs[solver_id] = merged
     return jsonify({"ok": True})
 
 
@@ -1961,25 +2302,21 @@ def main():
     args = parser.parse_args()
 
     use_reloader = not args.no_reload
-
-    # Try livereload for instant browser refresh on static/template changes.
-    # Falls back to Flask's built-in reloader for Python source changes.
     if use_reloader:
-        try:
-            from livereload import Server
-            server = Server(app.wsgi_app)
-            server.watch("templates/")
-            server.watch("static/")
-            server.watch("web_ui.py")
-            print(f" * LiveReload server on http://{args.host}:{args.port}")
-            print(" * Watching templates/, static/, and web_ui.py for changes")
-            server.serve(host=args.host, port=args.port)
-        except ImportError:
-            print(" * livereload not installed, using Flask debug reloader")
-            print(" * Install with: pip install livereload")
-            app.run(host=args.host, port=args.port, debug=True)
-    else:
-        app.run(host=args.host, port=args.port, debug=False)
+        print(f" * Dev server on http://{args.host}:{args.port}")
+        print(" * Using Flask threaded reloader for consistent browser/API behavior")
+
+    # Serve the same threaded Flask stack in manual and automated runs.
+    # The previous livereload server could block long-lived SSE and stage POSTs
+    # behind a single worker, which made browser interactions diverge from the
+    # Playwright harness.
+    app.run(
+        host=args.host,
+        port=args.port,
+        debug=use_reloader,
+        use_reloader=use_reloader,
+        threaded=True,
+    )
 
 
 if __name__ == "__main__":

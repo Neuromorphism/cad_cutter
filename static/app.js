@@ -37,6 +37,8 @@ const debugToggle    = document.getElementById('debug-toggle');
 const debugCopyBtn   = document.getElementById('debug-copy');
 const debugLogEl     = document.getElementById('debug-log');
 const debugCountEl   = document.getElementById('debug-count');
+const midlayerConfigForms = document.getElementById('midlayer-config-forms');
+const midlayerSolverDataEl = document.getElementById('midlayer-solver-data');
 
 const progressContainer = document.getElementById('progress-container');
 const progressFill      = document.getElementById('progress-fill');
@@ -57,6 +59,7 @@ let debugPanelOpen = false;
 let activeLoaderContext = null;
 let stallWatchdog = null;
 let lastProgressEventAt = 0;
+let stallThresholdMs = 5000;
 let pendingDebugFlush = [];
 let debugFlushTimer = null;
 let debugFlushInFlight = false;
@@ -70,6 +73,8 @@ const STAGE_TIMEOUT_MS = {
   auto_stack: 15000,
   auto_scale: 30000,
   auto_drop: 30000,
+  design_midlayer_dl4to: 60000,
+  design_midlayer_pymoto: 60000,
   cut_inner_from_mid: 30000,
   export_parts: 30000,
   render_whole: 45000,
@@ -81,6 +86,15 @@ const MATERIAL_OPTIONS = [
   'chrome', 'plastic', 'rubber', 'ceramic', 'glass', 'wood', 'oak', 'pine',
   'stone', 'concrete', 'red', 'green', 'blue', 'black', 'white'
 ];
+
+const midlayerSolverData = (() => {
+  if (!midlayerSolverDataEl?.textContent) return { solvers: {}, configs: {} };
+  try {
+    return JSON.parse(midlayerSolverDataEl.textContent);
+  } catch (_) {
+    return { solvers: {}, configs: {} };
+  }
+})();
 
 /* ── Toast notifications ── */
 function toast(message, type = 'info') {
@@ -189,15 +203,16 @@ function updateDebugPanelState() {
   debugLogEl.classList.toggle('hidden', !debugPanelOpen);
 }
 
-function startStallWatchdog(context) {
+function startStallWatchdog(context, thresholdMs = 5000) {
   stopStallWatchdog();
   activeLoaderContext = context;
+  stallThresholdMs = thresholdMs;
   lastProgressEventAt = Date.now();
   stallWatchdog = window.setInterval(() => {
     const loader = document.getElementById('viewport-loader');
     if (!loader || !activeLoaderContext) return;
     const idleMs = Date.now() - lastProgressEventAt;
-    if (idleMs >= 5000) {
+    if (idleMs >= stallThresholdMs) {
       const msg = document.querySelector('#viewport-loader .loader-msg')?.textContent || 'Loading parts...';
       addDebugLog('stall-warning', `${activeLoaderContext} has no new progress for ${Math.floor(idleMs / 1000)}s`, {
         loaderMessage: msg,
@@ -213,6 +228,7 @@ function stopStallWatchdog() {
     stallWatchdog = null;
   }
   activeLoaderContext = null;
+  stallThresholdMs = 5000;
 }
 
 function stopMainAnimation() {
@@ -487,14 +503,11 @@ function geometryFromPayload(payload) {
   const cached = geometryCache.get(payload);
   if (cached) return cached;
 
-  const indexed = new THREE.BufferGeometry();
-  indexed.setAttribute('position', new THREE.BufferAttribute(new Float32Array(payload.vertices), 3));
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(payload.vertices), 3));
   const vertexCount = payload.vertices.length / 3;
   const IndexArray = vertexCount < 65536 ? Uint16Array : Uint32Array;
-  indexed.setIndex(Array.from(new IndexArray(payload.indices)));
-  indexed.computeVertexNormals();
-
-  const geo = indexed.toNonIndexed();
+  geo.setIndex(new THREE.BufferAttribute(new IndexArray(payload.indices), 1));
   geo.computeBoundingBox();
   geo.computeBoundingSphere();
   geo.computeVertexNormals();
@@ -548,8 +561,18 @@ function applyPartTransforms(mesh, part, offset = null) {
   mesh.rotateY(THREE.MathUtils.degToRad(Number(rot[1] || 0)));
   mesh.rotateZ(THREE.MathUtils.degToRad(Number(rot[2] || 0)));
 
+  const translate = Array.isArray(part.translate) ? part.translate : [0, 0, 0];
+  const tx = Number(translate[0] || 0);
+  const ty = Number(translate[1] || 0);
+  const tz = Number(translate[2] || 0);
   if (Array.isArray(offset) && offset.length === 3) {
-    mesh.position.set(Number(offset[0] || 0), Number(offset[1] || 0), Number(offset[2] || 0));
+    mesh.position.set(
+      tx + Number(offset[0] || 0),
+      ty + Number(offset[1] || 0),
+      tz + Number(offset[2] || 0),
+    );
+  } else {
+    mesh.position.set(tx, ty, tz);
   }
   return mesh;
 }
@@ -560,7 +583,7 @@ function isLargeThumbPayload(payload) {
 }
 
 function thumbPayloadForPart(part) {
-  return part?.thumbMesh || part?.mesh || null;
+  return part?.thumbMesh || null;
 }
 
 async function loadRemoteGeometry(part) {
@@ -826,9 +849,9 @@ function buildThumb(part, idx, deferPreview = false, skipPreview = false) {
     </div>
     <div class="thumb-canvas"></div>
     <div class="thumb-controls">
-      <label><span class="ctrl-label">Rx</span> <input type="number" value="${part.rot[0]}" data-k="x"/></label>
-      <label><span class="ctrl-label">Ry</span> <input type="number" value="${part.rot[1]}" data-k="y"/></label>
-      <label><span class="ctrl-label">Rz</span> <input type="number" value="${part.rot[2]}" data-k="z"/></label>
+      <label><span class="ctrl-label">Tx</span> <input type="number" step="1" value="${(part.translate || [0, 0, 0])[0] || 0}" data-k="tx"/></label>
+      <label><span class="ctrl-label">Ty</span> <input type="number" step="1" value="${(part.translate || [0, 0, 0])[1] || 0}" data-k="ty"/></label>
+      <label><span class="ctrl-label">Tz</span> <input type="number" step="1" value="${(part.translate || [0, 0, 0])[2] || 0}" data-k="tz"/></label>
       <label><span class="ctrl-label">Scale</span> <input type="number" step="0.1" value="${part.scale}" data-k="scale"/></label>
       <label class="material-field"><span class="ctrl-label">Mat</span> <select data-k="material"></select></label>
     </div>`;
@@ -868,30 +891,16 @@ function buildThumb(part, idx, deferPreview = false, skipPreview = false) {
       canvas.appendChild(image);
       disposeRenderer(ctx);
     };
-    if (part.meshGeometry) {
+    if (part.meshGeometry && thumbPayload) {
       showMesh(applyPartTransforms(buildVisualFromGeometry(part.meshGeometry), part));
     } else if (thumbPayload) {
       showMesh(applyPartTransforms(buildVisualFromGeometry(geometryFromPayload(thumbPayload)), part));
-    } else if (part.meshUrl) {
-      loadRemoteGeometry(part)
-        .then((geometry) => {
-          part.meshGeometry = geometry;
-          showMesh(applyPartTransforms(buildVisualFromGeometry(geometry), part));
-        })
-        .catch((error) => {
-          disposeRenderer(ctx);
-          canvas.innerHTML = `
-            <div class="thumb-placeholder">
-              <span class="thumb-placeholder-title">Preview failed</span>
-              <span class="thumb-placeholder-copy">${error.message}</span>
-            </div>`;
-        });
     } else {
       disposeRenderer(ctx);
       canvas.innerHTML = `
         <div class="thumb-placeholder">
-          <span class="thumb-placeholder-title">No preview mesh</span>
-          <span class="thumb-placeholder-copy">This part did not provide a renderable preview.</span>
+          <span class="thumb-placeholder-title">Viewport Proxy</span>
+          <span class="thumb-placeholder-copy">3D thumbnail skipped to keep the main viewport responsive.</span>
         </div>`;
     }
   };
@@ -912,15 +921,15 @@ function buildThumb(part, idx, deferPreview = false, skipPreview = false) {
   });
 
   const sendUpdate = async () => {
-    const rotation = {
-      x: +wrap.querySelector('input[data-k="x"]').value,
-      y: +wrap.querySelector('input[data-k="y"]').value,
-      z: +wrap.querySelector('input[data-k="z"]').value,
+    const translation = {
+      x: +wrap.querySelector('input[data-k="tx"]').value,
+      y: +wrap.querySelector('input[data-k="ty"]').value,
+      z: +wrap.querySelector('input[data-k="tz"]').value,
     };
     const scale = +wrap.querySelector('input[data-k="scale"]').value;
     const material = wrap.querySelector('select[data-k="material"]').value;
     try {
-      await api(`/api/part/${idx}`, { method: 'PATCH', body: JSON.stringify({ rotation, scale, material }) });
+      await api(`/api/part/${idx}`, { method: 'PATCH', body: JSON.stringify({ translation, scale, material }) });
       await refreshScene();
     } catch (e) {
       toast('Failed to update part: ' + e.message, 'error');
@@ -976,6 +985,74 @@ function updateWorkflowUI() {
     const visible = !allowed.length || allowed.includes(workflow);
     el.classList.toggle('hidden', !visible);
     if ('disabled' in el) el.disabled = !visible;
+  });
+}
+
+function renderMidlayerConfigForms() {
+  if (!midlayerConfigForms) return;
+  const solvers = midlayerSolverData.solvers || {};
+  const configs = midlayerSolverData.configs || {};
+  midlayerConfigForms.innerHTML = '';
+
+  Object.entries(solvers).forEach(([solverId, solver]) => {
+    const current = configs[solverId] || solver.defaults || {};
+    const wrapper = document.createElement('section');
+    wrapper.className = 'solver-config';
+    wrapper.innerHTML = `
+      <div class="solver-config-header">
+        <div>
+          <h4>${solver.label}</h4>
+          <p>${solver.availability?.notes || ''}</p>
+        </div>
+        <span class="solver-chip ${solver.availability?.installed ? 'ok' : 'fallback'}">
+          ${solver.availability?.installed ? 'package detected' : 'scaffold mode'}
+        </span>
+      </div>
+      <div class="solver-config-grid"></div>`;
+    const grid = wrapper.querySelector('.solver-config-grid');
+    (solver.schema || []).forEach((field) => {
+      const label = document.createElement('label');
+      label.className = 'solver-config-field';
+      label.innerHTML = `
+        <span>${field.label}</span>
+        <input
+          type="${field.type || 'number'}"
+          step="${field.step ?? 1}"
+          min="${field.min ?? ''}"
+          max="${field.max ?? ''}"
+          value="${current[field.key] ?? field.default ?? ''}"
+          data-midlayer-solver="${solverId}"
+          data-midlayer-key="${field.key}"
+        />`;
+      grid.appendChild(label);
+    });
+    midlayerConfigForms.appendChild(wrapper);
+  });
+
+  midlayerConfigForms.querySelectorAll('input[data-midlayer-solver]').forEach((input) => {
+    input.addEventListener('change', async () => {
+      const solverId = input.dataset.midlayerSolver;
+      const solver = solvers[solverId];
+      if (!solver) return;
+      const values = {};
+      (solver.schema || []).forEach((field) => {
+        const fieldInput = midlayerConfigForms.querySelector(
+          `input[data-midlayer-solver="${solverId}"][data-midlayer-key="${field.key}"]`
+        );
+        if (!fieldInput) return;
+        values[field.key] = Number(fieldInput.value);
+      });
+      midlayerSolverData.configs[solverId] = values;
+      try {
+        await api('/api/config', {
+          method: 'PATCH',
+          body: JSON.stringify({ midlayer_configs: { [solverId]: values } }),
+        });
+        toast(`${solver.label} midlayer config updated`, 'success');
+      } catch (e) {
+        toast('Midlayer config update failed: ' + e.message, 'error');
+      }
+    });
   });
 }
 
@@ -1389,9 +1466,12 @@ sectionInput.addEventListener('change', async () => {
 document.querySelectorAll('[data-stage]').forEach(btn => {
   btn.addEventListener('click', withLoading(btn, async () => {
     const stageName = btn.textContent.trim().replace(/^\d+\s*/, '');
+    addDebugLog('stage-click', `Requested stage ${btn.dataset.stage}`, { stage: btn.dataset.stage });
+    await flushDebugLog(true);
     setBusy(`Running: ${stageName}...`);
     showViewportLoader(`Running: ${stageName}...`);
-    startStallWatchdog(`stage:${btn.dataset.stage}`);
+    const stallThreshold = btn.dataset.stage.startsWith('design_midlayer_') ? 20000 : 5000;
+    startStallWatchdog(`stage:${btn.dataset.stage}`, stallThreshold);
     try {
       const out = await api(`/api/stage/${btn.dataset.stage}`, {
         method: 'POST',
@@ -1526,4 +1606,5 @@ refreshGradientFiles();
 renderDebugLog();
 updateDebugPanelState();
 updateWorkflowUI();
+renderMidlayerConfigForms();
 addDebugLog('app-init', 'Web UI initialized');

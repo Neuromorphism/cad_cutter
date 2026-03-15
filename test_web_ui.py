@@ -31,6 +31,10 @@ def client(tmp_path):
     original_dir = web_ui.state.parts_dir
     original_workflow = web_ui.state.workflow
     original_fine_orient = web_ui.state.fine_orient
+    original_gap = web_ui.state.gap
+    original_axis = web_ui.state.axis
+    original_section_number = web_ui.state.section_number
+    original_midlayer_configs = {key: dict(value) for key, value in web_ui.state.midlayer_configs.items()}
     original_cache_dir = web_ui._WEBUI_CACHE_DIR
     original_mesh_cache = dict(web_ui._MESH_PAYLOAD_CACHE)
     original_decimated_cache = dict(web_ui._DECIMATED_PAYLOAD_CACHE)
@@ -38,6 +42,10 @@ def client(tmp_path):
     web_ui.state.parts_dir = tmp_path
     web_ui.state.workflow = "cylinder"
     web_ui.state.fine_orient = False
+    web_ui.state.gap = 0.0
+    web_ui.state.axis = "z"
+    web_ui.state.section_number = None
+    web_ui.state.midlayer_configs = {key: dict(value) for key, value in original_midlayer_configs.items()}
     web_ui._WEBUI_CACHE_DIR = tmp_path / ".webui_cache"
     web_ui._MESH_PAYLOAD_CACHE.clear()
     web_ui._DECIMATED_PAYLOAD_CACHE.clear()
@@ -50,6 +58,10 @@ def client(tmp_path):
         web_ui.state.parts_dir = original_dir
         web_ui.state.workflow = original_workflow
         web_ui.state.fine_orient = original_fine_orient
+        web_ui.state.gap = original_gap
+        web_ui.state.axis = original_axis
+        web_ui.state.section_number = original_section_number
+        web_ui.state.midlayer_configs = {key: dict(value) for key, value in original_midlayer_configs.items()}
         web_ui._WEBUI_CACHE_DIR = original_cache_dir
         web_ui._MESH_PAYLOAD_CACHE.clear()
         web_ui._MESH_PAYLOAD_CACHE.update(original_mesh_cache)
@@ -274,6 +286,127 @@ def test_auto_drop_stage_returns_timing_metrics_and_persists_offsets(client):
     assert len(scene["combined"]) == 2
 
 
+def test_part_translation_patch_persists_in_scene_payload(client):
+    client, _tmp_path = client
+    web_ui.state.parts_dir = _load_test_model_dir()
+
+    load_resp = client.post("/api/load", json={"files": ["outer_1.step", "outer_2.step"], "include_scene": True})
+    assert load_resp.status_code == 200
+
+    patch_resp = client.patch("/api/part/1", json={"translation": {"x": 12, "y": -8, "z": 34}})
+    assert patch_resp.status_code == 200
+    assert web_ui.state.parts[1].manual_translate == pytest.approx((12.0, -8.0, 34.0))
+
+    scene = web_ui._build_scene()
+    assert scene["parts"][1]["translate"] == pytest.approx([12.0, -8.0, 34.0])
+
+
+def test_auto_drop_closes_manual_translation_gap_on_test_models(client):
+    client, _tmp_path = client
+    web_ui.state.parts_dir = _load_test_model_dir()
+
+    load_resp = client.post("/api/load", json={"files": ["outer_1.step", "outer_2.step"], "include_scene": True})
+    assert load_resp.status_code == 200
+
+    patch_resp = client.patch("/api/part/1", json={"translation": {"z": 80}})
+    assert patch_resp.status_code == 200
+
+    resp = client.post("/api/stage/auto_drop", json={})
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data is not None
+    assert data["metrics"]["chosen"]["elapsed_s"] < 2.0
+    assert web_ui.state.parts[1].settle_offset[2] < -70.0
+
+
+def test_contact_solver_negative_gap_allows_slight_interference_fit():
+    lower_shape = cq.Workplane("XY").box(10, 10, 10).val().wrapped
+    upper_shape = cq.Workplane("XY").box(10, 10, 10).val().wrapped
+
+    part_info = [
+        ("lower", lower_shape, cq.Location(cq.Vector(0, 0, 5)), (0.5, 0.5, 0.5), None, False),
+        ("upper", upper_shape, cq.Location(cq.Vector(0, 0, 20)), (0.5, 0.5, 0.5), None, False),
+    ]
+
+    axis_vec = assemble.AXIS_MAP["z"]
+    zero_gap_info, _zero_metrics = assemble.simulate_physics_contact_fast(part_info, axis_vec, 0.0, rough_drop=False)
+    interference_info, _neg_metrics = assemble.simulate_physics_contact_fast(part_info, axis_vec, -0.5, rough_drop=False)
+
+    zero_upper = zero_gap_info[1][2].toTuple()[0][2]
+    neg_upper = interference_info[1][2].toTuple()[0][2]
+    assert neg_upper < zero_upper - 0.4
+
+
+def test_midlayer_solver_metadata_endpoint_exposes_defaults(client):
+    client, _tmp_path = client
+
+    resp = client.get("/api/midlayer-solvers")
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data is not None
+    assert set(data["solvers"]) == {"dl4to", "pymoto"}
+    assert data["solvers"]["dl4to"]["availability"]["installed"] is False
+    assert data["configs"]["pymoto"]["resolution"] >= 16
+
+
+def test_midlayer_design_requires_matching_outer_and_inner_sections(client):
+    client, _tmp_path = client
+    web_ui.state.parts_dir = _load_test_model_dir()
+
+    load_resp = client.post("/api/load", json={"files": ["outer_1.step"], "include_scene": True})
+    assert load_resp.status_code == 200
+
+    resp = client.post("/api/stage/design_midlayer_dl4to", json={})
+    assert resp.status_code == 400
+    data = resp.get_json()
+    assert data is not None
+    assert "matching outer_* and inner_* sections" in data["error"]
+
+
+@pytest.mark.parametrize("solver_id", ["dl4to", "pymoto"])
+def test_midlayer_design_stage_generates_mid_parts_from_matching_sections(client, solver_id):
+    client, _tmp_path = client
+    web_ui.state.parts_dir = _load_test_model_dir()
+
+    config_resp = client.patch("/api/config", json={
+        "midlayer_configs": {
+            solver_id: {
+                "resolution": 20,
+                "volume_fraction": 0.30,
+                "smoothing_passes": 2,
+            }
+        }
+    })
+    assert config_resp.status_code == 200
+
+    load_resp = client.post("/api/load", json={
+        "files": ["outer_1.step", "inner_1.step", "outer_2.step", "inner_2.step"],
+        "include_scene": True,
+    })
+    assert load_resp.status_code == 200
+
+    resp = client.post(f"/api/stage/design_midlayer_{solver_id}", json={})
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data is not None
+    assert data["ok"] is True
+    assert data["solver"]["mode"] == "scaffold"
+    assert len(data["generated"]) == 2
+    assert all(name.startswith("mid_") for name in data["generated"])
+
+    scene = _assert_scene_has_loaded_parts(client, 6)
+    names = {part["name"] for part in scene["parts"]}
+    assert f"mid_1_{solver_id}" in names
+    assert f"mid_2_{solver_id}" in names
+    solver_paths = [
+        Path(artifact["outputPath"])
+        for artifact in data["solver"]["artifacts"]
+        if artifact["outputPath"] is not None
+    ]
+    assert len(solver_paths) == 2
+    assert all(path.exists() for path in solver_paths)
+
+
 def _load_test_model_dir():
     return (Path(__file__).resolve().parent / "test_models" / "conic_capsule_topopt_8").resolve()
 
@@ -355,7 +488,13 @@ def test_repo_outer_step_pair_uses_inline_proxy_meshes(client):
     assert len(scene["parts"]) == 2
     assert all(part["mesh"] for part in scene["parts"])
     assert all(part["meshUrl"] is None for part in scene["parts"])
-    assert len(load_resp.data) < 5_000_000
+    total_numbers = sum(
+        len(part["mesh"]["vertices"]) + len(part["mesh"]["indices"])
+        for part in scene["parts"]
+    )
+    assert total_numbers < 140_000
+    assert all(part["thumbMesh"] is None for part in scene["parts"])
+    assert len(load_resp.data) < 1_600_000
 
 
 def _load_repo_root_outer_pair(client):
@@ -380,11 +519,15 @@ def test_repo_outer_step_pair_auto_stack_orders_parts_by_level(client):
 
     stack_resp = client.post("/api/stage/auto_stack", json={})
     assert stack_resp.status_code == 200
+    stack_data = stack_resp.get_json()
+    assert stack_data is not None
+    assert stack_data["timings"]["durationMs"] < 100.0
     assert [part.name for part in web_ui.state.parts] == ["outer_1", "outer_2"]
+    assert web_ui._effective_stack_axis_name() == "y"
 
     scene = _assert_scene_has_loaded_parts(client, 2)
     offsets = {entry["name"]: entry["offset"] for entry in scene["combined"]}
-    assert offsets["outer_2"][2] > offsets["outer_1"][2]
+    assert offsets["outer_2"][1] > offsets["outer_1"][1]
 
 
 @pytest.mark.parametrize(
