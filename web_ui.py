@@ -1253,6 +1253,15 @@ def _preview_cross_section_diameter(part: PartState) -> float:
     return max(float(maxs[idx] - mins[idx]) for idx in other_axes)
 
 
+def _auto_stack_sort_key(part: PartState, index: int):
+    tier, levels, segment = assemble.parse_part_name(part.name)
+    if state.workflow == "cylinder" and tier and levels:
+        tier_order = {"outer": 0, "mid": 1, "inner": 2}.get(tier, 3)
+        segment_order = {"a": 0, None: 1, "b": 2}.get(segment, 3)
+        return (0, min(levels), len(levels), tier_order, segment_order, index)
+    return (1, _centroid_along_stack_axis(part), index)
+
+
 def _autoscale_preview_parts() -> list[tuple[PartState, float]]:
     by_level: dict[int, dict[str, list[PartState]]] = {}
     for part in state.parts:
@@ -1799,9 +1808,9 @@ def run_stage(name: str):
             progress.begin("Auto-stack", len(state.parts), "Ordering parts for stacking...")
             ranked = []
             for idx, part in enumerate(state.parts, start=1):
-                ranked.append((_centroid_along_stack_axis(part), idx, part))
+                ranked.append((_auto_stack_sort_key(part, idx), idx, part))
                 progress.advance(1, f"Ranked {part.name} for stacking")
-            state.parts = [part for _centroid, _idx, part in sorted(ranked, key=lambda item: (item[0], item[1]))]
+            state.parts = [part for _sort_key, _idx, part in sorted(ranked, key=lambda item: (item[0], item[1]))]
             for part in state.parts:
                 part.settle_offset = (0.0, 0.0, 0.0)
             progress.finish("Auto-stack complete")
