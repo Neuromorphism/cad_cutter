@@ -5,7 +5,8 @@
   "main": "index.js",
   "scripts": {
     "test": "playwright test",
-    "test:webui": "playwright test"
+    "test:webui": "playwright test",
+    "test:webui:repo-root": "playwright test --config playwright.repo-root.config.js tests/playwright/repo_root_pipeline.spec.js"
   },
   "repository": {
     "type": "git",

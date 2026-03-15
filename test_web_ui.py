@@ -358,6 +358,79 @@ def test_repo_outer_step_pair_uses_inline_proxy_meshes(client):
     assert len(load_resp.data) < 5_000_000
 
 
+def _load_repo_root_outer_pair(client):
+    web_ui.state.parts_dir = Path(__file__).resolve().parent
+    load_resp = client.post("/api/load", json={"files": ["outer_1.STEP", "outer_2.STEP"], "include_scene": True})
+    assert load_resp.status_code == 200
+
+
+def _assert_scene_has_loaded_parts(client, expected_count: int):
+    scene_resp = client.get("/api/scene")
+    assert scene_resp.status_code == 200
+    scene = scene_resp.get_json()
+    assert scene is not None
+    assert len(scene["parts"]) == expected_count
+    assert len(scene["combined"]) == expected_count
+    return scene
+
+
+def test_repo_outer_step_pair_auto_stack_orders_parts_by_level(client):
+    client, _tmp_path = client
+    _load_repo_root_outer_pair(client)
+
+    stack_resp = client.post("/api/stage/auto_stack", json={})
+    assert stack_resp.status_code == 200
+    assert [part.name for part in web_ui.state.parts] == ["outer_1", "outer_2"]
+
+    scene = _assert_scene_has_loaded_parts(client, 2)
+    offsets = {entry["name"]: entry["offset"] for entry in scene["combined"]}
+    assert offsets["outer_2"][2] > offsets["outer_1"][2]
+
+
+@pytest.mark.parametrize(
+    ("stage_name", "artifact_path"),
+    [
+        ("auto_orient", None),
+        ("auto_stack", None),
+        ("auto_scale", None),
+        ("auto_drop", None),
+        ("export_parts", Path("parts")),
+        ("export_whole", Path("web_assembly.step")),
+    ],
+)
+def test_repo_outer_step_pair_pipeline_stages_succeed(client, stage_name, artifact_path):
+    client, _tmp_path = client
+    _load_repo_root_outer_pair(client)
+
+    resp = client.post(f"/api/stage/{stage_name}", json={})
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data is not None
+    assert data["ok"] is True
+
+    if artifact_path is not None:
+        assert artifact_path.exists()
+
+    _assert_scene_has_loaded_parts(client, 2)
+
+
+def test_test_model_cut_stage_succeeds_with_same_stage_process(client):
+    client, _tmp_path = client
+    web_ui.state.parts_dir = _load_test_model_dir()
+
+    load_resp = client.post("/api/load", json={"files": ["outer_1.step", "mid_1.step", "inner_1.step"], "include_scene": True})
+    assert load_resp.status_code == 200
+
+    resp = client.post("/api/stage/cut_inner_from_mid", json={})
+    assert resp.status_code == 200
+    data = resp.get_json()
+    assert data is not None
+    assert data["ok"] is True
+    assert "Cut complete" in data["message"]
+
+    _assert_scene_has_loaded_parts(client, 3)
+
+
 def test_test_models_full_backend_stack_nests_outer_mid_inner(client):
     client, _tmp_path = client
     web_ui.state.parts_dir = _load_test_model_dir()
