@@ -41,6 +41,27 @@ STEP files with optional photorealistic PNG renders.
 pip install -r requirements.txt
 ```
 
+Optional native topology-optimization solvers:
+
+```bash
+# DL4TO only
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+pip install -r requirements-topopt-dl4to.txt
+
+# pyMOTO only
+pip install -r requirements-topopt-pymoto.txt
+
+# both
+pip install -r requirements-topopt.txt
+```
+
+Or use the setup helper:
+
+```bash
+INSTALL_TOPOPT=1 TOPOPT_SOLVERS=dl4to TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130 ./setup_venv.sh
+INSTALL_TOPOPT=1 TOPOPT_SOLVERS=pymoto ./setup_venv.sh
+```
+
 ### Dependencies
 
 | Package | Purpose |

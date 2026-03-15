@@ -1,7 +1,7 @@
 ## Summary
 
 This PR adds a proxy-first midlayer topology-design path to the web UI and
-backend, with two solver-facing adapter scaffolds:
+backend, with two solver-facing solver paths:
 
 - `DL4TO`
 - `pyMOTO`
@@ -20,8 +20,10 @@ artifacts, and loads those generated mids back into the current session.
   - solver registry and availability metadata
   - normalized config handling
   - a stable `MidlayerAdapter` API
-  - scaffold implementations for `dl4to` and `pymoto`
+  - scaffold implementation for `dl4to`
+  - native `pyMOTO` execution when the package is installed
   - STL artifact export helpers
+  - per-iteration progress callbacks for native `pyMOTO`
 
 - Extended [web_ui.py](/home/me/gits/cad_cutter/web_ui.py) with:
   - `GET /api/midlayer-solvers`
@@ -52,29 +54,49 @@ artifacts, and loads those generated mids back into the current session.
   [docs/topopt-solver-survey.md](/home/me/gits/cad_cutter/docs/topopt-solver-survey.md)
   covering real solver candidates and the architecture tradeoffs.
 
+- Split optional solver dependencies into:
+  - [requirements-topopt-dl4to.txt](/home/me/gits/cad_cutter/requirements-topopt-dl4to.txt)
+  - [requirements-topopt-pymoto.txt](/home/me/gits/cad_cutter/requirements-topopt-pymoto.txt)
+  - [requirements-topopt.txt](/home/me/gits/cad_cutter/requirements-topopt.txt)
+  and updated [setup_venv.sh](/home/me/gits/cad_cutter/setup_venv.sh),
+  [setup_venv.bat](/home/me/gits/cad_cutter/setup_venv.bat), and
+  [README.md](/home/me/gits/cad_cutter/README.md) to support solver-specific installation.
+
 ## Current Solver Mode
 
-The adapter boundary is real, but in this environment both solvers are running
-in scaffold mode because neither native package is installed:
+Current mode in this environment:
 
 - `dl4to`
+  - scaffold mode
 - `pymoto`
+  - native mode
 
-The UI exposes that availability explicitly, and the generated outputs are
-still deterministic organic support meshes intended for authentic test-model
-generation.
+The UI exposes that availability explicitly. `DL4TO` still falls back to the
+local scaffold, while `pyMOTO` now runs a real native optimization loop and
+reports section/iteration progress through the existing web UI progress stream.
 
 ## Validation
 
 Python validation:
 
 ```bash
-pytest -q test_topopt_midlayer.py test_web_ui.py
+pytest -q test_topopt_midlayer.py
+pytest -q test_web_ui.py -k 'midlayer_solver_metadata_endpoint_exposes_defaults or midlayer_design_requires_matching_outer_and_inner_sections or midlayer_design_stage_generates_mid_parts_from_matching_sections'
 ```
 
 Result:
 
-- `31 passed`
+- `test_topopt_midlayer.py` -> `3 passed`
+- focused `test_web_ui.py` subset -> `4 passed`
+
+Performance check on the native `pyMOTO` path:
+
+- stock wrapper mean: `0.02108s`
+- direct-loop-with-progress mean: `0.02099s`
+- slowdown: `-0.39%`
+
+So driving the `MMA` optimizer loop directly for accurate progress reporting did
+not introduce measurable overhead in this environment.
 
 Browser coverage added:
 
@@ -92,7 +114,7 @@ Generated example artifacts:
 - [.webui_cache/midlayer_demo/dl4to/mid_1_dl4to.stl](/home/me/gits/cad_cutter/.webui_cache/midlayer_demo/dl4to/mid_1_dl4to.stl)
 - [.webui_cache/midlayer_demo/pymoto/mid_1_pymoto.stl](/home/me/gits/cad_cutter/.webui_cache/midlayer_demo/pymoto/mid_1_pymoto.stl)
 
-Example scaffold output characteristics from `outer_1.step` + `inner_1.step`:
+Example output characteristics from `outer_1.step` + `inner_1.step`:
 
 - `mid_1_dl4to.stl`: `30300` faces, `4413` vertices
 - `mid_1_pymoto.stl`: `140424` faces, `13754` vertices

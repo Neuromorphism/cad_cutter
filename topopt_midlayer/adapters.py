@@ -6,12 +6,17 @@ import importlib.util
 import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 from scipy import ndimage
 import trimesh
 from trimesh.transformations import scale_and_translate
+
+try:
+    import pymoto as _pymoto_native
+except Exception:
+    _pymoto_native = None
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -48,6 +53,14 @@ _COMMON_SCHEMA: list[dict[str, Any]] = [
     {"key": "bridge_count", "label": "Bridge count", "type": "number", "step": 1, "min": 3, "max": 12},
     {"key": "axial_slices", "label": "Axial slices", "type": "number", "step": 1, "min": 2, "max": 8},
 ]
+
+
+def _solver_mode(solver_id: str, installed: bool) -> tuple[str, str]:
+    if solver_id == "pymoto" and installed:
+        return "native", "native package 'pymoto' detected; using native pyMOTO optimization"
+    if installed:
+        return "scaffold", f"native package '{SOLVER_REGISTRY[solver_id]['package']}' detected; scaffold adapter remains active"
+    return "scaffold", f"native package '{SOLVER_REGISTRY[solver_id]['package']}' unavailable; using local scaffold"
 
 
 @dataclass
@@ -171,11 +184,7 @@ def solver_status() -> dict[str, dict[str, Any]]:
     for solver_id, info in SOLVER_REGISTRY.items():
         package = info["package"]
         installed = importlib.util.find_spec(package) is not None
-        notes = (
-            f"native package '{package}' detected; scaffold adapter remains active"
-            if installed
-            else f"native package '{package}' unavailable; using local scaffold"
-        )
+        mode, notes = _solver_mode(solver_id, installed)
         status[solver_id] = {
             "id": solver_id,
             "label": info["label"],
@@ -185,10 +194,10 @@ def solver_status() -> dict[str, dict[str, Any]]:
             "availability": {
                 "installed": installed,
                 "package": package,
-                "mode": "scaffold",
+                "mode": mode,
                 "notes": notes,
             },
-            "mode": "scaffold",
+            "mode": mode,
             "detail": notes,
         }
     return status
@@ -256,9 +265,16 @@ class MidlayerAdapter:
         config: dict[str, Any] | MidlayerDesignConfig | None = None,
         *,
         output_dir: str | Path | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> MidlayerDesignResult:
         specs = [_to_section_spec(section) for section in sections]
-        raw = build_midlayer_designs(specs, solver_id=self.solver_id, config=coerce_config(config), output_dir=output_dir)
+        raw = build_midlayer_designs(
+            specs,
+            solver_id=self.solver_id,
+            config=coerce_config(config),
+            output_dir=output_dir,
+            progress_callback=progress_callback,
+        )
         artifacts = [
             MidlayerArtifact(
                 level=int(item["level"]),
@@ -272,11 +288,11 @@ class MidlayerAdapter:
         return MidlayerDesignResult(
             solver_id=self.solver_id,
             label=self.label,
-            mode="scaffold",
+            mode=str(raw["mode"]),
             availability=self.availability,
             config=MidlayerDesignConfig(**coerce_config(config)).normalized(),
             artifacts=artifacts,
-            notes=self.availability.notes,
+            notes=str(raw["status"]["detail"]),
         )
 
 
@@ -305,6 +321,7 @@ def build_midlayer_designs(
     solver_id: str,
     config: dict[str, Any] | None = None,
     output_dir: str | Path | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     if solver_id not in SOLVER_REGISTRY:
         raise ValueError(f"unknown solver '{solver_id}'")
@@ -318,12 +335,36 @@ def build_midlayer_designs(
     if out_root is not None:
         out_root.mkdir(parents=True, exist_ok=True)
 
-    for section in sections:
-        mesh, metadata = _design_section_mesh(section, solver_id=solver_id, config=merged)
+    for section_index, section in enumerate(sections, start=1):
+        if progress_callback is not None:
+            progress_callback({
+                "kind": "section-start",
+                "solver": solver_id,
+                "sectionIndex": section_index,
+                "sectionCount": len(sections),
+                "level": section.level,
+            })
+        mesh, metadata = _design_section_mesh(
+            section,
+            solver_id=solver_id,
+            config=merged,
+            progress_callback=progress_callback,
+            section_index=section_index,
+            section_count=len(sections),
+        )
         out_path = None
         if out_root is not None:
             out_path = out_root / f"mid_{section.level}_{solver_id}.stl"
             mesh.export(out_path)
+        if progress_callback is not None:
+            progress_callback({
+                "kind": "section-done",
+                "solver": solver_id,
+                "sectionIndex": section_index,
+                "sectionCount": len(sections),
+                "level": section.level,
+                "faces": int(len(mesh.faces)),
+            })
         generated.append({
             "level": section.level,
             "name": f"mid_{section.level}_{solver_id}",
@@ -517,7 +558,7 @@ def _build_solver_score(points: np.ndarray, profile: dict[str, Any], *, solver_i
     return (0.42 * (inner_shell + outer_shell)) + (1.05 * bridge_score) + (0.18 * ring_score) + (0.22 * axial_wave)
 
 
-def _design_section_mesh(section: SectionSpec, *, solver_id: str, config: dict[str, Any]) -> tuple[trimesh.Trimesh, dict[str, Any]]:
+def _design_context(section: SectionSpec, *, solver_id: str, config: dict[str, Any]) -> dict[str, Any]:
     profile = _infer_axis_and_profiles(section, int(config["resolution"]) + 4)
     grid = _grid_for_profile(profile, int(config["resolution"]))
     pitch = float(grid["pitch"])
@@ -541,23 +582,240 @@ def _design_section_mesh(section: SectionSpec, *, solver_id: str, config: dict[s
     if not np.any(domain):
         raise ValueError(f"section {section.name} has no valid design domain")
 
-    score = _build_solver_score(points, profile, solver_id=solver_id, config=config)
-    threshold = float(np.quantile(score[domain], max(0.0, 1.0 - float(config["volume_fraction"]))))
-    occupied = domain & (score >= threshold)
-
     shell_band = domain & (
         (np.abs(radial - inner_r) <= (pitch * float(config["shell_thickness"])))
         | (np.abs(outer_r - radial) <= (pitch * float(config["shell_thickness"])))
     )
+    score = _build_solver_score(points, profile, solver_id=solver_id, config=config)
+    return {
+        "profile": profile,
+        "grid": grid,
+        "pitch": pitch,
+        "points": points,
+        "dims": dims,
+        "domain": domain.reshape(dims),
+        "domain_flat": domain,
+        "shell_band": shell_band.reshape(dims),
+        "shell_flat": shell_band,
+        "score": score.reshape(dims),
+        "score_flat": score,
+    }
+
+
+class _PyMOTOTargetObjective(_pymoto_native.Module if _pymoto_native is not None else object):
+    def __init__(self, target: np.ndarray, weight: np.ndarray):
+        self.target = np.asarray(target, dtype=float)
+        self.weight = np.asarray(weight, dtype=float)
+        self._diff = np.zeros_like(self.target)
+
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        self._diff = np.asarray(x, dtype=float) - self.target
+        return np.array(np.sum(self.weight * self._diff * self._diff), dtype=float)
+
+    def _sensitivity(self, df_dy: np.ndarray) -> np.ndarray:
+        return 2.0 * self.weight * self._diff * float(df_dy)
+
+
+class _PyMOTOVolumeConstraint(_pymoto_native.Module if _pymoto_native is not None else object):
+    def __init__(self, domain_mask: np.ndarray, max_fraction: float):
+        self.domain_mask = np.asarray(domain_mask, dtype=bool)
+        self.max_fraction = float(max_fraction)
+        self._count = max(1, int(np.count_nonzero(self.domain_mask)))
+
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        active = np.asarray(x, dtype=float)[self.domain_mask]
+        return np.array(np.mean(active) - self.max_fraction, dtype=float)
+
+    def _sensitivity(self, df_dy: np.ndarray) -> np.ndarray:
+        grad = np.zeros_like(self.domain_mask, dtype=float)
+        grad[self.domain_mask] = float(df_dy) / self._count
+        return grad
+
+
+def _native_pymoto_density(context: dict[str, Any], config: dict[str, Any]) -> tuple[np.ndarray, dict[str, Any]]:
+    import pymoto
+
+    dims = tuple(int(v) for v in context["dims"])
+    domain_mask = np.asarray(context["domain_flat"], dtype=bool)
+    shell_mask = np.asarray(context["shell_flat"], dtype=bool)
+    score = np.asarray(context["score_flat"], dtype=float)
+    if np.ptp(score[domain_mask]) <= 1e-12:
+        score_norm = np.where(domain_mask, 1.0, 0.0)
+    else:
+        smin = float(score[domain_mask].min())
+        smax = float(score[domain_mask].max())
+        score_norm = np.clip((score - smin) / max(1e-9, smax - smin), 0.0, 1.0)
+
+    penalty = max(1.0, float(config["pymoto_penalty"]))
+    target = np.where(domain_mask, score_norm ** penalty, 0.0)
+    target[shell_mask] = 1.0
+
+    weight = np.where(domain_mask, 1.0 + (2.0 * score_norm), 8.0)
+    weight[shell_mask] += 4.0
+
+    domain = pymoto.VoxelDomain(dims[0], dims[1], dims[2])
+    filter_radius = max(1.5, float(config["shell_thickness"]) * 1.25)
+    x0 = np.where(domain_mask, np.clip(float(config["volume_fraction"]) * (0.45 + target), 0.001, 1.0), 0.0)
+    xmin = np.zeros_like(x0)
+    xmax = np.where(domain_mask, 1.0, 1e-9)
+
+    x = pymoto.Signal("rho", state=x0, min=xmin, max=xmax)
+    with pymoto.Network() as net:
+        xf = pymoto.DensityFilter(domain, radius=filter_radius)(x)
+        obj = _PyMOTOTargetObjective(target, weight)(xf)
+        vol = _PyMOTOVolumeConstraint(domain_mask, float(config["volume_fraction"]))(xf)
+
+    pymoto.minimize_mma(
+        x,
+        [obj, vol],
+        function=net,
+        maxit=int(config["pymoto_iterations"]),
+        tolx=1e-3,
+        tolf=1e-4,
+        xmin=xmin,
+        xmax=xmax,
+        move=0.2,
+        verbosity=0,
+    )
+    net.response()
+    density = np.asarray(xf.state, dtype=float).reshape(dims)
+    density[~np.asarray(context["domain"], dtype=bool)] = 0.0
+    metadata = {
+        "filterRadius": filter_radius,
+        "iterations": int(config["pymoto_iterations"]),
+        "objective": float(obj.state),
+        "constraint": float(vol.state),
+        "densityMean": float(np.mean(density[np.asarray(context["domain"], dtype=bool)])),
+    }
+    return density, metadata
+
+
+def _native_pymoto_density_with_progress(
+    context: dict[str, Any],
+    config: dict[str, Any],
+    *,
+    progress_callback: Callable[[dict[str, Any]], None] | None,
+    section: SectionSpec,
+    section_index: int,
+    section_count: int,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    import pymoto
+
+    dims = tuple(int(v) for v in context["dims"])
+    domain_mask = np.asarray(context["domain_flat"], dtype=bool)
+    shell_mask = np.asarray(context["shell_flat"], dtype=bool)
+    score = np.asarray(context["score_flat"], dtype=float)
+    if np.ptp(score[domain_mask]) <= 1e-12:
+        score_norm = np.where(domain_mask, 1.0, 0.0)
+    else:
+        smin = float(score[domain_mask].min())
+        smax = float(score[domain_mask].max())
+        score_norm = np.clip((score - smin) / max(1e-9, smax - smin), 0.0, 1.0)
+
+    penalty = max(1.0, float(config["pymoto_penalty"]))
+    target = np.where(domain_mask, score_norm ** penalty, 0.0)
+    target[shell_mask] = 1.0
+
+    weight = np.where(domain_mask, 1.0 + (2.0 * score_norm), 8.0)
+    weight[shell_mask] += 4.0
+
+    domain = pymoto.VoxelDomain(dims[0], dims[1], dims[2])
+    filter_radius = max(1.5, float(config["shell_thickness"]) * 1.25)
+    x0 = np.where(domain_mask, np.clip(float(config["volume_fraction"]) * (0.45 + target), 0.001, 1.0), 0.0)
+    xmin = np.zeros_like(x0)
+    xmax = np.where(domain_mask, 1.0, 1e-9)
+
+    x = pymoto.Signal("rho", state=x0, min=xmin, max=xmax)
+    with pymoto.Network() as net:
+        xf = pymoto.DensityFilter(domain, radius=filter_radius)(x)
+        obj = _PyMOTOTargetObjective(target, weight)(xf)
+        vol = _PyMOTOVolumeConstraint(domain_mask, float(config["volume_fraction"]))(xf)
+
+    optimizer = pymoto.MMA(
+        x,
+        [obj, vol],
+        net,
+        xmin=xmin,
+        xmax=xmax,
+        move=0.2,
+        verbosity=0,
+    )
+    max_iterations = int(config["pymoto_iterations"])
+    tolx = 1e-3
+    tolf = 1e-4
+    xval = optimizer.x
+    gcur = 0.0
+    performed = 0
+    if progress_callback is not None:
+        progress_callback({
+            "kind": "native-setup",
+            "solver": "pymoto",
+            "sectionIndex": section_index,
+            "sectionCount": section_count,
+            "level": section.level,
+            "maxIterations": max_iterations,
+        })
+    while optimizer.iter < max_iterations:
+        xnew, g, dg = optimizer.step(x=xval)
+        performed += 1
+
+        gprev, gcur = gcur, g
+        rel_df = np.linalg.norm(gcur - gprev) / max(1e-12, np.linalg.norm(gcur))
+        rel_stepsize = np.linalg.norm((xval - xnew) / optimizer.dx) / max(1e-12, np.linalg.norm(xval / optimizer.dx))
+        if progress_callback is not None:
+            progress_callback({
+                "kind": "iteration",
+                "solver": "pymoto",
+                "sectionIndex": section_index,
+                "sectionCount": section_count,
+                "level": section.level,
+                "iteration": performed,
+                "maxIterations": max_iterations,
+                "objective": float(g[0] if np.ndim(g) else g),
+                "constraint": float(g[1] if np.ndim(g) and np.size(g) > 1 else vol.state),
+                "relativeFunctionChange": float(rel_df),
+                "relativeStep": float(rel_stepsize),
+            })
+
+        if rel_df < tolf or rel_stepsize < tolx:
+            break
+        xval = xnew
+        optimizer.iter += 1
+
+    net.response()
+    density = np.asarray(xf.state, dtype=float).reshape(dims)
+    density[~np.asarray(context["domain"], dtype=bool)] = 0.0
+    metadata = {
+        "filterRadius": filter_radius,
+        "iterations": performed,
+        "objective": float(obj.state),
+        "constraint": float(vol.state),
+        "densityMean": float(np.mean(density[np.asarray(context["domain"], dtype=bool)])),
+    }
+    return density, metadata
+
+
+def _scaffold_density(context: dict[str, Any], *, solver_id: str, config: dict[str, Any]) -> np.ndarray:
+    domain = np.asarray(context["domain"], dtype=bool)
+    shell_band = np.asarray(context["shell_band"], dtype=bool)
+    score = np.asarray(context["score"], dtype=float)
+    threshold = float(np.quantile(score[domain], max(0.0, 1.0 - float(config["volume_fraction"]))))
+    occupied = domain & (score >= threshold)
     occupied = occupied | shell_band
+    return occupied.astype(float)
 
-    mask = occupied.reshape(dims)
+
+def _mask_to_mesh(mask: np.ndarray, context: dict[str, Any], *, solver_id: str, config: dict[str, Any], section: SectionSpec) -> tuple[trimesh.Trimesh, dict[str, Any]]:
+    pitch = float(context["pitch"])
+    grid = context["grid"]
+    profile = context["profile"]
+    dims = tuple(int(v) for v in context["dims"])
     structure = ndimage.generate_binary_structure(3, 1)
-    mask = ndimage.binary_closing(mask, structure=structure, iterations=1)
-    mask = ndimage.binary_opening(mask, structure=structure, iterations=1)
-    mask = _largest_components(mask, keep=3)
+    cleaned = ndimage.binary_closing(mask.astype(bool), structure=structure, iterations=1)
+    cleaned = ndimage.binary_opening(cleaned, structure=structure, iterations=1)
+    cleaned = _largest_components(cleaned, keep=3)
 
-    voxel = trimesh.voxel.VoxelGrid(mask, transform=scale_and_translate(scale=pitch, translate=np.asarray(grid["mins"], dtype=float)))
+    voxel = trimesh.voxel.VoxelGrid(cleaned, transform=scale_and_translate(scale=pitch, translate=np.asarray(grid["mins"], dtype=float)))
     mesh = voxel.as_boxes()
     if hasattr(mesh, "unique_faces"):
         try:
@@ -602,13 +860,46 @@ def _design_section_mesh(section: SectionSpec, *, solver_id: str, config: dict[s
     _constrain_mesh_to_profile(mesh, profile, clearance=max(pitch * 0.35, 0.75))
     if not len(mesh.vertices) or not len(mesh.faces):
         raise ValueError(f"section {section.name} produced an empty {solver_id} scaffold")
-
     metadata = {
-        "axis": "xyz"[axis],
+        "axis": "xyz"[profile["axis"]],
         "pitch": pitch,
         "voxel_shape": [int(v) for v in dims],
-        "estimatedVolumeFraction": float(config["volume_fraction"]),
+        "estimatedVolumeFraction": float(np.mean(mask[np.asarray(context["domain"], dtype=bool)])),
         "faces": int(len(mesh.faces)),
         "vertices": int(len(mesh.vertices)),
     }
+    return mesh, metadata
+
+
+def _design_section_mesh(
+    section: SectionSpec,
+    *,
+    solver_id: str,
+    config: dict[str, Any],
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    section_index: int = 1,
+    section_count: int = 1,
+) -> tuple[trimesh.Trimesh, dict[str, Any]]:
+    context = _design_context(section, solver_id=solver_id, config=config)
+    status = solver_status()[solver_id]
+    if solver_id == "pymoto" and status["mode"] == "native":
+        density, metadata = _native_pymoto_density_with_progress(
+            context,
+            config,
+            progress_callback=progress_callback,
+            section=section,
+            section_index=section_index,
+            section_count=section_count,
+        )
+        quantile = float(np.quantile(density[np.asarray(context["domain"], dtype=bool)], max(0.0, 1.0 - float(config["volume_fraction"]))))
+        mask = (density >= quantile) & np.asarray(context["domain"], dtype=bool)
+        mask |= np.asarray(context["shell_band"], dtype=bool)
+        mesh, mesh_meta = _mask_to_mesh(mask, context, solver_id=solver_id, config=config, section=section)
+        mesh_meta.update(metadata)
+        mesh_meta["mode"] = "native"
+        return mesh, mesh_meta
+
+    density = _scaffold_density(context, solver_id=solver_id, config=config)
+    mesh, metadata = _mask_to_mesh(density > 0.5, context, solver_id=solver_id, config=config, section=section)
+    metadata["mode"] = "scaffold"
     return mesh, metadata

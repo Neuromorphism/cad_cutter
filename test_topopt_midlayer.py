@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 from pathlib import Path
 
 import cadquery as cq
@@ -54,13 +55,18 @@ def _pill(radius: float = 18.0, height: float = 92.0):
 
 def test_midlayer_solver_defaults_expose_both_real_solver_scaffolds():
     defaults = get_solver_defaults()
+    pymoto_installed = importlib.util.find_spec("pymoto") is not None
     assert set(defaults) == {"dl4to", "pymoto"}
     assert defaults["dl4to"]["availability"]["installed"] is False
+    assert defaults["dl4to"]["availability"]["mode"] == "scaffold"
     assert defaults["dl4to"]["schema"]
+    assert defaults["pymoto"]["availability"]["installed"] is pymoto_installed
+    assert defaults["pymoto"]["availability"]["mode"] == ("native" if pymoto_installed else "scaffold")
     assert defaults["pymoto"]["defaults"]["resolution"] >= 16
 
 
 def test_midlayer_adapter_generates_mesh_artifacts_for_each_solver(tmp_path: Path):
+    pymoto_installed = importlib.util.find_spec("pymoto") is not None
     outer_mesh = _shape_to_mesh(_section_shell().val().wrapped)
     inner_mesh = _shape_to_mesh(_pill().val().wrapped)
     section = MidlayerSectionInput(
@@ -76,13 +82,15 @@ def test_midlayer_adapter_generates_mesh_artifacts_for_each_solver(tmp_path: Pat
         result = adapter.run(
             [section],
             {
-                "resolution": 18,
+                "resolution": 16,
                 "volume_fraction": 0.30,
-                "smoothing_passes": 2,
+                "smoothing_passes": 1,
+                "pymoto_iterations": 8,
             },
             output_dir=tmp_path / solver_id,
         )
-        assert result.mode == "scaffold"
+        expected_mode = "native" if solver_id == "pymoto" and pymoto_installed else "scaffold"
+        assert result.mode == expected_mode
         assert result.artifacts
         artifact = result.artifacts[0]
         assert artifact.output_path is not None
@@ -95,3 +103,36 @@ def test_midlayer_adapter_generates_mesh_artifacts_for_each_solver(tmp_path: Pat
         assert mid_bounds[0][1] >= outer_bounds[0][1] - 10.0
         assert mid_bounds[1][0] <= outer_bounds[1][0] + 10.0
         assert mid_bounds[1][1] <= outer_bounds[1][1] + 10.0
+        assert artifact.metadata["mode"] == expected_mode
+
+
+def test_pymoto_native_adapter_emits_iteration_progress_when_available(tmp_path: Path):
+    if importlib.util.find_spec("pymoto") is None:
+        return
+
+    outer_mesh = _shape_to_mesh(_section_shell().val().wrapped)
+    inner_mesh = _shape_to_mesh(_pill().val().wrapped)
+    section = MidlayerSectionInput(
+        level=1,
+        outer_name="outer_1",
+        inner_name="inner_1",
+        outer_mesh=outer_mesh,
+        inner_mesh=inner_mesh,
+    )
+    events: list[dict[str, object]] = []
+    adapter = get_adapter("pymoto")
+    result = adapter.run(
+        [section],
+        {
+            "resolution": 16,
+            "volume_fraction": 0.30,
+            "smoothing_passes": 1,
+            "pymoto_iterations": 6,
+        },
+        output_dir=tmp_path / "pymoto_native",
+        progress_callback=events.append,
+    )
+    assert result.mode == "native"
+    iteration_events = [event for event in events if event.get("kind") == "iteration"]
+    assert iteration_events
+    assert int(iteration_events[0]["iteration"]) >= 1

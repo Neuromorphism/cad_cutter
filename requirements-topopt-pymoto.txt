@@ -1,0 +1,7 @@
+# Optional pyMOTO solver stack
+#
+# Install after the base environment if you want native pyMOTO-backed
+# midlayer design instead of scaffold mode in the web UI.
+
+pymoto
+

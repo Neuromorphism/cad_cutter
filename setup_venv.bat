@@ -15,6 +15,11 @@ if "%VENV_DIR%"=="" set "VENV_DIR=.venv"
 
 set "SCRIPT_DIR=%~dp0"
 set "REQ_FILE=%SCRIPT_DIR%requirements.txt"
+set "TOPOPT_REQ_FILE=%SCRIPT_DIR%requirements-topopt.txt"
+set "TOPOPT_DL4TO_REQ_FILE=%SCRIPT_DIR%requirements-topopt-dl4to.txt"
+set "TOPOPT_PYMOTO_REQ_FILE=%SCRIPT_DIR%requirements-topopt-pymoto.txt"
+if "%INSTALL_TOPOPT%"=="" set "INSTALL_TOPOPT=0"
+if "%TOPOPT_SOLVERS%"=="" set "TOPOPT_SOLVERS=both"
 
 REM --- Check Python is available --------------------------------------------
 where python >nul 2>&1
@@ -52,6 +57,34 @@ pip install --upgrade pip --quiet
 echo Installing dependencies from requirements.txt...
 pip install -r "%REQ_FILE%"
 
+if "%INSTALL_TOPOPT%"=="1" (
+    echo Installing optional topology-optimization stack...
+    if /I "%TOPOPT_SOLVERS%"=="both" (
+        if not "%TORCH_INDEX_URL%"=="" (
+            echo Installing torch/torchvision from custom index: %TORCH_INDEX_URL%
+            pip install torch torchvision --index-url "%TORCH_INDEX_URL%"
+        ) else (
+            echo Installing torch/torchvision from default index
+            pip install torch torchvision
+        )
+        pip install -r "%TOPOPT_REQ_FILE%"
+    ) else if /I "%TOPOPT_SOLVERS%"=="dl4to" (
+        if not "%TORCH_INDEX_URL%"=="" (
+            echo Installing torch/torchvision from custom index: %TORCH_INDEX_URL%
+            pip install torch torchvision --index-url "%TORCH_INDEX_URL%"
+        ) else (
+            echo Installing torch/torchvision from default index
+            pip install torch torchvision
+        )
+        pip install -r "%TOPOPT_DL4TO_REQ_FILE%"
+    ) else if /I "%TOPOPT_SOLVERS%"=="pymoto" (
+        pip install -r "%TOPOPT_PYMOTO_REQ_FILE%"
+    ) else (
+        echo ERROR: TOPOPT_SOLVERS must be one of: both, dl4to, pymoto
+        exit /b 1
+    )
+)
+
 echo.
 echo ============================================
 echo   Setup complete!
@@ -60,6 +93,14 @@ echo ============================================
 echo.
 echo Quick start:
 echo   python assemble.py outer_1.step inner_1.stl -o assembly.step --render assembly.png
+echo.
+echo Optional native topology optimization:
+echo   set INSTALL_TOPOPT=1
+echo   set TOPOPT_SOLVERS=dl4to
+echo   set TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130
+echo   setup_venv.bat
+echo   set TOPOPT_SOLVERS=pymoto
+echo   setup_venv.bat
 echo.
 echo Run tests:
 echo   python -m pytest test_assemble.py -v

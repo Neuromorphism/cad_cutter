@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Regression tests for the Flask web UI error handling."""
 
+import importlib.util
 import math
 from pathlib import Path
 
@@ -346,6 +347,9 @@ def test_midlayer_solver_metadata_endpoint_exposes_defaults(client):
     assert data is not None
     assert set(data["solvers"]) == {"dl4to", "pymoto"}
     assert data["solvers"]["dl4to"]["availability"]["installed"] is False
+    expected_pymoto_installed = importlib.util.find_spec("pymoto") is not None
+    assert data["solvers"]["pymoto"]["availability"]["installed"] is expected_pymoto_installed
+    assert data["solvers"]["pymoto"]["availability"]["mode"] == ("native" if expected_pymoto_installed else "scaffold")
     assert data["configs"]["pymoto"]["resolution"] >= 16
 
 
@@ -367,14 +371,20 @@ def test_midlayer_design_requires_matching_outer_and_inner_sections(client):
 def test_midlayer_design_stage_generates_mid_parts_from_matching_sections(client, solver_id):
     client, _tmp_path = client
     web_ui.state.parts_dir = _load_test_model_dir()
+    expected_mode = "native" if solver_id == "pymoto" and importlib.util.find_spec("pymoto") is not None else "scaffold"
+    config_payload = {
+        "resolution": 20,
+        "volume_fraction": 0.30,
+        "smoothing_passes": 2,
+    }
+    if solver_id == "pymoto":
+        config_payload["resolution"] = 14
+        config_payload["smoothing_passes"] = 1
+        config_payload["pymoto_iterations"] = 4
 
     config_resp = client.patch("/api/config", json={
         "midlayer_configs": {
-            solver_id: {
-                "resolution": 20,
-                "volume_fraction": 0.30,
-                "smoothing_passes": 2,
-            }
+            solver_id: config_payload
         }
     })
     assert config_resp.status_code == 200
@@ -390,7 +400,7 @@ def test_midlayer_design_stage_generates_mid_parts_from_matching_sections(client
     data = resp.get_json()
     assert data is not None
     assert data["ok"] is True
-    assert data["solver"]["mode"] == "scaffold"
+    assert data["solver"]["mode"] == expected_mode
     assert len(data["generated"]) == 2
     assert all(name.startswith("mid_") for name in data["generated"])
 

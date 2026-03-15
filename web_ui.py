@@ -2113,19 +2113,62 @@ def run_stage(name: str):
 
             adapter = get_topopt_adapter(solver_id)
             stage_started_at = time.perf_counter()
-            progress.begin("Midlayer design", (len(sections) * 3) + 1, f"Preparing {adapter.label} design domain...")
+            solver_defaults = get_topopt_solver_defaults().get(solver_id, {}).get("defaults", {})
+            solver_config = dict(solver_defaults)
+            solver_config.update(state.midlayer_configs.get(solver_id, {}))
+            native_iteration_steps = 0
+            if solver_id == "pymoto" and adapter.availability.mode == "native":
+                native_iteration_steps = len(sections) * (int(solver_config.get("pymoto_iterations", 0)) + 1)
+            progress.begin(
+                "Midlayer design",
+                (len(sections) * 2) + 1 + native_iteration_steps,
+                f"Preparing {adapter.label} design domain...",
+            )
             for idx, section in enumerate(sections, start=1):
                 progress.advance(1, f"Matched section {idx} of {len(sections)}: outer_{section.level} / inner_{section.level}")
 
             output_dir = _WEBUI_CACHE_DIR / "midlayer_design" / solver_id
+            def on_midlayer_progress(event: dict[str, Any]) -> None:
+                kind = str(event.get("kind", ""))
+                if solver_id != "pymoto" or adapter.availability.mode != "native":
+                    return
+                section_idx = int(event.get("sectionIndex", 1))
+                section_count = int(event.get("sectionCount", len(sections)))
+                level = int(event.get("level", section_idx))
+                if kind == "section-start":
+                    progress.note(f"pyMOTO section {section_idx} of {section_count}: preparing level {level}")
+                    return
+                if kind == "native-setup":
+                    max_iterations = int(event.get("maxIterations", 0))
+                    progress.advance(1, f"pyMOTO section {section_idx} of {section_count}: initialized optimizer ({max_iterations} iterations)")
+                    return
+                if kind == "iteration":
+                    iteration = int(event.get("iteration", 0))
+                    max_iterations = int(event.get("maxIterations", 0))
+                    objective = float(event.get("objective", 0.0))
+                    constraint = float(event.get("constraint", 0.0))
+                    progress.advance(
+                        1,
+                        f"pyMOTO section {section_idx} of {section_count}: iteration {iteration} of {max_iterations} "
+                        f"(objective={objective:.3f}, constraint={constraint:.3f})",
+                    )
+                    return
+                if kind == "section-done":
+                    progress.note(f"pyMOTO section {section_idx} of {section_count}: completed level {level}")
+
             with _SlowProgressDetail(
-                f"Running {adapter.label} scaffold solve...",
+                f"Running {adapter.label} {adapter.availability.mode} solve...",
                 lambda elapsed, label=adapter.label:
-                    f"Running {label} scaffold solve ({elapsed:.0f}s)",
+                    f"Running {label} {adapter.availability.mode} solve ({elapsed:.0f}s)",
             ):
-                result = adapter.run(sections, state.midlayer_configs.get(solver_id, {}), output_dir=output_dir)
+                result = adapter.run(
+                    sections,
+                    solver_config,
+                    output_dir=output_dir,
+                    progress_callback=on_midlayer_progress,
+                )
             for idx, artifact in enumerate(result.artifacts, start=1):
-                progress.advance(1, f"Generated {adapter.label} scaffold {idx} of {len(result.artifacts)}: {artifact.name}")
+                progress.advance(1, f"Generated {adapter.label} {result.mode} result {idx} of {len(result.artifacts)}: {artifact.name}")
             generated_names = _insert_generated_mid_parts([
                 artifact.output_path for artifact in result.artifacts if artifact.output_path is not None
             ])

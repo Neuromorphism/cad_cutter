@@ -1,0 +1,7 @@
+# Optional topology-optimization solver stack
+#
+# This installs both supported solver paths.
+
+-r requirements-topopt-dl4to.txt
+-r requirements-topopt-pymoto.txt
+

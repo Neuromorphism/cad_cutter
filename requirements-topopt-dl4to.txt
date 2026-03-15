@@ -1,0 +1,22 @@
+# Optional DL4TO solver stack
+#
+# Install after the base environment if you want native DL4TO-backed
+# midlayer design instead of scaffold mode in the web UI.
+# Install PyTorch separately for your hardware/driver stack before this file.
+# The list below is based on DL4TO's upstream package metadata in settings.ini.
+
+plotly
+matplotlib
+hypothesis
+pandas
+tqdm
+natsort
+scikit-image
+kaleido
+requests
+vtk
+setuptools
+
+# DL4TO does not currently publish a PyPI package; install from the official repo.
+dl4to @ git+https://github.com/dl4to/dl4to.git
+

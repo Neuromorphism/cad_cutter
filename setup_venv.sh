@@ -14,6 +14,12 @@ set -euo pipefail
 VENV_DIR="${1:-.venv}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REQ_FILE="$SCRIPT_DIR/requirements.txt"
+TOPOPT_REQ_FILE="$SCRIPT_DIR/requirements-topopt.txt"
+TOPOPT_DL4TO_REQ_FILE="$SCRIPT_DIR/requirements-topopt-dl4to.txt"
+TOPOPT_PYMOTO_REQ_FILE="$SCRIPT_DIR/requirements-topopt-pymoto.txt"
+INSTALL_TOPOPT="${INSTALL_TOPOPT:-0}"
+TORCH_INDEX_URL="${TORCH_INDEX_URL:-}"
+TOPOPT_SOLVERS="${TOPOPT_SOLVERS:-both}"
 
 # --- Check Python version ---------------------------------------------------
 PYTHON="${PYTHON:-python3}"
@@ -58,6 +64,39 @@ pip install --upgrade pip --quiet
 echo "Installing dependencies from requirements.txt..."
 pip install -r "$REQ_FILE"
 
+if [ "$INSTALL_TOPOPT" = "1" ]; then
+    echo "Installing optional topology-optimization stack..."
+    case "$TOPOPT_SOLVERS" in
+        both)
+            if [ -n "$TORCH_INDEX_URL" ]; then
+                echo "Installing torch/torchvision from custom index: $TORCH_INDEX_URL"
+                pip install torch torchvision --index-url "$TORCH_INDEX_URL"
+            else
+                echo "Installing torch/torchvision from default index"
+                pip install torch torchvision
+            fi
+            pip install -r "$TOPOPT_REQ_FILE"
+            ;;
+        dl4to)
+            if [ -n "$TORCH_INDEX_URL" ]; then
+                echo "Installing torch/torchvision from custom index: $TORCH_INDEX_URL"
+                pip install torch torchvision --index-url "$TORCH_INDEX_URL"
+            else
+                echo "Installing torch/torchvision from default index"
+                pip install torch torchvision
+            fi
+            pip install -r "$TOPOPT_DL4TO_REQ_FILE"
+            ;;
+        pymoto)
+            pip install -r "$TOPOPT_PYMOTO_REQ_FILE"
+            ;;
+        *)
+            echo "ERROR: TOPOPT_SOLVERS must be one of: both, dl4to, pymoto"
+            exit 1
+            ;;
+    esac
+fi
+
 echo ""
 echo "============================================"
 echo "  Setup complete!"
@@ -66,6 +105,10 @@ echo "============================================"
 echo ""
 echo "Quick start:"
 echo "  python assemble.py outer_1.step inner_1.stl -o assembly.step --render assembly.png"
+echo ""
+echo "Optional native topology optimization:"
+echo "  INSTALL_TOPOPT=1 TOPOPT_SOLVERS=dl4to TORCH_INDEX_URL=https://download.pytorch.org/whl/cu130 ./setup_venv.sh"
+echo "  INSTALL_TOPOPT=1 TOPOPT_SOLVERS=pymoto ./setup_venv.sh"
 echo ""
 echo "Run tests:"
 echo "  xvfb-run -a python -m pytest test_assemble.py -v"
